@@ -345,7 +345,7 @@ names the stage that broke rather than the whole milestone.
 |---|---|---|
 | A persist | `cargo test --test sessions` | a turn writes `<id>.jsonl` plus an index row; a write failure never fails the turn |
 | B continue | `cargo test --test sessions` | `--continue` picks the newest session for provider+cwd; `--session <id>` targets one; a vendor id that no longer exists re-bootstraps instead of erroring; **the session id is surfaced after a turn**, as `[resume] <vendor-id>` already is, because otherwise there is no way to target `--session <id>` without first running `pie sessions` |
-| C compact | `cargo test --test sessions` | extractive: head + state block + tail; spawns nothing (quota-free); stored rows untouched; the block sits after the persona |
+| C compact | `cargo test --test compact` | extractive: head + state block + tail; spawns nothing (quota-free); stored rows untouched; the block sits after the persona |
 | D ocr | `cargo test --test ocr` and `cargo run -- ocr <fixture>` | a reachable stub is cached by content hash; an unreachable itsmini is a stated error, never an empty success |
 | E mcp | `cargo test --test mcp` | a stdio handshake: `initialize`, then `tools/list` returns exactly one tool named `ocr` |
 | F switch | `cargo test --test sessions` | switching backends rebuilds the prompt from pie's transcript and records the new vendor id — payload-level, no quota |
@@ -367,6 +367,25 @@ names the stage that broke rather than the whole milestone.
 **Not verifiable here**: `ocr` against a real itsmini, which does not exist yet. Stage
 D therefore tests the stub contract and the failure path, not a real conversion, and
 says so rather than implying coverage it does not have.
+
+### Notes stage C raised, recorded rather than left implicit
+
+- **Its gate was decorative at first.** Section 8 originally named
+  `cargo test --test sessions` as stage C's command, so compaction could have broken
+  without any gate failing — the same class as B20, where a gate ran but could not
+  fail. Both runners now have a separate `G4 acceptance (M5 compact)`. A per-stage
+  gate is only worth having if it names the stage's own tests.
+- **Order is relative, not absolute.** The composed order is persona → head turns →
+  state block → tail turns → task. The *head* sits between the persona and the block
+  because chronology matters and the head is the most stable part of the history. The
+  property that protects the cache is therefore the relative one — the volatile task
+  text last, nothing volatile before it — not "the block is immediately after the
+  persona".
+- **"What changed" is an outcome ledger, not a file-change list.** A `TurnRow`
+  records `ok` and `stop_reason`, and in delegate mode pie never sees the vendor's
+  file edits, so the block can say *that* a turn succeeded and *how* it stopped — not
+  which files moved. The dropped turns are handed back rather than discarded, so the
+  detail is recoverable even though it is not in the block.
 
 ## 9. Bug protocol
 
@@ -504,3 +523,4 @@ rather than oversights. None affects a milestone verdict.
 | S2 | `println!`/`print!` in `commands/*` panic on a write failure, so `pie -p … \| head -1` exits 101 with a broken-pipe message | Rust ignores `SIGPIPE`; the fix is `writeln!` on a locked stdout ignoring `Err`. Cosmetic, but it is the cheapest remaining panic |
 | S3 | `session_log::read_all` reads the whole log, and the log is append-only and never rotated | Correct today — totals must see every row, and truncating would make them silently wrong. Revisit only if a real log gets large, and use a tail read for the rolling windows rather than capping "all time" |
 | S4 | The version snapshot in `commands/backends.rs` is a plain `fs::write`, so a crash mid-write leaves a truncated file | The reader tolerates a corrupt cache (it is a miss), so the consequence is one wasted probe |
+| S5 | itsmini is configured by `PIE_ITSMINI_URL` alone, with a hardcoded `http://127.0.0.1:8000` default and a 120 s timeout constant, rather than by `[itsmini] url` in `config.toml` as every other setting is | Stage D shipped env-only resolution; wiring `Config` through `src/ocr.rs` and `commands/ocr.rs` is a small follow-up, and the env var works today. Worth doing before the MCP server (stage E) hardens the surface, since MCP config will want the same knob |

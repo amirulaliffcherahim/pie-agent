@@ -7,6 +7,7 @@
 pub mod auth;
 pub mod backends;
 pub mod models;
+pub mod ocr;
 pub mod print;
 pub mod profile;
 pub mod sessions;
@@ -38,6 +39,14 @@ pub async fn dispatch(cli: &Cli, cfg: &Config) -> Result<()> {
         // Likewise no `cfg`: `pie sessions` reads pie's own index and nothing
         // else, so it is quota-free and spawn-free by construction.
         Some(Command::Sessions) => sessions::run(),
+        // And no `cfg` here either: `pie ocr` reads the itsmini base URL from the
+        // environment at call time, so it needs nothing resolved first.
+        Some(Command::Ocr {
+            file,
+            lang,
+            output,
+            refresh,
+        }) => ocr::run(file, lang.as_deref(), output.as_deref(), *refresh, cli.json).await,
         None => match cli.print.as_deref() {
             Some(prompt) => print::run(cfg, cli, prompt).await,
             None => print_help(),

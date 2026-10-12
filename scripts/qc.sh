@@ -17,7 +17,7 @@
 # M0 `cargo run -- --list-backends`, M1 `cargo test --test parse_agy`,
 # M2 `cargo test --test parse_codex`, M3 `cargo test --test profile` +
 # `cargo run -- profile`, M4 `cargo run -- auth` + `cargo run -- usage`,
-# M5 stage A `cargo test --test sessions`. CI runs the same commands, through this
+# M5 sessions `cargo test --test sessions`. CI runs the same commands, through this
 # same script (.github/workflows/ci.yml), so local and CI cannot drift apart.
 # Add the next milestone's command when it lands. `tests/acceptance.rs` asserts
 # what the M0 table actually prints, because this gate only sees the exit status.
@@ -154,9 +154,13 @@ run_gate 'G4 acceptance (M3 tests)' cargo test --test profile
 run_gate 'G4 acceptance (M3 profile)' cargo run -- profile
 run_gate 'G4 acceptance (M4 auth)' cargo run -- auth
 run_gate 'G4 acceptance (M4 usage)' cargo run -- usage
-# M5 lands one gate per stage (ACCEPTANCE.md section 8), so a red gate names the
-# stage that broke: A persistence, then B continue, C compact, F switch.
-run_gate 'G4 acceptance (M5 stage A)' cargo test --test sessions
+# M5's stages share one test binary (`cargo test --test sessions`), so its gate is
+# named for the store rather than for the stage that happened to land first: a
+# label naming only stage A would lie once B (continue), C (compact) and F
+# (switch) are covered by the same command.
+run_gate 'G4 acceptance (M5 sessions)' cargo test --test sessions
+run_gate 'G4 acceptance (M5 compact)' cargo test --test compact
+run_gate 'G4 acceptance (M5 ocr)' cargo test --test ocr
 
 # --- G5 (live acceptance) ---------------------------------------------------
 if [ "$LIVE" -eq 1 ]; then

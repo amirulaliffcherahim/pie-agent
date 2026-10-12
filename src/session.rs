@@ -207,6 +207,30 @@ impl Session {
         &self.id
     }
 
+    /// Re-open a recorded session so the next turn appends to its transcript.
+    ///
+    /// [`Self::start_in`] cannot be used for this: it mints a new id, and the
+    /// turn would then land in a second session beside the one the user asked to
+    /// continue. The running state the next summary frame needs (`turns`,
+    /// `preview`, `updated_at`) is taken from the index frame, because the index —
+    /// not this process — is what knows how many turns came before.
+    ///
+    /// The id is not re-validated here; every write path validates it
+    /// (`append_row` → `validate_id`), so a hand-edited index cannot talk this
+    /// into writing outside the store.
+    pub fn reopen_in(root: impl Into<PathBuf>, summary: SessionSummary) -> Self {
+        Self {
+            root: root.into(),
+            id: summary.id,
+            provider: summary.provider,
+            cwd: summary.cwd,
+            started_at: summary.started_at,
+            updated_at: summary.updated_at,
+            turns: summary.turns,
+            preview: summary.preview,
+        }
+    }
+
     /// `$PIE_HOME/sessions/<id>.jsonl`
     pub fn transcript_path(&self) -> PathBuf {
         transcript_path(&self.root, &self.id)
@@ -729,6 +753,52 @@ mod tests {
         session.record_best_effort(&row);
         assert_eq!(session.turns(), 0, "nothing was recorded");
         assert!(blocked.is_file(), "the obstruction is untouched");
+    }
+
+    #[test]
+    fn a_reopened_session_continues_the_transcript_it_names() {
+        let dir = store();
+        let mut first = Session::start_in(dir.path(), "agy", Path::new("/work"));
+        first
+            .record(&TurnRow::from_turn(
+                "agy",
+                "m",
+                "one",
+                &outcome("OK", None, "SUCCESS"),
+            ))
+            .unwrap();
+
+        let summary = list_from(dir.path()).unwrap().remove(0);
+        let mut reopened = Session::reopen_in(dir.path(), summary);
+        assert_eq!(
+            reopened.id(),
+            first.id(),
+            "re-opening must not mint a second id"
+        );
+        assert_eq!(reopened.turns(), 1, "the index knows what came before");
+        assert_eq!(reopened.transcript_path(), first.transcript_path());
+
+        reopened
+            .record(&TurnRow::from_turn(
+                "agy",
+                "m",
+                "two",
+                &outcome("OK", None, "SUCCESS"),
+            ))
+            .unwrap();
+
+        assert_eq!(
+            load_from(dir.path(), first.id()).unwrap().len(),
+            2,
+            "the second turn joined the first conversation"
+        );
+        let summaries = list_from(dir.path()).unwrap();
+        assert_eq!(summaries.len(), 1, "one session, folded, not two");
+        assert_eq!(summaries[0].turns, 2);
+        assert_eq!(
+            summaries[0].preview, "one",
+            "the preview still describes the first turn"
+        );
     }
 
     #[test]

@@ -18,7 +18,7 @@
     (M0: `cargo run -- --list-backends`, M1: `cargo test --test parse_agy`,
     M2: `cargo test --test parse_codex`, M3: `cargo test --test profile` and
     `cargo run -- profile`, M4: `cargo run -- auth` and `cargo run -- usage`,
-    M5 stage A: `cargo test --test sessions`). CI runs the same commands
+    M5 sessions: `cargo test --test sessions`). CI runs the same commands
     (.github/workflows/ci.yml) so local and CI agree.
 
     FAIL-FAST: the first failing gate writes `FAIL: <gate>` to stderr and exits
@@ -162,9 +162,13 @@ Invoke-Gate -Label 'G4 acceptance (M3 tests)' -Argv @('test', '--test', 'profile
 Invoke-Gate -Label 'G4 acceptance (M3 profile)' -Argv @('run', '--', 'profile')
 Invoke-Gate -Label 'G4 acceptance (M4 auth)' -Argv @('run', '--', 'auth')
 Invoke-Gate -Label 'G4 acceptance (M4 usage)' -Argv @('run', '--', 'usage')
-# M5 lands one gate per stage (ACCEPTANCE.md section 8), so a red gate names the
-# stage that broke: A persistence, then B continue, C compact, F switch.
-Invoke-Gate -Label 'G4 acceptance (M5 stage A)' -Argv @('test', '--test', 'sessions')
+# M5's stages share one test binary (cargo test --test sessions), so its gate is
+# named for the store rather than for the stage that landed first: a label naming
+# only stage A would lie once B (continue), C (compact) and F (switch) are
+# covered by the same command.
+Invoke-Gate -Label 'G4 acceptance (M5 sessions)' -Argv @('test', '--test', 'sessions')
+Invoke-Gate -Label 'G4 acceptance (M5 compact)' -Argv @('test', '--test', 'compact')
+Invoke-Gate -Label 'G4 acceptance (M5 ocr)' -Argv @('test', '--test', 'ocr')
 
 # --- G5 (live acceptance) ---------------------------------------------------
 if ($Live) {

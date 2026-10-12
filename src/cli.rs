@@ -43,7 +43,11 @@ pub struct Cli {
     pub cwd: Option<PathBuf>,
 
     /// Emit one JSON object per line instead of human text.
-    #[arg(long)]
+    ///
+    /// `global = true` so it is accepted on either side of a subcommand: `pie ocr
+    /// file --json` now works as well as `pie --json ocr file`. It was top-level
+    /// only, which meant the flag silently had to precede the subcommand.
+    #[arg(long, global = true)]
     pub json: bool,
 
     /// Resume a previous conversation by id.
@@ -53,6 +57,25 @@ pub struct Cli {
     /// in the `init` event, so a caller can pick it up and pass it back.
     #[arg(long, value_name = "ID")]
     pub resume: Option<String>,
+
+    /// Continue the newest session for this provider and working directory.
+    ///
+    /// Opt-in on purpose: a plain `pie -p` starts a fresh conversation, because
+    /// resume is context continuity rather than a latency win and reusing a
+    /// conversation the user did not ask for can answer in the wrong context
+    /// (`DESIGN.md` §11). Combining it with `--session` or `--resume` is a
+    /// configuration error.
+    #[arg(long = "continue")]
+    pub continue_session: bool,
+
+    /// Continue one recorded session, named by pie's own id.
+    ///
+    /// The id is the one pie prints after every turn as `[session] <id>`, and the
+    /// one `pie sessions` lists. The vendor, not pie, owns the actual
+    /// conversation, so the id to hand back is read from that session's own
+    /// transcript.
+    #[arg(long = "session", value_name = "ID")]
+    pub session: Option<String>,
 
     /// Print a short argument-error hint.
     #[arg(long, hide = true)]
@@ -103,6 +126,27 @@ pub enum Command {
     /// Reads pie's own `sessions/index.jsonl` only: nothing is spawned, no quota
     /// is spent, and the command writes no session row of its own.
     Sessions,
+
+    /// Convert an image or scanned PDF to text through itsmini.
+    ///
+    /// Spawns no vendor CLI and spends no model quota: the work happens on
+    /// itsmini, and the answer is cached by content hash under
+    /// `$PIE_HOME/ocr-cache/`, so the same image is converted once. `--json` is
+    /// the top-level flag: `pie --json ocr <file>`.
+    Ocr {
+        /// Image or scanned PDF to convert.
+        #[arg(value_name = "FILE")]
+        file: PathBuf,
+        /// Language hint passed to itsmini (e.g. `en`, `ch`).
+        #[arg(long, value_name = "CODE")]
+        lang: Option<String>,
+        /// Output format requested from itsmini (default `text`).
+        #[arg(long, value_name = "FORMAT")]
+        output: Option<String>,
+        /// Ignore the cache and ask itsmini again.
+        #[arg(long)]
+        refresh: bool,
+    },
 }
 
 #[cfg(test)]
@@ -182,5 +226,26 @@ mod tests {
     #[test]
     fn unknown_flags_are_rejected() {
         assert!(Cli::try_parse_from(["pie", "--nope"]).is_err());
+    }
+
+    /// The two M5 selectors parse. Whether they may be *combined* is decided in
+    /// `commands::print`, not by clap, so the error names the conflicting flags
+    /// as a config error (exit 2) rather than as clap's usage text.
+    #[test]
+    fn the_session_selectors_parse() {
+        let cli = Cli::try_parse_from(["pie", "-p", "hi", "--continue"]).unwrap();
+        assert!(cli.continue_session);
+        assert!(cli.session.is_none());
+        assert!(cli.resume.is_none());
+
+        let cli = Cli::try_parse_from(["pie", "-p", "hi", "--session", "s-1-2"]).unwrap();
+        assert_eq!(cli.session.as_deref(), Some("s-1-2"));
+        assert!(!cli.continue_session);
+
+        // They are accepted together by the parser so that pie, not clap, owns
+        // the message; `commands::print::select` is what refuses them.
+        let cli =
+            Cli::try_parse_from(["pie", "-p", "hi", "--continue", "--session", "s-1-2"]).unwrap();
+        assert!(cli.continue_session && cli.session.is_some());
     }
 }

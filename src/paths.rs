@@ -17,6 +17,9 @@ pub const MEMORY_DIR: &str = "memory";
 /// The session-store directory, relative to `PIE_HOME` (M5).
 pub const SESSIONS_DIR: &str = "sessions";
 
+/// The OCR text cache, relative to `PIE_HOME` (M5 stage D).
+pub const OCR_CACHE_DIR: &str = "ocr-cache";
+
 /// Root of pie's state directory. Honours `PIE_HOME`, else `~/.pie`.
 pub fn pie_home() -> PathBuf {
     if let Some(v) = non_empty_env("PIE_HOME") {
@@ -103,6 +106,16 @@ pub fn sessions_dir() -> PathBuf {
     pie_home().join(SESSIONS_DIR)
 }
 
+/// `$PIE_HOME/ocr-cache/` — text itsmini has already returned (M5 stage D).
+///
+/// Keyed by the file's *contents*, not its name (`ocr.rs`): the same image under
+/// two paths is converted once, and no cache entry can say anything about a file
+/// the user did not run through `pie ocr`. The directory holds text, never an
+/// image.
+pub fn ocr_cache_dir() -> PathBuf {
+    pie_home().join(OCR_CACHE_DIR)
+}
+
 /// The legacy `~/.pie/auth.json` written by the earlier JS implementation.
 ///
 /// pie deliberately never reads or writes this: it holds extracted OAuth
@@ -186,6 +199,22 @@ mod tests {
         assert!(
             !usage_log().starts_with(sessions_dir()),
             "transcripts must not be written into the frozen log's namespace"
+        );
+    }
+
+    /// Stage D's cache is a directory of its own, beside the frozen log rather
+    /// than inside its namespace.
+    #[test]
+    fn the_ocr_cache_is_its_own_directory() {
+        let _env = EnvGuard::set(&[("PIE_HOME", Some("/tmp/pie-home"))]);
+        assert_eq!(
+            ocr_cache_dir(),
+            PathBuf::from("/tmp/pie-home").join("ocr-cache")
+        );
+        assert_eq!(OCR_CACHE_DIR, "ocr-cache");
+        assert!(
+            !usage_log().starts_with(ocr_cache_dir()),
+            "OCR text must not be written into the frozen log's namespace"
         );
     }
 

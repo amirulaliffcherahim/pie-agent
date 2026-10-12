@@ -1,14 +1,23 @@
-//! Gate G4 for M5 stage A: session persistence.
+//! Gate G4 for M5 sessions: persistence (stage A) and continuation (stage B).
 //!
-//! `planning/ACCEPTANCE.md` §8, row A: *"a turn writes `<id>.jsonl` plus an index
-//! row; a write failure never fails the turn"*. `planning/DESIGN.md` §11 is the
-//! contract. This file is where both are enforced.
+//! `planning/ACCEPTANCE.md` §8: row A is *"a turn writes `<id>.jsonl` plus an
+//! index row; a write failure never fails the turn"*, row B is *"`--continue`
+//! picks the newest session for provider+cwd; `--session <id>` targets one; a
+//! vendor id that no longer exists re-bootstraps instead of erroring; **the
+//! session id is surfaced after a turn**"*. `planning/DESIGN.md` §11 is the
+//! contract. This file is where both are enforced — one binary for both stages,
+//! because they are two halves of the same store.
 //!
 //! Every turn here runs against a **stand-in** `agy` that prints a recorded
 //! fixture (the same mechanism `tests/parse_agy.rs` and `tests/cache.rs` use), so
 //! the suite exercises the real `pie -p` path — resolve, spawn, parse, record —
 //! without spending a single token of subscription quota. The one live assertion
 //! left is G5, and it is the user's call, not a test's.
+//!
+//! The stage B selection and prompt-assembly paths are also called **directly**
+//! (`print::select`, `print::apply_selection`, `print::seed_prompt`), because the
+//! payload is what the contract is about and a `ChatRequest` is easier to assert
+//! on than an argv that a stand-in cannot reliably read (see [`Seeded`]).
 //!
 //! Nothing touches the real `~/.pie`: every test builds its own home in a
 //! `tempfile::tempdir()` and passes it to the child through `PIE_HOME`. `HOME`
@@ -24,8 +33,12 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use pie::provider::{TurnOutcome, Usage};
-use pie::session::{self, Session, TurnRow};
+use clap::Parser;
+use pie::cli::Cli;
+use pie::commands::print;
+use pie::error::PieError;
+use pie::provider::{ChatRequest, TurnOutcome, Usage};
+use pie::session::{self, Session, SessionSummary, TurnRow};
 
 /// The nine keys `DESIGN.md` §11 fixes for a transcript row.
 const SESSION_ROW_KEYS: [&str; 9] = [
@@ -189,6 +202,142 @@ impl Fixture {
         );
         output
     }
+
+    /// The argv a user would type for one turn in this fixture's directory.
+    fn args(&self, prompt: &str, extra: &[&str]) -> Vec<String> {
+        let mut args = vec![
+            "-p".to_string(),
+            prompt.to_string(),
+            "--model".to_string(),
+            "agy/gemini-3.8-flash".to_string(),
+            "--cwd".to_string(),
+            self.work().display().to_string(),
+        ];
+        args.extend(extra.iter().map(|arg| (*arg).to_string()));
+        args
+    }
+
+    /// Write the stand-in `agy` for `kind` beside a copy of the answer fixture.
+    ///
+    /// Each stand-in counts its invocations in `calls.log`, which is how
+    /// "retries exactly once" is asserted: a counter (
+    /// `echo invoked`) survives an argv the batch language cannot parse, where a
+    /// logged command line would not (cmd.exe stops at the first newline inside
+    /// an argument, and a re-bootstrap prompt is many lines long).
+    fn stub(&self, kind: Stub, fixture: &str) -> PathBuf {
+        let bin = self.root.path().join("bin");
+        std::fs::copy(fixture_path(fixture), bin.join("answer.jsonl")).unwrap();
+
+        #[cfg(windows)]
+        let script = bin.join(format!("{}.bat", kind.name()));
+        #[cfg(windows)]
+        std::fs::write(
+            &script,
+            match kind {
+                // Answers every turn, and records the argv it was handed. Only
+                // used with single-line prompts: cmd.exe stops at the first
+                // newline inside an argument, so a re-bootstrap prompt — which is
+                // many lines long — could not be read back this way.
+                Stub::Args => concat!(
+                    "@echo off\r\n",
+                    "echo invoked >> \"%~dp0calls.log\"\r\n",
+                    "echo %* >> \"%~dp0argv.log\"\r\n",
+                    "type \"%~dp0answer.jsonl\"\r\n",
+                ),
+                // The first invocation fails the way a purged conversation does;
+                // the second answers. That is exactly the shape of RISKS §6.
+                Stub::Stale => concat!(
+                    "@echo off\r\n",
+                    "if exist \"%~dp0calls.log\" goto fresh\r\n",
+                    "echo invoked >> \"%~dp0calls.log\"\r\n",
+                    ">&2 echo Error: conversation not found\r\n",
+                    "exit /b 1\r\n",
+                    ":fresh\r\n",
+                    "echo invoked >> \"%~dp0calls.log\"\r\n",
+                    "type \"%~dp0answer.jsonl\"\r\n",
+                ),
+                // Every invocation fails, and not because anything is missing.
+                Stub::Unrelated => concat!(
+                    "@echo off\r\n",
+                    "echo invoked >> \"%~dp0calls.log\"\r\n",
+                    ">&2 echo Error: model overloaded, try again later\r\n",
+                    "exit /b 1\r\n",
+                ),
+            },
+        )
+        .unwrap();
+
+        #[cfg(not(windows))]
+        let script = bin.join(format!("{}.sh", kind.name()));
+        #[cfg(not(windows))]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::write(
+                &script,
+                match kind {
+                    Stub::Args => concat!(
+                        "#!/bin/sh\n",
+                        "d=\"$(dirname \"$0\")\"\n",
+                        "echo invoked >> \"$d/calls.log\"\n",
+                        "printf '%s\\n' \"$*\" >> \"$d/argv.log\"\n",
+                        "cat \"$d/answer.jsonl\"\n",
+                    ),
+                    Stub::Stale => concat!(
+                        "#!/bin/sh\n",
+                        "d=\"$(dirname \"$0\")\"\n",
+                        "if [ -f \"$d/calls.log\" ]; then\n",
+                        "  echo invoked >> \"$d/calls.log\"\n",
+                        "  cat \"$d/answer.jsonl\"\n",
+                        "  exit 0\n",
+                        "fi\n",
+                        "echo invoked >> \"$d/calls.log\"\n",
+                        "echo 'Error: conversation not found' >&2\n",
+                        "exit 1\n",
+                    ),
+                    Stub::Unrelated => concat!(
+                        "#!/bin/sh\n",
+                        "d=\"$(dirname \"$0\")\"\n",
+                        "echo invoked >> \"$d/calls.log\"\n",
+                        "echo 'Error: model overloaded, try again later' >&2\n",
+                        "exit 1\n",
+                    ),
+                },
+            )
+            .unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        script
+    }
+
+    /// Run `pie` against a stand-in, with this fixture's environment.
+    fn run_stub(&self, kind: Stub, args: &[String]) -> Output {
+        let stub = self.stub(kind, "agy_turn.jsonl");
+
+        Command::new(env!("CARGO_BIN_EXE_pie"))
+            .args(args)
+            .env("PIE_HOME", self.pie_home())
+            .env("HOME", self.root.path().join("home"))
+            .env("USERPROFILE", self.root.path().join("home"))
+            .env("PIE_AGY_BIN", stub)
+            // Recorded on purpose: the stand-ins are outside pie's home, so a
+            // "nothing was written" check stays honest.
+            .env("PIE_LOG", "pie=info,warn")
+            .output()
+            .expect("failed to run the pie binary")
+    }
+
+    /// How many times the stand-in was invoked.
+    fn stub_calls(&self) -> usize {
+        std::fs::read_to_string(self.root.path().join("bin").join("calls.log"))
+            .map(|text| text.lines().count())
+            .unwrap_or(0)
+    }
+
+    /// The argv the stand-in was handed, joined. Empty unless [`Stub::Args`].
+    fn stub_argv(&self) -> String {
+        std::fs::read_to_string(self.root.path().join("bin").join("argv.log")).unwrap_or_default()
+    }
 }
 
 fn stdout(output: &Output) -> String {
@@ -254,6 +403,934 @@ fn outcome(text: &str, conversation_id: Option<&str>) -> TurnOutcome {
         conversation_id: conversation_id.map(str::to_string),
         duration: std::time::Duration::from_millis(35_900),
     }
+}
+
+// ------------------------------------------------- continuing a session ----
+
+/// Which stand-in `agy` a test wants. None of them is a real CLI.
+#[derive(Clone, Copy)]
+enum Stub {
+    /// Answer every turn, and record the argv it was handed.
+    Args,
+    /// The first invocation fails the way a purged conversation does.
+    Stale,
+    /// Every invocation fails for a reason that is not a missing conversation.
+    Unrelated,
+}
+
+impl Stub {
+    fn name(&self) -> &'static str {
+        match self {
+            Stub::Args => "stub-args",
+            Stub::Stale => "stub-stale",
+            Stub::Unrelated => "stub-unrelated",
+        }
+    }
+}
+
+/// A session to put in the store, described rather than written.
+///
+/// Stage A's writer has its own tests. What stage B needs is a store whose
+/// `updated_at` values are **fixed numbers**: "newest by `updated_at`" is the
+/// property under test, and two real turns landing in the same millisecond would
+/// turn the assertion into a race.
+struct Seeded<'a> {
+    id: &'a str,
+    provider: &'a str,
+    cwd: &'a Path,
+    updated_at: u64,
+    prompt: &'a str,
+    response: &'a str,
+    vendor: Option<&'a str>,
+}
+
+/// Write one session's transcript, and return the index frame describing it.
+fn seed(fixture: &Fixture, spec: &Seeded) -> SessionSummary {
+    std::fs::create_dir_all(fixture.sessions_dir()).unwrap();
+
+    let row = TurnRow {
+        ts: spec.updated_at,
+        provider: spec.provider.to_string(),
+        model: "gemini-3.8-flash".to_string(),
+        prompt: spec.prompt.to_string(),
+        response: spec.response.to_string(),
+        conversation_id: spec.vendor.map(str::to_string),
+        usage: Usage::default(),
+        ok: true,
+        stop_reason: "SUCCESS".to_string(),
+    };
+    std::fs::write(
+        session::transcript_path(&fixture.sessions_dir(), spec.id),
+        format!("{}\n", serde_json::to_string(&row).unwrap()),
+    )
+    .unwrap();
+
+    SessionSummary {
+        id: spec.id.to_string(),
+        provider: spec.provider.to_string(),
+        cwd: spec.cwd.display().to_string(),
+        started_at: spec.updated_at,
+        updated_at: spec.updated_at,
+        turns: 1,
+        preview: spec.prompt.to_string(),
+    }
+}
+
+/// Write the whole index, in the order given (the format is append-only frames).
+fn write_index(fixture: &Fixture, frames: &[SessionSummary]) {
+    let mut text = String::new();
+    for frame in frames {
+        text.push_str(&serde_json::to_string(frame).unwrap());
+        text.push('\n');
+    }
+    std::fs::write(session::index_path(&fixture.sessions_dir()), text).unwrap();
+}
+
+/// Two agy sessions in this fixture's directory, the second one newer.
+fn two_sessions(fixture: &Fixture) -> (SessionSummary, SessionSummary) {
+    let older = seed(
+        fixture,
+        &Seeded {
+            id: "s-1000-1",
+            provider: "agy",
+            cwd: &fixture.work(),
+            updated_at: 1_000,
+            prompt: "older task",
+            response: "OLDER ANSWER",
+            vendor: Some("conv-old"),
+        },
+    );
+    let newer = seed(
+        fixture,
+        &Seeded {
+            id: "s-2000-2",
+            provider: "agy",
+            cwd: &fixture.work(),
+            updated_at: 2_000,
+            prompt: "newer task",
+            response: "NEWER ANSWER",
+            vendor: Some("conv-new"),
+        },
+    );
+    write_index(fixture, &[older.clone(), newer.clone()]);
+    (older, newer)
+}
+
+/// A parsed command line, as `pie -p` would see it.
+fn cli(args: &[&str]) -> Cli {
+    let mut argv = vec!["pie"];
+    argv.extend_from_slice(args);
+    Cli::try_parse_from(argv).expect("these arguments parse")
+}
+
+// ----------------------------------------- which conversation, payload level --
+
+/// ACCEPTANCE §8, stage B: `--continue` picks the newest session for
+/// provider+cwd, and the id that session recorded is what the turn resumes.
+#[test]
+fn continue_takes_the_newest_session_for_this_provider_and_directory() {
+    let fixture = Fixture::new();
+    let (_, newer) = two_sessions(&fixture);
+
+    let selection = print::select(
+        &fixture.sessions_dir(),
+        &cli(&["-p", "next task", "--continue"]),
+        "agy",
+        &fixture.work(),
+    )
+    .unwrap();
+
+    let continuation = selection.continuation().expect("a session was selected");
+    assert_eq!(
+        continuation.summary.id, newer.id,
+        "the newest matching session is the one continued"
+    );
+    assert_eq!(
+        continuation.rows.len(),
+        1,
+        "with its transcript, not a summary"
+    );
+    assert_eq!(selection.vendor_id(), Some("conv-new"));
+
+    // …and that vendor id is what the request carries: the vendor's id, not
+    // pie's session id.
+    let mut request = ChatRequest::new("next task");
+    print::apply_selection(&selection, &mut request, "next task");
+    assert_eq!(request.resume.as_deref(), Some("conv-new"));
+    assert_eq!(
+        request.prompt, "next task",
+        "a resumed turn sends the task as given"
+    );
+}
+
+/// "Newest" means by `updated_at`, and *both* the provider and the working
+/// directory have to match — either alone would resume a conversation the user
+/// did not ask for.
+#[test]
+fn the_newest_is_by_updated_at_and_a_foreign_directory_or_provider_is_not_selected() {
+    let fixture = Fixture::new();
+    let elsewhere = fixture.root.path().join("other-work");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+
+    let frames = vec![
+        seed(
+            &fixture,
+            &Seeded {
+                id: "s-4000-4",
+                provider: "agy",
+                cwd: &elsewhere,
+                updated_at: 4_000,
+                prompt: "elsewhere",
+                response: "A",
+                vendor: Some("conv-elsewhere"),
+            },
+        ),
+        seed(
+            &fixture,
+            &Seeded {
+                id: "s-3000-3",
+                provider: "codex",
+                cwd: &fixture.work(),
+                updated_at: 3_000,
+                prompt: "other backend",
+                response: "B",
+                vendor: Some("conv-codex"),
+            },
+        ),
+        seed(
+            &fixture,
+            &Seeded {
+                id: "s-2000-2",
+                provider: "agy",
+                cwd: &fixture.work(),
+                updated_at: 2_000,
+                prompt: "matching",
+                response: "C",
+                vendor: Some("conv-agy"),
+            },
+        ),
+    ];
+    write_index(&fixture, &frames);
+
+    let selection = print::select(
+        &fixture.sessions_dir(),
+        &cli(&["-p", "next", "--continue"]),
+        "agy",
+        &fixture.work(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        selection.vendor_id(),
+        Some("conv-agy"),
+        "two sessions are newer; one is another backend's and one another directory's"
+    );
+    assert_eq!(selection.continuation().unwrap().summary.id, "s-2000-2");
+}
+
+#[test]
+fn session_targets_exactly_that_session() {
+    let fixture = Fixture::new();
+    let (older, _) = two_sessions(&fixture);
+
+    let selection = print::select(
+        &fixture.sessions_dir(),
+        &cli(&["-p", "next", "--session", &older.id]),
+        "agy",
+        &fixture.work(),
+    )
+    .unwrap();
+    assert_eq!(
+        selection.vendor_id(),
+        Some("conv-old"),
+        "named explicitly, so the newer session is not preferred"
+    );
+
+    // Naming a session is an explicit act, so the working directory is not part
+    // of the match — the user asked for this conversation, wherever it ran.
+    let elsewhere = fixture.root.path().join("other-work");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let selection = print::select(
+        &fixture.sessions_dir(),
+        &cli(&["-p", "next", "--session", &older.id]),
+        "agy",
+        &elsewhere,
+    )
+    .unwrap();
+    assert_eq!(selection.vendor_id(), Some("conv-old"));
+
+    // The provider, though, is not negotiable: the id belongs to the backend
+    // that issued it, and moving a session between backends is stage F's job.
+    let error = print::select(
+        &fixture.sessions_dir(),
+        &cli(&["-p", "next", "--session", &older.id]),
+        "codex",
+        &fixture.work(),
+    )
+    .unwrap_err();
+    assert!(matches!(error, PieError::Config(_)), "{error:?}");
+    let message = error.to_string();
+    assert!(
+        message.contains("agy") && message.contains("codex"),
+        "{message}"
+    );
+}
+
+#[test]
+fn an_unknown_session_id_is_a_config_error_that_names_it() {
+    let fixture = Fixture::new();
+    two_sessions(&fixture);
+
+    let error = print::select(
+        &fixture.sessions_dir(),
+        &cli(&["-p", "next", "--session", "s-9999-9"]),
+        "agy",
+        &fixture.work(),
+    )
+    .unwrap_err();
+    assert!(matches!(error, PieError::Config(_)), "{error:?}");
+    assert_eq!(error.exit_code(), 2, "a configuration error, not a crash");
+    let message = error.to_string();
+    assert!(message.contains("s-9999-9"), "{message}");
+    assert!(message.contains("pie sessions"), "{message}");
+
+    // An id that could never name a transcript is refused for that reason.
+    let error = print::select(
+        &fixture.sessions_dir(),
+        &cli(&["-p", "next", "--session", "../usage"]),
+        "agy",
+        &fixture.work(),
+    )
+    .unwrap_err();
+    assert!(matches!(error, PieError::Config(_)), "{error:?}");
+    assert!(error.to_string().contains("session id"), "{error}");
+}
+
+/// Three flags for one decision, so any two of them together is refused rather
+/// than silently resolved in one direction.
+#[test]
+fn each_pair_of_selectors_is_a_config_error_naming_both() {
+    let fixture = Fixture::new();
+    two_sessions(&fixture);
+
+    let pairs: [(&str, &str, &[&str]); 3] = [
+        (
+            "--continue",
+            "--session",
+            &["-p", "next", "--continue", "--session", "s-1000-1"],
+        ),
+        (
+            "--continue",
+            "--resume",
+            &["-p", "next", "--continue", "--resume", "conv-old"],
+        ),
+        (
+            "--session",
+            "--resume",
+            &[
+                "-p",
+                "next",
+                "--session",
+                "s-1000-1",
+                "--resume",
+                "conv-old",
+            ],
+        ),
+    ];
+
+    for (first, second, args) in pairs {
+        let error =
+            print::select(&fixture.sessions_dir(), &cli(args), "agy", &fixture.work()).unwrap_err();
+        assert!(matches!(error, PieError::Config(_)), "{error:?}");
+        assert_eq!(error.exit_code(), 2);
+        let message = error.to_string();
+        assert!(
+            message.contains(first) && message.contains(second),
+            "the message must name the conflict: {message}"
+        );
+    }
+}
+
+/// Silently starting fresh when the user asked to continue is the failure mode
+/// this milestone exists to avoid, so "nothing to continue" is an error that
+/// says *which* provider and directory had nothing.
+#[test]
+fn continue_with_nothing_to_continue_names_the_provider_and_directory() {
+    let fixture = Fixture::new();
+    let args = cli(&["-p", "next", "--continue"]);
+
+    // An empty store…
+    let error = print::select(&fixture.sessions_dir(), &args, "agy", &fixture.work()).unwrap_err();
+    assert!(matches!(error, PieError::Config(_)), "{error:?}");
+    assert_eq!(error.exit_code(), 2);
+    let message = error.to_string();
+    assert!(message.contains("agy"), "{message}");
+    assert!(
+        message.contains(&fixture.work().display().to_string()),
+        "{message}"
+    );
+
+    // …and a store with sessions, none of them for this backend in this place.
+    let elsewhere = fixture.root.path().join("other-work");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let frame = seed(
+        &fixture,
+        &Seeded {
+            id: "s-5000-5",
+            provider: "codex",
+            cwd: &elsewhere,
+            updated_at: 5_000,
+            prompt: "someone else's session",
+            response: "X",
+            vendor: Some("conv-x"),
+        },
+    );
+    write_index(&fixture, &[frame]);
+
+    let error = print::select(&fixture.sessions_dir(), &args, "agy", &fixture.work()).unwrap_err();
+    assert!(matches!(error, PieError::Config(_)), "{error:?}");
+}
+
+/// A session whose every turn failed has no conversation to hand back, so it is
+/// re-bootstrapped from pie's own transcript rather than resuming nothing.
+#[test]
+fn a_session_with_no_vendor_id_is_rebootstrapped_from_its_own_transcript() {
+    let fixture = Fixture::new();
+    let frame = seed(
+        &fixture,
+        &Seeded {
+            id: "s-1000-1",
+            provider: "agy",
+            cwd: &fixture.work(),
+            updated_at: 1_000,
+            prompt: "first task",
+            response: "",
+            vendor: None,
+        },
+    );
+    write_index(&fixture, &[frame]);
+
+    let selection = print::select(
+        &fixture.sessions_dir(),
+        &cli(&["-p", "next task", "--continue"]),
+        "agy",
+        &fixture.work(),
+    )
+    .unwrap();
+    assert_eq!(
+        selection.vendor_id(),
+        None,
+        "there is no conversation to hand back"
+    );
+
+    let mut request = ChatRequest::new("next task");
+    print::apply_selection(&selection, &mut request, "next task");
+    assert!(request.resume.is_none());
+    assert!(request.prompt.contains("first task"), "{}", request.prompt);
+    assert!(request.prompt.ends_with("next task"), "{}", request.prompt);
+}
+
+/// The `RISKS.md` §6 classifier. It reads vendor text, so its safety comes from
+/// requiring two independent signals: a marker that something is missing, and a
+/// noun that names a conversation. A false positive would re-run a turn that
+/// failed for a real reason — spending subscription quota twice and replacing the
+/// real error with the retry's — so the negative cases matter as much as these.
+#[test]
+fn a_stale_conversation_is_recognised_and_an_unrelated_failure_is_not() {
+    let stale = [
+        PieError::protocol(
+            "agy",
+            "stdout closed without a terminal `result` event (exit code: 1); stderr: Error: \
+             conversation not found",
+        ),
+        PieError::Backend {
+            backend: "codex".into(),
+            status: "exit code: 1".into(),
+            detail: "no rollout found for this thread".into(),
+        },
+        PieError::Backend {
+            backend: "agy".into(),
+            status: "ERROR".into(),
+            detail: "conversation 8f3d9b2a no longer exists".into(),
+        },
+    ];
+    for error in stale {
+        assert!(print::is_stale_conversation(&error), "{error}");
+    }
+
+    let unrelated = [
+        PieError::Backend {
+            backend: "agy".into(),
+            status: "ERROR".into(),
+            detail: "model overloaded, try again later".into(),
+        },
+        PieError::Timeout {
+            backend: "agy".into(),
+            secs: 300,
+        },
+        PieError::AuthRequired {
+            backend: "codex".into(),
+            hint: "run `codex login`".into(),
+        },
+        PieError::protocol("agy", "stderr: no space left on device"),
+        PieError::BinaryMissing {
+            backend: "agy".into(),
+            path: "C:/nowhere/agy.exe".into(),
+        },
+    ];
+    for error in unrelated {
+        assert!(!print::is_stale_conversation(&error), "{error}");
+    }
+}
+
+/// The prompt a re-bootstrap sends: the history pie still has, then `---`, then
+/// the task. This is the stage C seam, so the shape is asserted here.
+#[test]
+fn seeding_renders_the_earlier_turns_then_the_task() {
+    let rows = vec![
+        TurnRow {
+            ts: 1_000,
+            provider: "agy".into(),
+            model: "gemini-3.8-flash".into(),
+            prompt: "first task".into(),
+            response: "FIRST ANSWER".into(),
+            conversation_id: Some("conv-old".into()),
+            usage: Usage::default(),
+            ok: true,
+            stop_reason: "SUCCESS".into(),
+        },
+        TurnRow {
+            ts: 2_000,
+            provider: "agy".into(),
+            model: String::new(),
+            prompt: "second task".into(),
+            response: String::new(),
+            conversation_id: None,
+            usage: Usage::default(),
+            ok: false,
+            stop_reason: "timeout".into(),
+        },
+    ];
+
+    let seeded = print::seed_prompt(&rows, "third task");
+
+    // Both halves of the earlier turn, which is what makes the rebuild useful.
+    assert!(seeded.contains("first task"), "{seeded}");
+    assert!(seeded.contains("FIRST ANSWER"), "{seeded}");
+    // A failed turn is history too: what was asked, and why nothing came back.
+    assert!(seeded.contains("second task"), "{seeded}");
+    assert!(seeded.contains("timeout"), "{seeded}");
+    // The separator §11 asks for, with the task after it — and last, because the
+    // task is the volatile text.
+    let separator = seeded.find("\n---\n").expect("a `---` separator");
+    assert!(seeded[separator..].contains("third task"), "{seeded}");
+    assert!(seeded.ends_with("third task"), "{seeded}");
+    // Seeding is not recursive: a recorded row holds the user's text, never a
+    // payload, so a re-bootstrapped turn cannot nest history inside history.
+    assert_eq!(seeded.matches("first task").count(), 1, "{seeded}");
+}
+
+// ------------------------------------------- which conversation, end to end --
+
+#[test]
+fn continue_reuses_the_selected_session_and_hands_its_vendor_id_back() {
+    let fixture = Fixture::new();
+    let (_, newer) = two_sessions(&fixture);
+
+    let output = fixture.run_stub(Stub::Args, &fixture.args("next task", &["--continue"]));
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(stdout(&output).contains("OK"), "{}", stdout(&output));
+
+    // The vendor id comes from the newest session's transcript, and the older
+    // session's id is nowhere in the argv.
+    let argv = fixture.stub_argv();
+    assert!(argv.contains("--conversation conv-new"), "{argv}");
+    assert!(!argv.contains("conv-old"), "{argv}");
+
+    // …and the turn joined that session instead of starting a third one.
+    let sessions = session::list_from(&fixture.sessions_dir()).unwrap();
+    assert_eq!(sessions.len(), 2, "no new session was minted");
+    let continued = sessions
+        .iter()
+        .find(|summary| summary.id == newer.id)
+        .expect("the continued session is still listed");
+    assert_eq!(continued.turns, 2, "the index folded the turn onto it");
+    assert_eq!(
+        session::load_from(&fixture.sessions_dir(), &newer.id)
+            .unwrap()
+            .len(),
+        2,
+        "the transcript holds both turns"
+    );
+
+    // The ids are surfaced, which is what makes `--session <id>` reachable
+    // without running `pie sessions` first.
+    let err = stderr(&output);
+    assert!(err.contains(&format!("[session] {}", newer.id)), "{err}");
+    assert!(
+        err.contains(&format!("[resume] {FIXTURE_CONVERSATION_ID}")),
+        "{err}"
+    );
+}
+
+#[test]
+fn session_targets_one_session_and_the_turn_lands_in_it() {
+    let fixture = Fixture::new();
+    let (older, newer) = two_sessions(&fixture);
+
+    let output = fixture.run_stub(
+        Stub::Args,
+        &fixture.args("next task", &["--session", &older.id]),
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+
+    let argv = fixture.stub_argv();
+    assert!(argv.contains("--conversation conv-old"), "{argv}");
+    assert!(!argv.contains("conv-new"), "{argv}");
+
+    assert!(
+        stderr(&output).contains(&format!("[session] {}", older.id)),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(
+        session::load_from(&fixture.sessions_dir(), &older.id)
+            .unwrap()
+            .len(),
+        2,
+        "the named session got the turn"
+    );
+    assert_eq!(
+        session::load_from(&fixture.sessions_dir(), &newer.id)
+            .unwrap()
+            .len(),
+        1,
+        "and the newer one is untouched"
+    );
+}
+
+/// ACCEPTANCE §8: "`--continue` is opt-in: a plain `pie -p` starts a fresh
+/// conversation". Resume is context continuity, not a latency win, and reusing a
+/// conversation the user did not ask for can answer in the wrong context.
+#[test]
+fn a_plain_run_starts_a_fresh_conversation() {
+    let fixture = Fixture::new();
+    let (older, newer) = two_sessions(&fixture);
+
+    let output = fixture.run_stub(Stub::Args, &fixture.args("next task", &[]));
+    assert!(output.status.success(), "{}", stderr(&output));
+
+    let argv = fixture.stub_argv();
+    assert!(
+        !argv.contains("--conversation"),
+        "a plain turn resumes nothing: {argv}"
+    );
+
+    let sessions = session::list_from(&fixture.sessions_dir()).unwrap();
+    assert_eq!(
+        sessions.len(),
+        3,
+        "the turn started its own session even though one could have been continued"
+    );
+    assert_eq!(
+        session::load_from(&fixture.sessions_dir(), &newer.id)
+            .unwrap()
+            .len(),
+        1,
+        "the continuable session was left alone"
+    );
+    assert_eq!(
+        session::load_from(&fixture.sessions_dir(), &older.id)
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let fresh = sessions
+        .iter()
+        .find(|summary| summary.id != older.id && summary.id != newer.id)
+        .expect("the new session is listed");
+    assert_eq!(fresh.turns, 1);
+    assert_eq!(fresh.provider, "agy");
+    assert_eq!(fresh.cwd, fixture.work().display().to_string());
+    assert!(
+        stderr(&output).contains(&format!("[session] {}", fresh.id)),
+        "its id is surfaced like any other turn's: {}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn the_command_line_refuses_two_selectors_and_spawns_nothing() {
+    let combos: [&[&str]; 3] = [
+        &["--continue", "--session", "s-1000-1"],
+        &["--continue", "--resume", "conv-old"],
+        &["--session", "s-1000-1", "--resume", "conv-old"],
+    ];
+
+    for extra in combos {
+        let fixture = Fixture::new();
+        two_sessions(&fixture);
+
+        let output = fixture.run_stub(Stub::Args, &fixture.args("next task", extra));
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{} gave {:?}",
+            extra.join(" "),
+            output.status.code()
+        );
+        assert!(
+            stderr(&output).contains("select the conversation to continue"),
+            "{}",
+            stderr(&output)
+        );
+        assert_eq!(
+            fixture.stub_calls(),
+            0,
+            "a contradictory selection is refused before anything is spawned"
+        );
+    }
+}
+
+#[test]
+fn continue_on_an_empty_store_is_an_error_rather_than_a_fresh_turn() {
+    let fixture = Fixture::new();
+
+    let output = fixture.run_stub(Stub::Args, &fixture.args("next task", &["--continue"]));
+
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    let err = stderr(&output);
+    assert!(err.contains("no session to continue"), "{err}");
+    assert!(err.contains("agy"), "{err}");
+    assert!(
+        err.contains(&fixture.work().display().to_string()),
+        "the directory it looked in: {err}"
+    );
+    assert_eq!(fixture.stub_calls(), 0, "no turn was run");
+    assert!(
+        !fixture.sessions_dir().exists(),
+        "and no session was started behind the user's back"
+    );
+}
+
+#[test]
+fn an_unknown_session_id_is_refused_on_the_command_line() {
+    let fixture = Fixture::new();
+    two_sessions(&fixture);
+
+    let output = fixture.run_stub(
+        Stub::Args,
+        &fixture.args("next task", &["--session", "s-9999-9"]),
+    );
+
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    assert!(stderr(&output).contains("s-9999-9"), "{}", stderr(&output));
+    assert_eq!(fixture.stub_calls(), 0);
+}
+
+/// `RISKS.md` §6, payload level: a resumed attempt that fails because the
+/// conversation is gone is replaced by pie's own transcript — the earlier turn's
+/// prompt and answer, then the task.
+#[test]
+fn a_stale_resume_is_rebuilt_from_the_transcript() {
+    let fixture = Fixture::new();
+    two_sessions(&fixture);
+
+    let selection = print::select(
+        &fixture.sessions_dir(),
+        &cli(&["-p", "next task", "--continue"]),
+        "agy",
+        &fixture.work(),
+    )
+    .unwrap();
+
+    let stale = PieError::protocol(
+        "agy",
+        "stdout closed without a terminal `result` event (exit code: 1); stderr: Error: \
+         conversation not found",
+    );
+
+    let seeded = print::rebootstrap_prompt(&selection, &stale, false, "next task")
+        .expect("a purged conversation is rebuilt, not reported");
+    assert!(
+        seeded.contains("newer task"),
+        "the earlier prompt: {seeded}"
+    );
+    assert!(seeded.contains("NEWER ANSWER"), "and its answer: {seeded}");
+    assert!(seeded.ends_with("next task"), "then the task: {seeded}");
+
+    // Anything else is reported instead. A resumed attempt that already produced
+    // answer text did not fail because the conversation was empty…
+    assert!(print::rebootstrap_prompt(&selection, &stale, true, "next task").is_none());
+    // …an unrelated failure is not a re-bootstrap trigger…
+    let unrelated = PieError::Backend {
+        backend: "agy".into(),
+        status: "ERROR".into(),
+        detail: "model overloaded, try again later".into(),
+    };
+    assert!(print::rebootstrap_prompt(&selection, &unrelated, false, "next task").is_none());
+    // …and a turn that resumed nothing has nothing to rebuild.
+    assert!(
+        print::rebootstrap_prompt(&print::Selection::Fresh, &stale, false, "next task").is_none()
+    );
+}
+
+/// `RISKS.md` §6, end to end: the resumed attempt fails because the backend no
+/// longer has the id, and the turn is rebuilt from pie's transcript exactly once.
+///
+/// What is visible here is the *decision* and the count. The rebuilt prompt itself
+/// cannot be handed to the stand-in on Windows: `std` refuses to spawn a batch
+/// file with a multi-line argument (`batch file arguments are invalid`), and the
+/// seeded prompt is many lines. That text is asserted above, by calling the same
+/// function `run` calls.
+#[test]
+fn a_stale_vendor_id_is_rebuilt_once_and_not_repeatedly() {
+    let fixture = Fixture::new();
+    let frame = seed(
+        &fixture,
+        &Seeded {
+            id: "s-1000-1",
+            provider: "agy",
+            cwd: &fixture.work(),
+            updated_at: 1_000,
+            prompt: "first task",
+            response: "EARLIER ANSWER",
+            vendor: Some("conv-old"),
+        },
+    );
+    write_index(&fixture, &[frame]);
+
+    let output = fixture.run_stub(Stub::Stale, &fixture.args("next task", &["--continue"]));
+
+    assert_eq!(
+        stderr(&output).matches("re-bootstrapping").count(),
+        1,
+        "one rebuild, never a retry loop: {}",
+        stderr(&output)
+    );
+    assert!(
+        stderr(&output).contains("[session] s-1000-1"),
+        "{}",
+        stderr(&output)
+    );
+
+    // One row for the turn, in the session that was being continued: the failed
+    // attempt is not a second turn, and a retry must not double the history.
+    let rows = session::load_from(&fixture.sessions_dir(), "s-1000-1").unwrap();
+    assert_eq!(rows.len(), 2, "the seeded turn plus one row for this turn");
+    assert_eq!(
+        rows[1].prompt, "next task",
+        "the row keeps the user's text, never the seeded payload"
+    );
+
+    // Where the rebuilt turn can actually be delivered, it is an ordinary
+    // successful turn, and the *new* vendor id is what gets recorded.
+    #[cfg(not(windows))]
+    {
+        assert!(output.status.success(), "{}", stderr(&output));
+        assert!(stdout(&output).contains("OK"), "{}", stdout(&output));
+        assert_eq!(
+            fixture.stub_calls(),
+            2,
+            "the resumed attempt plus exactly one re-bootstrap"
+        );
+        assert!(rows[1].ok);
+        assert_eq!(
+            rows[1].conversation_id.as_deref(),
+            Some(FIXTURE_CONVERSATION_ID),
+            "the id from the re-bootstrapped turn is the one worth recording"
+        );
+        assert!(
+            stderr(&output).contains(&format!("[resume] {FIXTURE_CONVERSATION_ID}")),
+            "{}",
+            stderr(&output)
+        );
+    }
+
+    // On Windows the second spawn never reaches the stand-in, so all this can say
+    // is that the rebuild was attempted once. The vendor's own answer to a
+    // multi-line prompt is covered by the payload test above and by G5.
+    #[cfg(windows)]
+    {
+        assert_eq!(
+            fixture.stub_calls(),
+            1,
+            "the rebuilt prompt cannot be delivered to a batch-file stand-in"
+        );
+        assert!(!output.status.success());
+    }
+}
+
+/// The other direction, which is the expensive one: a resumed turn that failed
+/// for a real reason must not be retried, because that spends subscription quota
+/// twice and reports the retry's outcome instead of the real error.
+#[test]
+fn an_unrelated_failure_while_resuming_is_not_retried() {
+    let fixture = Fixture::new();
+    let frame = seed(
+        &fixture,
+        &Seeded {
+            id: "s-1000-1",
+            provider: "agy",
+            cwd: &fixture.work(),
+            updated_at: 1_000,
+            prompt: "first task",
+            response: "EARLIER ANSWER",
+            vendor: Some("conv-old"),
+        },
+    );
+    write_index(&fixture, &[frame]);
+
+    let output = fixture.run_stub(Stub::Unrelated, &fixture.args("next task", &["--continue"]));
+
+    assert!(!output.status.success(), "the failure stands");
+    assert_eq!(
+        fixture.stub_calls(),
+        1,
+        "a failure that is not a missing conversation is not a re-bootstrap trigger"
+    );
+    assert!(
+        stderr(&output).contains("model overloaded"),
+        "the real error is what the user sees: {}",
+        stderr(&output)
+    );
+
+    let rows = session::load_from(&fixture.sessions_dir(), "s-1000-1").unwrap();
+    assert_eq!(
+        rows.len(),
+        2,
+        "the failed attempt is recorded in the session"
+    );
+    assert!(!rows[1].ok);
+}
+
+#[test]
+fn the_json_init_event_carries_pie_session_id() {
+    let fixture = Fixture::new();
+
+    let output = fixture.run_stub(Stub::Args, &fixture.args("next task", &["--json"]));
+    assert!(output.status.success(), "{}", stderr(&output));
+
+    let sessions = session::list_from(&fixture.sessions_dir()).unwrap();
+    let id = sessions[0].id.clone();
+
+    let init = stdout(&output)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|value| value["event"] == "init")
+        .expect("the fixture emits an init event");
+
+    assert_eq!(init["data"]["session_id"], id, "{init}");
+    assert_eq!(
+        init["data"]["conversation_id"], FIXTURE_CONVERSATION_ID,
+        "the vendor's id is untouched beside it"
+    );
+    assert!(
+        stderr(&output).contains(&format!("[session] {id}")),
+        "and stderr names it too: {}",
+        stderr(&output)
+    );
 }
 
 // ------------------------------------------------------- a turn is persisted --
