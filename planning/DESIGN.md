@@ -457,7 +457,88 @@ transcript"*. That clause needs a stored transcript, which is M5's session work,
 is deferred rather than faked — recorded here because the two milestones depend on
 each other in the opposite order to the one they are listed in.
 
-## 11. CLI surface for M0–M3
+## 11. Sessions, compaction and OCR (M5)
+
+Contract for M5. Roadmap: session JSONL persist/resume, compaction, `pie ocr` plus an
+MCP server so the delegate CLIs can reach it, and the "backend switch mid-session"
+clause M3 deferred into here.
+
+### Session store — a NEW file, never the frozen log
+
+`usage.jsonl` is frozen and shared with the earlier JS implementation (§7), so
+transcripts live beside it rather than inside it:
+
+| Path | Contents |
+|---|---|
+| `$PIE_HOME/sessions/<id>.jsonl` | the transcript: one row per turn, append-only |
+| `$PIE_HOME/sessions/index.jsonl` | `{id, provider, cwd, started_at, updated_at, turns, preview}` for lookup without scanning every file |
+
+A turn row: `{ts, provider, model, prompt, response, conversation_id, usage, ok, stop_reason}`. A session is identified by **pie's own id**, not the vendor's, because the vendor id differs per backend and is lost on a switch; the vendor id is recorded per row so a resume can still pass it back.
+
+**Nothing here spends quota** — a session write is local I/O — and a write failure
+must never fail a turn that otherwise succeeded.
+
+### Resume, deliberately not automatic
+
+`--resume <ID>` is already present and explicit. `--continue` picks the most recent
+session for the current provider and working directory; `--session <ID>` targets one.
+Auto-resume is **not** the default: `knowledge/agy.md` measured resume as a
+context-continuity feature rather than a latency one (41.2 s resumed against 40.5 s
+fresh), and silently reusing a conversation can answer a question in the wrong
+context. The user opts in.
+
+### Compaction: deterministic and quota-free by default
+
+Past `agent.compact_after_turns` (default 40) turns, older turns collapse into a
+state block:
+
+- **Extractive, not summarised.** The head and a tail window are kept; the middle is
+  replaced by a structured block of what was asked and what changed. No model call,
+  so compaction can never surprise the user with spent quota (`RISKS.md` §13).
+- **Stable position.** The block sits *after* the static persona and *before* the
+  volatile task text, so compacting does not invalidate the vendor's cached prefix
+  (`TOKEN-ECONOMICS.md` §4).
+- **Non-destructive.** Stored rows are never deleted. Compaction changes only what is
+  *sent*, never what is *kept*, so it is reversible by inspection.
+
+Model-based summarisation is out of scope: M7's `learn` job already owns "spend a
+budgeted model call on my own history" and is the right home for it.
+
+### OCR is an MCP server, not a pie tool
+
+`pie ocr <file>` POSTs `{file, lang?, output}` to itsmini and caches the result under
+`$PIE_HOME/ocr-cache/`, keyed by content hash. The token argument is ~1–2k vision
+tokens becoming ~200–500 text tokens.
+
+In delegate mode agy and codex run their **own** tools, so a pie-native tool never
+reaches them (`RISKS.md` §11). MCP is the only route that serves all three: `pie mcp
+ocr` runs a stdio server exposing exactly one tool, and the user points each CLI at
+it through that CLI's own MCP config.
+
+itsmini is a separate, unbuilt project. Until it exists, `pie ocr` and the server
+return a clear *itsmini not reachable* error — never a silent empty result.
+
+MCP overhead is real: an advertised tool raises the vendor's per-turn input tokens on
+**every** turn, including ones that never call it. So the server is opt-in, exposes
+exactly one tool, and must not bundle a second.
+
+### Backend switch — the clause M3 deferred
+
+`--switch <backend>` continues the current session on a different backend by
+re-bootstrapping from pie's own transcript: the state block plus the tail window
+becomes the prompt for the new backend, and the new vendor conversation id is
+recorded. This is a payload transformation and therefore testable without quota. It is
+what "no per-CLI config" means in practice — the persona and the history travel with
+the user, not with the CLI.
+
+### Stages
+
+Each stage is verifiable on its own, so an incomplete milestone shows up at the stage
+that is incomplete rather than at the end: **A** persistence · **B**
+`--continue`/`--session` · **C** compaction · **D** `pie ocr` · **E** MCP server ·
+**F** backend switch · **G5** live resume across two turns.
+
+## 12. CLI surface for M0–M3
 
 Additions since M0–M2: `--resume <ID>` (M5-preview, see §10's note on ordering) and
 `profile` (M3). `profile` prints the assembled projection and the provenance of each
@@ -480,7 +561,7 @@ parser is tested by the CLI itself, not only by unit tests. Human mode prints
 deltas as they arrive. Zero-token guarantee: `models`/`auth`/`doctor`/`--list-backends`
 must never spend model quota (catalogs come from disk/help, not a model turn).
 
-## 12. Test strategy
+## 13. Test strategy
 
 | Layer | What | Runs |
 |---|---|---|
@@ -493,7 +574,7 @@ Rules: no test spawns a real CLI unless `PIE_LIVE=1`. Fixtures live in
 `knowledge/agy.md` / `knowledge/codex.md` — not invented. Every milestone gate
 runs `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`.
 
-## 13. Explicitly deferred
+## 14. Explicitly deferred
 
 M3 profile/memory projection · M4 unified auth/usage tables · M5 agent loop +
 sessions + OCR MCP · M6 ratatui TUI · M7 learn · M8 watchtower · M9 claude +

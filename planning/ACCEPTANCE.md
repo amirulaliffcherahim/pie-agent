@@ -333,7 +333,42 @@ The marker must appear in **both** replies. This is the real proof of `ROADMAP`'
 Done condition: payload equality proves the same bytes were sent, a live turn proves
 the persona was actually honoured. Two turns, both on approved models.
 
-## 8. Bug protocol
+## 8. M5 — sessions, compaction and OCR
+
+Contract: `DESIGN.md` §11. Done condition from `ROADMAP.md`: *"`pie -p "audit this
+repo"` delegates + persists; resume works"*.
+
+**Acceptance, per stage.** Each becomes a G4 gate selected by name, so a red gate
+names the stage that broke rather than the whole milestone.
+
+| Stage | Command | Shape |
+|---|---|---|
+| A persist | `cargo test --test sessions` | a turn writes `<id>.jsonl` plus an index row; a write failure never fails the turn |
+| B continue | `cargo test --test sessions` | `--continue` picks the newest session for provider+cwd; `--session <id>` targets one; a vendor id that no longer exists re-bootstraps instead of erroring |
+| C compact | `cargo test --test sessions` | extractive: head + state block + tail; spawns nothing (quota-free); stored rows untouched; the block sits after the persona |
+| D ocr | `cargo test --test ocr` and `cargo run -- ocr <fixture>` | a reachable stub is cached by content hash; an unreachable itsmini is a stated error, never an empty success |
+| E mcp | `cargo test --test mcp` | a stdio handshake: `initialize`, then `tools/list` returns exactly one tool named `ocr` |
+| F switch | `cargo test --test sessions` | switching backends rebuilds the prompt from pie's transcript and records the new vendor id — payload-level, no quota |
+| G5 | live, by hand | two turns with `--continue`: the second answers from the first's context |
+
+**Checks**
+
+- [ ] the frozen `usage.jsonl` schema is unchanged — sessions use their own files
+- [ ] no session row is written by `auth`, `usage`, `models`, `doctor`, `profile` or `ocr`
+- [ ] compaction spawns nothing and spends no quota
+- [ ] compaction never deletes stored rows, so it is reversible by inspection
+- [ ] the state block sits after the static persona, for prefix-cache safety
+- [ ] MCP advertises exactly one tool, and enabling the server is opt-in
+- [ ] an OCR failure is a stated error, never an empty success
+- [ ] a resume whose vendor id is gone re-bootstraps from pie's transcript (`RISKS.md` §6)
+- [ ] a session write failure does not fail a successful turn
+- [ ] `--continue` is opt-in: a plain `pie -p` starts a fresh conversation
+
+**Not verifiable here**: `ocr` against a real itsmini, which does not exist yet. Stage
+D therefore tests the stub contract and the failure path, not a real conversion, and
+says so rather than implying coverage it does not have.
+
+## 9. Bug protocol
 
 A "bug" is any behavior that contradicts `ROADMAP.md`, `DESIGN.md`, or a
 knowledge file. Process, in order:
@@ -365,7 +400,7 @@ Bug categories to actively hunt before marking a milestone done:
 - **Env leak** — API key reaching a child, flipping it to pay-as-you-go (RISKS §10)
 - **Panic** — `unwrap`/`expect`/index-out-of-bounds on external input
 
-## 9. Independent verification
+## 10. Independent verification
 
 Each milestone, after G1–G3 are green and before it is called done, dispatch an
 independent reviewer subagent with **no shared context** and give it: the design
@@ -375,7 +410,7 @@ is either fixed (with a test) or logged as accepted with a written reason.
 
 The reviewer must not be the same agent that wrote the code.
 
-## 10. Run log
+## 11. Run log
 
 Appended as gates pass. Evidence = command + observed result, not a claim.
 
@@ -392,6 +427,7 @@ here. A row is a record of what was verified, not a substitute for verifying.
 | M2 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | **done** | G4 `cargo test --test parse_codex` → 34 passed. G5 live: a real `codex/gpt-6-luna` turn printed `ok` (exit 0) and logged `{input_tokens:13424, cached_input_tokens:1792, output_tokens:5, reasoning_tokens:0, ok:true, stop_reason:"completed"}` — the full frozen schema, and the first live evidence that the vendor prefix cache actually operates (13.3% on a trivial turn). `pie usage codex` printed `30d 88.0% 2026-11-08T01:52:52Z` and logged **no** session row, proving a probe is not a turn. G6 clean |
 | M3 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | **done** | G4 `cargo test --test profile` → 12 passed; `cargo run -- profile` → exit 0 with a provenance table (KIND / BYTES / SOURCE). G5 live: a rule in `profile.toml` requiring the token `ZQ7-MARKER` was honoured by **both** backends — agy replied `hello` + `ZQ7-MARKER`, codex replied `hello` + `ZQ7-MARKER` — so the persona is honoured, not merely sent. Payload equality (agy's persona text == codex's) is asserted without quota in `tests/profile.rs`, and determinism was verified by assembling from two different working directories and byte-comparing. G6 clean. Two findings: the contract's vendor-config check contradicted M1's own agy auth probe, so the contract was wrong and section 7 now allows exactly that one presence check; and the B13 redaction fix had over-corrected into destroying paths in diagnostics (B23) |
 | M4 | ✅ | ✅ | ✅ | ✅ | n/a | ✅ | **done** | Closed out of sequence: its work was built during M0–M2 and had no verdict until now. G4 `cargo run -- auth` and `cargo run -- usage` both exit 0 **with no `--model`**, which is the roadmap's Done condition. `tests/acceptance.rs` asserts the rendered rows, all three usage windows and the totals block, plus that neither command writes a session row. Two deviations recorded in section 6. G5 is `n/a`: neither command spends model tokens |
+| M5 | — | — | — | — | — | — | **not started** | Contract frozen in `DESIGN.md` §11 and section 8 below, with six independently testable stages (A persist, B continue, C compact, D ocr, E mcp, F switch) plus a live resume gate. Stage A is next |
 
 Verdict values: `done` (all applicable gates) · `offline-verified` (G5 skipped by
 user decision) · `blocked` (a gate fails) · `not started`.
@@ -416,7 +452,7 @@ No milestone regressed. The lesson worth keeping: **re-run a live gate after any
 change to the payload it proves** — otherwise the earlier green is a statement about
 a revision that no longer exists.
 
-## 11. Bug log
+## 12. Bug log
 
 Every bug found, the gate that caught it, and the regression test that now
 prevents it. This is the record the milestone verdicts above rest on.
@@ -457,7 +493,7 @@ prevents it. This is the record the milestone verdicts above rest on.
 | F2 | codex resolves to `node.exe` + `codex.js` on this machine (no native `codex.exe`, and the `codex.cmd` shim cannot be spawned directly). The BINARY column therefore shows node | Documented in `codex.rs` and `PLATFORMS.md`; the launch path is the verified one |
 | F3 | WSL2 is installed but cannot boot (`HCS_E_SERVICE_NOT_AVAILABLE`) | Linux is verified by G6 locally and by the CI matrix; see `PLATFORMS.md` |
 
-## 12. Open suggestions from the QC sweep
+## 13. Open suggestions from the QC sweep
 
 Accepted as real, deliberately not done yet. Recorded here so they are decisions
 rather than oversights. None affects a milestone verdict.
