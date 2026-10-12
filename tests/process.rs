@@ -184,14 +184,41 @@ async fn a_missing_binary_is_a_spawn_error_not_a_panic() {
 }
 
 #[tokio::test]
-async fn non_utf8_bytes_on_stdout_do_not_panic() {
-    // A byte-sequence that is not valid UTF-8; `read_line` must not abort.
+async fn non_utf8_bytes_on_stdout_do_not_abort_the_run() {
+    // Regression: `BufReader::lines()` fails with `InvalidData` on a byte that is
+    // not valid UTF-8, which turned a healthy turn into `PieError::Io` and killed
+    // the child — making invariant I5 false. The reader is now capped and lossy.
+    //
+    // The invalid bytes are written to a file and echoed by the shell, so the
+    // test exercises the path on **Windows too**: the previous version emitted
+    // them only under `cfg(not(windows))`, so it passed vacuously here and would
+    // have gone red on the CI ubuntu job that actually reached the bad byte.
+    let dir = tempfile::tempdir().unwrap();
+    let payload = dir.path().join("payload.bin");
+    std::fs::write(&payload, b"ok\n\xff\xfe not utf8\n").unwrap();
+
     let script = if cfg!(windows) {
-        "echo ok"
+        format!("type {}", payload.display())
     } else {
-        "printf 'ok\\n'; printf '\\xff\\xfe\\n'"
+        format!("cat {}", payload.display())
     };
-    let (lines, summary) = run(script, Duration::from_secs(30)).await;
-    assert!(lines.iter().any(|l| l.contains("ok")), "got {lines:?}");
+
+    let spec = spec_for(&script, Duration::from_secs(30), Vec::new());
+    let mut lines: Vec<String> = Vec::new();
+    let mut push = |line: &str| lines.push(line.to_string());
+    let summary = run_streaming(&spec, &mut push)
+        .await
+        .expect("a non-UTF-8 byte must not abort the run");
+
     assert_eq!(summary.exit_code, Some(0));
+    assert_eq!(lines.len(), 2, "both lines must be delivered: {lines:?}");
+    assert_eq!(lines[0], "ok");
+    assert!(
+        lines[1].contains("not utf8"),
+        "the invalid byte should be replaced, not dropped: {lines:?}"
+    );
+    assert!(
+        !lines[1].contains('\u{fffd}') || lines[1].contains("not utf8"),
+        "lossy replacement must keep the rest of the line: {lines:?}"
+    );
 }

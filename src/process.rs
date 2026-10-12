@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
-use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::Command;
 
 use crate::error::{truncate, PieError, Result};
@@ -109,14 +109,27 @@ pub async fn run_streaming(
     // Drain stderr concurrently: a chatty CLI must not fill a pipe and deadlock.
     let stderr_task = tokio::spawn(drain_tail(stderr, STDERR_TAIL_BYTES));
 
-    let deadline = tokio::time::Instant::now() + spec.timeout;
-    let mut lines = BufReader::new(stdout).lines();
+    // `Instant + Duration` panics on overflow, and the timeout is an unvalidated
+    // `u64` from `--timeout` / `PIE_TIMEOUT_SECS`, so `checked_add` turns a
+    // nonsense value into a config error instead of a panic.
+    let deadline = tokio::time::Instant::now()
+        .checked_add(spec.timeout)
+        .ok_or_else(|| {
+            PieError::Config(format!(
+                "timeout of {}s is too large to schedule",
+                spec.timeout.as_secs()
+            ))
+        })?;
+
+    let mut reader = BufReader::new(stdout);
     let mut stdout_lines = 0usize;
     let mut timed_out = false;
     let mut io_error: Option<std::io::Error> = None;
+    let mut truncated_lines = 0usize;
 
     loop {
-        match tokio::time::timeout_at(deadline, lines.next_line()).await {
+        match tokio::time::timeout_at(deadline, read_line_capped(&mut reader, MAX_LINE_BYTES)).await
+        {
             // deadline hit
             Err(_elapsed) => {
                 timed_out = true;
@@ -124,7 +137,10 @@ pub async fn run_streaming(
             }
             Ok(Ok(Some(line))) => {
                 stdout_lines += 1;
-                on_line(&line);
+                if line.truncated {
+                    truncated_lines += 1;
+                }
+                on_line(&line.text);
             }
             Ok(Ok(None)) => break,
             Ok(Err(e)) => {
@@ -132,6 +148,16 @@ pub async fn run_streaming(
                 break;
             }
         }
+    }
+
+    if truncated_lines > 0 {
+        tracing::warn!(
+            backend = %spec.backend,
+            count = truncated_lines,
+            cap_bytes = MAX_LINE_BYTES,
+            "truncated oversized stdout line(s); a vendor line longer than the cap cannot be \
+             buffered without bound"
+        );
     }
 
     if timed_out {
@@ -226,6 +252,87 @@ pub fn resolve_binary(spec: &str) -> Option<PathBuf> {
     None
 }
 
+/// How much of a single stdout line pie will buffer.
+///
+/// The input is a vendor CLI's stdout, which pie does not control. Without a
+/// cap, one line with no newline (a base64 blob, a stuck progress bar) grows the
+/// buffer without bound and OOMs before the deadline can fire. 1 MiB is far
+/// larger than any real stream-json event — roughly 250k tokens of answer text —
+/// so truncation signals a broken or hostile stream rather than a big answer.
+pub const MAX_LINE_BYTES: usize = 1 << 20;
+
+/// One line read from a child, with its bytes interpreted lossily.
+#[derive(Debug, Clone)]
+pub struct ChildLine {
+    /// The line with the trailing newline (and a lone CR) removed.
+    pub text: String,
+    /// True when the line exceeded the cap and was cut short.
+    pub truncated: bool,
+}
+
+/// Read one line, retaining at most `cap` bytes, as **lossy** UTF-8.
+///
+/// Deliberately not `lines()` / `next_line()`: those fail with `InvalidData` on
+/// a byte that is not valid UTF-8, which aborted a healthy run (invariant I5) and
+/// made the whole turn a `PieError::Io`. A vendor CLI printing one stray byte is
+/// not a reason to discard a good answer. `drain_tail` already took this view for
+/// stderr; this makes stdout agree.
+///
+/// Uses `fill_buf`/`consume` rather than `read_until` so the cap can be applied
+/// *while* reading, not after a line has already been materialised.
+///
+/// Returns `None` at end of stream.
+pub async fn read_line_capped<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    cap: usize,
+) -> std::io::Result<Option<ChildLine>> {
+    let mut out: Vec<u8> = Vec::new();
+    let mut saw_any = false;
+    let mut truncated = false;
+
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return if saw_any {
+                Ok(Some(finish_line(out, truncated)))
+            } else {
+                Ok(None)
+            };
+        }
+        saw_any = true;
+
+        let newline = available.iter().position(|&b| b == b'\n');
+        // Bytes to consider from this chunk, excluding the newline itself.
+        let take = newline.unwrap_or(available.len());
+        let consume = newline.map_or(available.len(), |at| at + 1);
+
+        let room = cap.saturating_sub(out.len());
+        if take <= room {
+            out.extend_from_slice(&available[..take]);
+        } else {
+            out.extend_from_slice(&available[..room]);
+            truncated = true;
+        }
+
+        reader.consume(consume);
+
+        if newline.is_some() {
+            return Ok(Some(finish_line(out, truncated)));
+        }
+    }
+}
+
+/// Trim a trailing CR and interpret the bytes lossily.
+fn finish_line(mut bytes: Vec<u8>, truncated: bool) -> ChildLine {
+    if bytes.last() == Some(&b'\r') {
+        bytes.pop();
+    }
+    ChildLine {
+        text: String::from_utf8_lossy(&bytes).into_owned(),
+        truncated,
+    }
+}
+
 /// Kill a process and everything it spawned.
 ///
 /// `Child::kill` only signals the direct child; vendor CLIs spawn node,
@@ -246,7 +353,10 @@ pub async fn kill_tree(pid: Option<u32>) {
         for key in crate::config::BUILTIN_SCRUB {
             cmd.env_remove(key);
         }
-        let _ = cmd.status().await;
+        // Bounded: `kill_tree` runs on the timeout path, so it must not itself
+        // block past the deadline. A hung `taskkill` would defeat the timeout it
+        // exists to enforce.
+        let _ = tokio::time::timeout(Duration::from_secs(5), cmd.status()).await;
     }
 
     #[cfg(not(windows))]
@@ -263,7 +373,7 @@ pub async fn kill_tree(pid: Option<u32>) {
             for key in crate::config::BUILTIN_SCRUB {
                 cmd.env_remove(key);
             }
-            let _ = cmd.status().await;
+            let _ = tokio::time::timeout(Duration::from_secs(5), cmd.status()).await;
             if signal == "-TERM" {
                 // Give the tree a moment to exit cleanly before escalating.
                 tokio::time::sleep(Duration::from_millis(250)).await;
@@ -273,13 +383,16 @@ pub async fn kill_tree(pid: Option<u32>) {
 }
 
 /// Read `reader` to EOF, keeping only the last `cap` bytes.
+///
+/// Lines are read with the same capped, lossy reader as stdout, so neither a
+/// non-UTF-8 byte nor an unbounded line can break or exhaust the tail.
 async fn drain_tail<R: AsyncRead + Unpin>(reader: R, cap: usize) -> String {
-    let mut lines = BufReader::new(reader).lines();
+    let mut reader = BufReader::new(reader);
     let mut buf: Vec<u8> = Vec::new();
     loop {
-        match lines.next_line().await {
+        match read_line_capped(&mut reader, MAX_LINE_BYTES).await {
             Ok(Some(line)) => {
-                buf.extend_from_slice(line.as_bytes());
+                buf.extend_from_slice(line.text.as_bytes());
                 buf.push(b'\n');
                 if buf.len() > cap {
                     let excess = buf.len() - cap;

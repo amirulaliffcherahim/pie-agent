@@ -101,13 +101,29 @@ pub async fn drive(
 
 /// Measure the argv as it will reach `CreateProcess`, approximately.
 ///
-/// Windows joins argv into one string; quoting adds a little. Counting
-/// `len + 3` per argument (two quotes plus a separator) over-estimates rather
-/// than under-estimates, which is the safe direction for a hard cap.
+/// Windows joins argv into a single UTF-16 command line, so the length must be
+/// counted in **UTF-16 code units**, not `char`s: a non-BMP character (an emoji,
+/// many CJK extension characters) is 2 units there and 1 `char`, so counting
+/// `chars()` under-measured and could let an over-limit prompt through to an
+/// opaque `CreateProcessW` failure instead of a clear `PromptTooLong`.
+///
+/// On unix `execve` receives argv as separate strings and the limit is far
+/// higher, so `chars()` is the right measure there.
 pub fn argv_char_len(program: &Path, args: &[OsString]) -> usize {
-    let mut total = program.to_string_lossy().chars().count();
-    for a in args {
-        total += a.to_string_lossy().chars().count() + 3;
+    fn measured(value: &std::ffi::OsStr) -> usize {
+        let text = value.to_string_lossy();
+        if cfg!(windows) {
+            text.encode_utf16().count()
+        } else {
+            text.chars().count()
+        }
+    }
+
+    let mut total = measured(program.as_os_str());
+    for arg in args {
+        // Two quotes plus a separator, as before: over-estimating is the safe
+        // direction for a hard cap.
+        total += measured(arg) + 3;
     }
     total
 }

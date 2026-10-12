@@ -15,6 +15,12 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use crate::error::Result;
 use crate::session_log::now_millis;
 
+/// Refuse to read a cache file larger than this (16 MiB).
+///
+/// A model catalog or version snapshot is kilobytes. The bound exists so a
+/// swapped-in or symlinked file cannot make pie allocate without limit.
+pub const MAX_CACHE_BYTES: u64 = 16 * 1024 * 1024;
+
 /// A cached value plus when it was fetched.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CacheEntry<T> {
@@ -45,7 +51,22 @@ impl<T> CacheEntry<T> {
 }
 
 /// Read an entry. `None` on missing, unreadable, or corrupt content.
+///
+/// Bounded on purpose: the file lives in a user-writable directory and could be
+/// a symlink to something enormous, so a size check comes first. A cache is an
+/// optimisation; it must never be the reason a command exhausts memory.
 pub fn read<T: DeserializeOwned>(path: &Path) -> Option<CacheEntry<T>> {
+    let metadata = std::fs::metadata(path).ok()?;
+    if metadata.len() > MAX_CACHE_BYTES {
+        tracing::warn!(
+            path = %path.display(),
+            bytes = metadata.len(),
+            limit = MAX_CACHE_BYTES,
+            "ignoring an implausibly large cache file"
+        );
+        return None;
+    }
+
     let text = std::fs::read_to_string(path).ok()?;
     match serde_json::from_str::<CacheEntry<T>>(&text) {
         Ok(entry) => Some(entry),
@@ -100,6 +121,27 @@ mod tests {
         Payload {
             models: vec!["gemini-3.8-flash".into()],
         }
+    }
+
+    #[test]
+    fn an_implausibly_large_cache_file_is_a_miss_not_an_allocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge.json");
+
+        // Sparse-ish: the point is the size check, not the content, so a small
+        // over-limit file stands in for a symlinked giant.
+        let filler = "x".repeat(1024);
+        let mut text = String::from("{\"fetched_at\":1,\"value\":\"");
+        while (text.len() as u64) < MAX_CACHE_BYTES + 1024 {
+            text.push_str(&filler);
+        }
+        text.push_str("\"}");
+        std::fs::write(&path, text).unwrap();
+
+        assert!(
+            read::<Payload>(&path).is_none(),
+            "an over-limit cache file must be refused"
+        );
     }
 
     #[test]

@@ -126,6 +126,32 @@ impl Usage {
             parts
         }
     }
+
+    /// Overlay the non-zero fields of `other` onto `self`.
+    ///
+    /// Backends report usage incrementally and a later event may carry only some
+    /// fields, so assigning wholesale would zero the fields it omits: a terminal
+    /// event reporting `{input_tokens, total_tokens}` wiped a `thinking_tokens`
+    /// already seen in the step update. Zero is read as "not reported" rather
+    /// than "reported as zero" — the only interpretation the streams support,
+    /// since no backend distinguishes the two and usage within a turn is
+    /// cumulative and monotonic.
+    pub fn merge(&mut self, other: Usage) {
+        macro_rules! overlay {
+            ($($field:ident),+ $(,)?) => {
+                $(if other.$field != 0 { self.$field = other.$field; })*
+            };
+        }
+
+        overlay!(
+            input_tokens,
+            output_tokens,
+            thinking_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
+            total_tokens,
+        );
+    }
 }
 
 /// State of an in-flight tool call reported by a backend.
@@ -491,6 +517,28 @@ mod tests {
             }
             other => panic!("wrong error: {other:?}"),
         }
+    }
+
+    #[test]
+    fn usage_merge_does_not_zero_fields_a_later_event_omits() {
+        let mut accumulated = Usage {
+            input_tokens: 100,
+            thinking_tokens: 19,
+            output_tokens: 5,
+            ..Usage::default()
+        };
+
+        // A terminal event reporting only two fields must not wipe the rest.
+        accumulated.merge(Usage {
+            input_tokens: 20_704,
+            total_tokens: 20_724,
+            ..Usage::default()
+        });
+
+        assert_eq!(accumulated.input_tokens, 20_704, "a reported field wins");
+        assert_eq!(accumulated.total_tokens, 20_724);
+        assert_eq!(accumulated.thinking_tokens, 19, "an omitted field survives");
+        assert_eq!(accumulated.output_tokens, 5, "an omitted field survives");
     }
 
     #[test]

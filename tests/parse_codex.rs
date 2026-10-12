@@ -232,10 +232,13 @@ fn non_agent_item_types_are_never_text_deltas() {
 
 #[test]
 fn a_completed_item_with_a_non_zero_exit_code_is_a_failed_tool_step() {
+    // The exit code is checked before the status string: an item can report
+    // `status: "completed"` while its command exited non-zero, and the exit code
+    // is the truth. This test previously asserted `Done` here, which contradicted
+    // its own name — the QC sweep caught the mismatch.
     let line = r#"{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"false","exit_code":1,"status":"completed"}}"#;
     match router().on_line(line).unwrap() {
-        // The explicit status wins; with no status the exit code decides.
-        StreamEvent::ToolStep { state, .. } => assert_eq!(state, ToolState::Done),
+        StreamEvent::ToolStep { state, .. } => assert_eq!(state, ToolState::Error),
         other => panic!("expected a tool step, got {other:?}"),
     }
 
@@ -276,6 +279,11 @@ fn turn_completed_yields_usage_and_done() {
 #[test]
 fn usage_field_names_are_renamed_on_mapping() {
     let mut r = router();
+    // An agent message too: `outcome` now refuses a `turn.completed` with no
+    // answer text, and this test is about field renames, not about that rule.
+    r.on_line(
+        r#"{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"OK"}}"#,
+    );
     r.on_line(
         r#"{"type":"turn.completed","usage":{"input_tokens":13768,"cached_input_tokens":11008,"cache_write_input_tokens":256,"output_tokens":5,"reasoning_output_tokens":19}}"#,
     );
@@ -428,16 +436,28 @@ fn a_healthy_terminal_event_wins_over_a_noisy_stderr_and_a_bad_exit() {
     assert_eq!(outcome.usage.output_tokens, 5);
 }
 
+/// A stream that contradicts itself must not discard a delivered answer.
+///
+/// This test previously asserted the turn *fails* when a `turn.failed` follows a
+/// healthy `turn.completed`. The QC sweep argued the opposite, and for a
+/// delegation tool the argument is stronger: codex emits `turn.failed` *instead
+/// of* `turn.completed` when a turn fails, so both appearing means the stream is
+/// contradictory, with a plausible cause being a close after delivery. Discarding
+/// a complete answer over a trailing noise event is worse than returning it and
+/// noting the anomaly, which the router now does with a warning.
 #[test]
-fn a_failure_after_the_terminal_event_still_fails_the_turn() {
+fn a_failure_after_the_terminal_event_does_not_erase_the_answer() {
     let mut r = router();
     for line in lines(TURN) {
         r.on_line(line);
     }
     r.on_line(r#"{"type":"turn.failed","error":{"message":"aborted after completion"}}"#);
 
-    let err = r.outcome(Some(0), "exit 0", "").unwrap_err();
-    assert!(matches!(err, PieError::Backend { .. }), "got {err:?}");
+    let outcome = r
+        .outcome(Some(0), "exit 0", "")
+        .expect("a trailing failure must not discard a delivered answer");
+    assert_eq!(outcome.text, "OK");
+    assert_eq!(outcome.status, "completed");
 }
 
 #[test]

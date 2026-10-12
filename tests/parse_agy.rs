@@ -354,12 +354,26 @@ fn a_malformed_payload_of_any_shape_does_not_abort_the_run() {
     router.on_line(
         r#"{"event":"step_update","step_update":{"step_type":"tool","state":17,"tool_name":null,"tool_info":{"cmd":"ls"}}}"#,
     );
-    router.on_line(r#"{"event":"step_update","step_update":{"text_delta":42}}"#);
+    router.on_line(
+        r#"{"event":"step_update","step_update":{"step_type":"agent_response","text_delta":42}}"#,
+    );
+    // A delta on a step that is not `agent_response` is ignored: only that step
+    // type carries answer text (`knowledge/agy.md`), and accepting any other type
+    // let a future one — `thinking` here, or a step with no `step_type` at all —
+    // inject text into the final answer.
+    router.on_line(
+        r#"{"event":"step_update","step_update":{"step_type":"thinking","text_delta":"NOPE"}}"#,
+    );
+    router.on_line(r#"{"event":"step_update","step_update":{"text_delta":"NOPE"}}"#);
     router.on_line(
         r#"{"event":"result","result":{"status":"SUCCESS","response":"done","usage":"nonsense"}}"#,
     );
 
-    assert_eq!(router.text(), "42", "a non-string delta is stringified");
+    assert_eq!(
+        router.text(),
+        "42",
+        "a non-string delta is stringified, and non-answer steps are ignored"
+    );
     let outcome = router.outcome(Some(0), "exit 0", "").expect("success");
     assert_eq!(outcome.text, "done");
     assert_eq!(
@@ -860,9 +874,16 @@ async fn usage_parses_a_recorded_slash_expansion() {
         .usage(&cfg)
         .await
         .expect("the recorded capture parses");
-    assert_eq!(report, parse_usage(&fixture_lines("agy_usage.json")));
+    // No `assert_eq!(report, parse_usage(...))` here: that compared the result to
+    // itself, since `Agy::usage` *is* `parse_usage`. It would have passed for any
+    // parser at all. The assertions below are the ones with teeth.
     assert_eq!(report.buckets.len(), 4, "got {:?}", report.buckets);
     assert_eq!(report.buckets[0].label, "Gemini Models / weekly");
+    assert!(
+        report.source.contains("/usage"),
+        "the report must name the probe it came from: {}",
+        report.source
+    );
 }
 
 /// A stand-in `agy` that emits one event and then never finishes.

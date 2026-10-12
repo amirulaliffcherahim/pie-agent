@@ -183,7 +183,7 @@ fn short_path(path: &str, width: usize) -> String {
 
     let keep: String = tail
         .chars()
-        .skip(tail.chars().count().saturating_sub(width - 1))
+        .skip(tail.chars().count().saturating_sub(width.saturating_sub(1)))
         .collect();
     format!("…{keep}")
 }

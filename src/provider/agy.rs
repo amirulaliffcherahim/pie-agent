@@ -158,10 +158,20 @@ impl AgyRouter {
     fn on_step_update(&mut self, line: &Value) -> Option<StreamEvent> {
         let step = payload(line, "step_update");
 
+        // Merged field-wise, never assigned wholesale: a terminal or step event
+        // that reports only some fields must not zero the fields it omits. This
+        // used to overwrite, so a `result` carrying `{input_tokens, total_tokens}`
+        // would wipe a `thinking_tokens: 19` already seen in a step update.
         if let Some(usage) =
             usage_from(jsonl::at(step, "usage").or_else(|| jsonl::at(line, "usage")))
         {
-            self.usage = usage;
+            self.usage.merge(usage);
+        }
+
+        // Once the terminal event has arrived, later lines are ignored: the
+        // answer is already decided.
+        if self.terminal.is_some() {
+            return None;
         }
 
         let step_type = string_field(step, line, "step_type")
@@ -177,6 +187,13 @@ impl AgyRouter {
                 info: text_field(step, line, "tool_info")
                     .or_else(|| text_field(step, line, "info")),
             });
+        }
+
+        // Only `agent_response` carries answer text. Accepting `text_delta` from
+        // any step type meant a future type (`thinking`, or a step with no
+        // `step_type` at all) could inject text into the final answer.
+        if step_type != "agent_response" {
+            return None;
         }
 
         match string_field(step, line, "text_delta") {
@@ -197,10 +214,20 @@ impl AgyRouter {
         if let Some(usage) =
             usage_from(jsonl::at(result, "usage").or_else(|| jsonl::at(line, "usage")))
         {
-            self.usage = usage;
+            self.usage.merge(usage);
         }
         if let Some(id) = string_field(result, line, "conversation_id") {
             self.conversation_id = Some(id);
+        }
+
+        // The first terminal event wins. A stream that emits `SUCCESS` and then a
+        // stray `ERROR` (or vice versa) must not have the outcome rewritten by
+        // whichever line happened to arrive last.
+        if let Some(existing) = &self.terminal {
+            return StreamEvent::Done {
+                text: existing.text.clone(),
+                status: existing.status.clone(),
+            };
         }
 
         let status = string_field(result, line, "status").unwrap_or_default();

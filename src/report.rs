@@ -33,8 +33,15 @@ pub struct Totals {
 
 impl Totals {
     /// Every token counted, including reasoning.
+    ///
+    /// Saturating: the inputs come from `~/.pie/usage.jsonl`, which a user or an
+    /// older version could have written with any `u64`. A plain `+` panics on
+    /// overflow in a debug build and wraps silently in release, so one crafted
+    /// row should not be able to break `pie usage`.
     pub fn total_tokens(&self) -> u64 {
-        self.input_tokens + self.output_tokens + self.reasoning_tokens
+        self.input_tokens
+            .saturating_add(self.output_tokens)
+            .saturating_add(self.reasoning_tokens)
     }
 
     /// Share of prompt tokens that came from cache, 0.0–1.0.
@@ -47,20 +54,25 @@ impl Totals {
 }
 
 /// Sum a slice of rows.
+///
+/// Every field is saturating: the rows are read from a file pie does not fully
+/// control (`~/.pie/usage.jsonl` is append-only, user-writable, and readable by
+/// any older version), so a single `u64::MAX` value must produce a wrong total
+/// rather than a panic or a silent wrap.
 pub fn totals(rows: &[SessionLogRow]) -> Totals {
     let mut t = Totals::default();
     for r in rows {
-        t.turns += 1;
+        t.turns = t.turns.saturating_add(1);
         if r.ok {
-            t.ok_turns += 1;
+            t.ok_turns = t.ok_turns.saturating_add(1);
         } else {
-            t.failed_turns += 1;
+            t.failed_turns = t.failed_turns.saturating_add(1);
         }
-        t.input_tokens += r.input_tokens;
-        t.cached_input_tokens += r.cached_input_tokens;
-        t.output_tokens += r.output_tokens;
-        t.reasoning_tokens += r.reasoning_tokens;
-        t.duration_ms += r.duration_ms;
+        t.input_tokens = t.input_tokens.saturating_add(r.input_tokens);
+        t.cached_input_tokens = t.cached_input_tokens.saturating_add(r.cached_input_tokens);
+        t.output_tokens = t.output_tokens.saturating_add(r.output_tokens);
+        t.reasoning_tokens = t.reasoning_tokens.saturating_add(r.reasoning_tokens);
+        t.duration_ms = t.duration_ms.saturating_add(r.duration_ms);
     }
     t
 }
@@ -306,6 +318,26 @@ mod tests {
             !rendered.contains('…'),
             "a real bucket label must fit the column; truncation hides the window:\n{rendered}"
         );
+    }
+
+    /// Regression (QC sweep, robustness lens): `totals` used plain `+` over
+    /// values read from a user-writable file, so one crafted row panicked a debug
+    /// build and wrapped silently in release.
+    #[test]
+    fn totals_saturate_instead_of_overflowing() {
+        let mut a = row("agy", true, 1);
+        let mut b = row("agy", true, 2);
+        a.input_tokens = u64::MAX;
+        b.input_tokens = u64::MAX;
+        a.duration_ms = u64::MAX;
+        b.duration_ms = u64::MAX;
+        b.reasoning_tokens = u64::MAX;
+
+        let t = totals(&[a, b]);
+        assert_eq!(t.turns, 2, "counts still work");
+        assert_eq!(t.input_tokens, u64::MAX, "saturates, does not wrap");
+        assert_eq!(t.duration_ms, u64::MAX);
+        assert_eq!(t.total_tokens(), u64::MAX, "total_tokens must saturate too");
     }
 
     #[test]

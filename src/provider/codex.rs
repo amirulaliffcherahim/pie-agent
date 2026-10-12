@@ -432,6 +432,12 @@ pub struct CodexRouter {
     thread_id: Option<String>,
     /// Answer text accumulated from agent items.
     text: String,
+    /// The answer frozen at `turn.completed`.
+    ///
+    /// Kept separately from `text` because `text` keeps accumulating: any agent
+    /// item arriving *after* the terminal event would otherwise be appended into
+    /// the returned answer.
+    final_text: Option<String>,
     /// Usage from `turn.completed`.
     usage: Usage,
     /// Whether a healthy terminal event was seen.
@@ -513,16 +519,38 @@ impl EventRouter for CodexRouter {
             "item.started" | "item.updated" => Some(self.on_item(&value, false, ToolState::Active)),
             "item.completed" => Some(self.on_item(&value, true, ToolState::Done)),
             "turn.completed" => {
+                // First terminal wins. A duplicated or trailing `turn.completed`
+                // must not be able to change the answer.
+                if self.finished {
+                    return None;
+                }
                 self.usage = usage_from_event(&value);
+                // Freeze the answer here. Reading the live accumulator in
+                // `outcome` would let any `item.completed` after this line be
+                // appended into the answer.
+                self.final_text = Some(self.text.clone());
                 self.finished = true;
                 // A healthy terminal event wins over an earlier transient error.
                 self.failure = None;
                 Some(StreamEvent::Done {
-                    text: self.text.clone(),
+                    text: self.final_text.clone().unwrap_or_default(),
                     status: TURN_COMPLETED.to_string(),
                 })
             }
             "turn.failed" => {
+                // A failure after a healthy terminal event must not discard a
+                // delivered answer: codex emits `turn.failed` *instead of*
+                // `turn.completed`, so both appearing means a contradictory
+                // stream, and the plausible cause is a close-after-delivery. The
+                // anomaly is surfaced rather than swallowed.
+                if self.finished {
+                    tracing::warn!(
+                        backend = "codex",
+                        "ignoring `turn.failed` after a healthy `turn.completed`; the answer is \
+                         kept"
+                    );
+                    return None;
+                }
                 self.failure = Some(failure_from(&value, TURN_FAILED));
                 Some(StreamEvent::Other {
                     kind: kind.clone(),
@@ -530,6 +558,13 @@ impl EventRouter for CodexRouter {
                 })
             }
             "error" => {
+                if self.finished {
+                    tracing::warn!(
+                        backend = "codex",
+                        "ignoring an `error` event after a healthy `turn.completed`"
+                    );
+                    return None;
+                }
                 self.failure = Some(failure_from(&value, "error"));
                 Some(StreamEvent::Other {
                     kind: kind.clone(),
@@ -563,8 +598,20 @@ impl EventRouter for CodexRouter {
         // (`DESIGN.md` §6 rule 7) — a chatty stderr or a non-zero exit after a
         // healthy `turn.completed` is not an error.
         if self.finished {
+            let text = self.final_text.clone().unwrap_or_default();
+            // A terminal event with no answer at all means the stream did not
+            // honour its contract — a renamed item type, or a turn that only ran
+            // tools. Returning `ok: true` with empty text would log a successful
+            // turn that produced nothing, and `pie -p` would print a blank line
+            // as though that were the answer.
+            if text.trim().is_empty() {
+                return Err(PieError::protocol(
+                    "codex",
+                    "`turn.completed` arrived but no agent message was captured",
+                ));
+            }
             return Ok(TurnOutcome {
-                text: self.text.clone(),
+                text,
                 usage: self.usage.clone(),
                 status: TURN_COMPLETED.to_string(),
                 conversation_id: self.thread_id.clone(),
@@ -632,6 +679,14 @@ fn item_text(event: &Value) -> Option<String> {
 /// best evidence; otherwise the event kind decides (`item.completed` ⇒ `Done`,
 /// `item.started`/`item.updated` ⇒ `Active`).
 fn tool_state(event: &Value, fallback: ToolState) -> ToolState {
+    // Checked **before** the status string: an item can report
+    // `status: "completed"` while its command exited non-zero, and the exit code
+    // is the truth about whether the step worked. Previously the status won, so a
+    // failed command rendered as a completed tool step.
+    if matches!(jsonl::u(event, "item.exit_code"), Some(code) if code != 0) {
+        return ToolState::Error;
+    }
+
     if let Some(status) = jsonl::s_nonempty(event, "item.status") {
         let status = status.to_ascii_lowercase();
         if status.contains("fail") || status.contains("error") || status.contains("cancel") {
@@ -643,11 +698,6 @@ fn tool_state(event: &Value, fallback: ToolState) -> ToolState {
         if status.contains("complete") || status.contains("success") || status.contains("done") {
             return ToolState::Done;
         }
-    }
-
-    // A non-zero exit code in a completed item is a failed tool step.
-    if matches!(jsonl::u(event, "item.exit_code"), Some(code) if code != 0) {
-        return ToolState::Error;
     }
 
     fallback
@@ -950,11 +1000,18 @@ pub fn describe_http_failure(code: u16, body: &str) -> PieError {
 ///
 /// Verified shape (`chatgpt.com/backend-api/wham/usage`): the windows live under
 /// `rate_limit.primary_window` / `rate_limit.secondary_window`, each with
-/// `used_percent`, `limit_window_seconds` and `reset_at` (epoch seconds). Codex's
-/// own rollout records the same windows as `primary`/`secondary` with
-/// `window_minutes` and `resets_at`, so both spellings are accepted. A window
-/// this plan does not report is simply absent (both were `null` on the
-/// development machine except `primary_window`).
+/// `used_percent`, `limit_window_seconds` and `reset_at` (epoch seconds). A window
+/// this plan does not report is simply absent (only `primary_window` was present
+/// on the development machine, as a 30-day window).
+///
+/// `limit_window_seconds` has a `window_minutes` fallback and `reset_at` has a
+/// `resets_at` fallback, both inside the same window object, because those
+/// spellings appear in codex's own on-disk rollout records.
+///
+/// Note: this reads **only** the `rate_limit.*_window` keys. An earlier version of
+/// this comment claimed the rollout's `primary`/`secondary` top-level spelling was
+/// also accepted; it never was, and a test asserted it produced nothing, so the
+/// claim was removed rather than left to mislead.
 #[cfg(feature = "http")]
 pub fn buckets_from_usage(value: &Value) -> Vec<Bucket> {
     let mut buckets = Vec::new();
@@ -984,13 +1041,31 @@ fn window_bucket(key: &str, window: &Value) -> Bucket {
     Bucket {
         label: window_label(key, seconds),
         remaining_fraction,
-        reset_at: jsonl::u(window, "reset_at")
-            .or_else(|| jsonl::u(window, "resets_at"))
-            .map(iso8601_utc),
+        reset_at: reset_at_string(window),
         // The endpoint reports percentages, not unit counts.
         used: None,
         limit: None,
     }
+}
+
+/// `reset_at` in whichever form the endpoint used.
+///
+/// `jsonl::u` alone silently dropped the timestamp when the field arrived as an
+/// ISO-8601 string (which is how `knowledge/codex.md` documents it), rendering the
+/// row with no reset time and looking like a parser bug. Epoch seconds and an
+/// already-formatted timestamp are both accepted.
+#[cfg(feature = "http")]
+fn reset_at_string(window: &Value) -> Option<String> {
+    for key in ["reset_at", "resets_at"] {
+        if let Some(seconds) = jsonl::u(window, key) {
+            return Some(iso8601_utc(seconds));
+        }
+        // Not a number: pass a timestamp through unchanged rather than dropping it.
+        if let Some(text) = jsonl::s_nonempty(window, key) {
+            return Some(text);
+        }
+    }
+    None
 }
 
 /// Name a window after its real duration, so a plan that reports a 30-day

@@ -48,23 +48,27 @@ fn live_enabled() -> bool {
     std::env::var("PIE_LIVE").is_ok_and(|v| v == "1")
 }
 
-/// Guard that keeps a live test from running by accident.
+/// Refuse a vacuous pass.
 ///
-/// Returns `false` when the tests must be skipped. Prints why, so an operator
-/// who ran `--ignored` without `PIE_LIVE=1` is not left guessing.
-fn ready(model: &str) -> bool {
+/// Returning early when `PIE_LIVE` is unset made `cargo test -- --ignored`
+/// report "5 passed" while executing nothing, with the "skipping" lines hidden
+/// in captured stderr. The QC sweep flagged that as failing open. Panicking makes
+/// the misuse loud instead of green.
+fn require_live(what: &str) {
+    assert!(
+        live_enabled(),
+        "refusing a vacuous pass: set PIE_LIVE=1 to run `{what}` - this spends real \
+         subscription quota"
+    );
+}
+
+/// Guard a live test, checking both the opt-in and the approved model.
+fn ready(model: &str) {
     assert!(
         APPROVED_MODELS.contains(&model),
         "`{model}` is not an approved live model. Approved: {APPROVED_MODELS:?} (ACCEPTANCE.md §1)"
     );
-
-    if !live_enabled() {
-        eprintln!(
-            "skipping: set PIE_LIVE=1 to run live smoke tests (this spends subscription quota)"
-        );
-        return false;
-    }
-    true
+    require_live(model);
 }
 
 /// Run `pie` with an isolated state directory.
@@ -154,9 +158,7 @@ fn assert_turn_recorded(home: &Path, provider: &str, output: &std::process::Outp
 #[test]
 #[ignore = "spends real subscription quota; requires PIE_LIVE=1 and a logged-in agy"]
 fn agy_turn_succeeds_and_is_recorded() {
-    if !ready("agy/gemini-3.8-flash") {
-        return;
-    }
+    ready("agy/gemini-3.8-flash");
     let home = tempfile::tempdir().unwrap();
 
     let output = run_pie(
@@ -182,10 +184,7 @@ fn agy_turn_succeeds_and_is_recorded() {
 #[test]
 #[ignore = "spends real subscription quota; requires PIE_LIVE=1 and a logged-in agy"]
 fn agy_usage_probe_reports_buckets() {
-    if !live_enabled() {
-        eprintln!("skipping: set PIE_LIVE=1 to run live smoke tests");
-        return;
-    }
+    require_live("agy_usage_probe_reports_buckets");
     let home = tempfile::tempdir().unwrap();
 
     let output = run_pie(home.path(), &["usage", "agy"]);
@@ -200,6 +199,17 @@ fn agy_usage_probe_reports_buckets() {
         stdout.contains("agy quota"),
         "expected a quota table, got:\n{stdout}"
     );
+    // Asserting only the header, which `render_report` prints unconditionally,
+    // let a parser returning zero buckets pass this gate. The QC sweep called that
+    // out: the test name promised more than it checked.
+    assert!(
+        !stdout.contains("no buckets reported"),
+        "the probe returned no buckets at all:\n{stdout}"
+    );
+    assert!(
+        stdout.contains('%'),
+        "expected at least one rendered remaining fraction:\n{stdout}"
+    );
 
     // A slash expansion must not be a model turn, so it must not be logged.
     assert!(
@@ -211,9 +221,7 @@ fn agy_usage_probe_reports_buckets() {
 #[test]
 #[ignore = "spends real subscription quota; requires PIE_LIVE=1 and a logged-in codex"]
 fn codex_turn_succeeds_and_is_recorded() {
-    if !ready("codex/gpt-6-luna") {
-        return;
-    }
+    ready("codex/gpt-6-luna");
     let home = tempfile::tempdir().unwrap();
 
     let output = run_pie(
@@ -237,10 +245,7 @@ fn codex_turn_succeeds_and_is_recorded() {
 #[test]
 #[ignore = "spends real subscription quota; requires PIE_LIVE=1 and a logged-in codex"]
 fn codex_usage_probe_reports_buckets() {
-    if !live_enabled() {
-        eprintln!("skipping: set PIE_LIVE=1 to run live smoke tests");
-        return;
-    }
+    require_live("codex_usage_probe_reports_buckets");
     let home = tempfile::tempdir().unwrap();
 
     let output = run_pie(home.path(), &["usage", "codex"]);
@@ -256,6 +261,14 @@ fn codex_usage_probe_reports_buckets() {
         "expected a quota table, got:\n{stdout}"
     );
     assert!(
+        !stdout.contains("no buckets reported"),
+        "the probe returned no buckets at all:\n{stdout}"
+    );
+    assert!(
+        stdout.contains('%'),
+        "expected at least one rendered remaining fraction:\n{stdout}"
+    );
+    assert!(
         session_rows(home.path()).is_empty(),
         "a quota probe must not spend a turn"
     );
@@ -266,10 +279,7 @@ fn codex_usage_probe_reports_buckets() {
 #[test]
 #[ignore = "spends real subscription quota; requires PIE_LIVE=1 and a logged-in agy"]
 fn a_live_turn_does_not_leak_key_material() {
-    if !live_enabled() {
-        eprintln!("skipping: set PIE_LIVE=1 to run live smoke tests");
-        return;
-    }
+    require_live("a_live_turn_does_not_leak_key_material");
     let home = tempfile::tempdir().unwrap();
 
     let output = run_pie(
