@@ -105,6 +105,10 @@ impl Provider for Codex {
             // config cap applies; a stdin path for oversized prompts is
             // deferred (the driver spawns children with `stdin(null)`).
             max_prompt_argv: 0,
+            // `exec` has no verified system-prompt or instructions flag, and
+            // writing an `AGENTS.md` into the user's own workspace is rejected
+            // as invasive, so the persona is folded into the prompt (DESIGN §10).
+            system_prompt: false,
         }
     }
 
@@ -338,7 +342,11 @@ pub fn build_args(cfg: &Config, req: &ChatRequest) -> Result<Vec<OsString>> {
     // No `--effort`: codex takes reasoning effort through `-c` overrides, not a
     // dedicated flag. M2 sends only the model; the catalog still reports the
     // effort axis so a later milestone can wire it up.
-    args.push(OsString::from(&req.prompt));
+    //
+    // The prompt carries the profile projection folded in front of the task
+    // text, through the same rule agy uses, so the two payloads are the
+    // identical bytes (M3's Done condition, DESIGN §10).
+    args.push(OsString::from(req.folded_prompt()));
     Ok(args)
 }
 
@@ -360,7 +368,11 @@ pub fn build_plan(cfg: &Config, req: &ChatRequest) -> Result<TurnPlan> {
         &program,
         &args,
         cap,
-        "shorten the prompt or split the task",
+        if req.has_persona() {
+            crate::provider::PROJECTION_CAP_HINT
+        } else {
+            "shorten the prompt or split the task"
+        },
     )?;
 
     Ok(TurnPlan {
@@ -1209,6 +1221,28 @@ mod tests {
         assert_eq!(a[0], "exec");
         assert_eq!(a[at + 1], "thread-9");
         assert_eq!(a.last().unwrap(), "hi", "the prompt follows the session id");
+    }
+
+    /// M3: codex has no system-prompt flag, so the projection is folded into
+    /// the prompt — and the prompt is still the last argument, after even the
+    /// `resume` subcommand.
+    #[test]
+    fn a_folded_persona_precedes_the_prompt_and_stays_last() {
+        let persona = "# Persona\ntone: terse";
+        let mut r = req();
+        r.persona = Some(persona.to_string());
+        let a = strings(&build_args(&Config::default(), &r).unwrap());
+        assert_eq!(
+            a.last().unwrap(),
+            &format!("{persona}{}hi", crate::profile::TASK_SEPARATOR)
+        );
+        assert!(!a.contains(&"--append-system-prompt".to_string()));
+
+        // Still last when the turn resumes a thread.
+        r.resume = Some("thread-9".into());
+        let a = strings(&build_args(&Config::default(), &r).unwrap());
+        assert!(a.last().unwrap().starts_with(persona));
+        assert_eq!(a[a.len() - 2], "thread-9");
     }
 
     /// Regression: `resume` is a **subcommand** of `exec`, so an option written

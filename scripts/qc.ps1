@@ -16,7 +16,8 @@
 
     G4 is the milestone's offline acceptance command, one gate per milestone
     (M0: `cargo run -- --list-backends`, M1: `cargo test --test parse_agy`,
-    M2: `cargo test --test parse_codex`). CI runs the same commands
+    M2: `cargo test --test parse_codex`, M3: `cargo test --test profile` and
+    `cargo run -- profile`). CI runs the same commands
     (.github/workflows/ci.yml) so local and CI agree.
 
     FAIL-FAST: the first failing gate writes `FAIL: <gate>` to stderr and exits
@@ -156,6 +157,8 @@ Write-Host 'PASS: G3b ignore reasons'
 Invoke-Gate -Label 'G4 acceptance (M0)' -Argv @('run', '--', '--list-backends')
 Invoke-Gate -Label 'G4 acceptance (M1)' -Argv @('test', '--test', 'parse_agy')
 Invoke-Gate -Label 'G4 acceptance (M2)' -Argv @('test', '--test', 'parse_codex')
+Invoke-Gate -Label 'G4 acceptance (M3 tests)' -Argv @('test', '--test', 'profile')
+Invoke-Gate -Label 'G4 acceptance (M3 profile)' -Argv @('run', '--', 'profile')
 Invoke-Gate -Label 'G4 acceptance (M4 auth)' -Argv @('run', '--', 'auth')
 Invoke-Gate -Label 'G4 acceptance (M4 usage)' -Argv @('run', '--', 'usage')
 

@@ -27,6 +27,7 @@ pub mod jsonl;
 pub mod logging;
 pub mod paths;
 pub mod process;
+pub mod profile;
 pub mod provider;
 pub mod report;
 pub mod session_log;

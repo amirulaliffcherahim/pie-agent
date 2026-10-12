@@ -16,11 +16,18 @@ use std::time::{Duration, Instant};
 use crate::cli::Cli;
 use crate::config::Config;
 use crate::error::{PieError, Result};
+use crate::profile::Profile;
 use crate::provider::{self, ChatRequest, StreamEvent};
 use crate::session_log::{self, SessionLogRow};
 
 /// `pie -p <PROMPT> [--model provider/model]`
 pub async fn run(cfg: &Config, cli: &Cli, prompt: &str) -> Result<()> {
+    // The projection is loaded once, before anything is spawned, and handed to
+    // whichever backend runs. Every backend receives the identical bytes (M3's
+    // Done condition, DESIGN §10); only the mechanism differs. A malformed
+    // `profile.toml` therefore fails before a turn is paid for, not after.
+    let profile = Profile::from_home()?;
+
     let (backend, model) = provider::resolve_target(cfg, cli.model.as_deref())?;
 
     let provider = provider::by_id(&backend).ok_or_else(|| PieError::UnknownBackend {
@@ -28,7 +35,7 @@ pub async fn run(cfg: &Config, cli: &Cli, prompt: &str) -> Result<()> {
         known: super::models::known_backends(),
     })?;
 
-    let request = build_request(cli, prompt, &model);
+    let request = build_request(cli, prompt, model.as_deref(), &profile);
     let started = Instant::now();
     let streamed = Arc::new(AtomicBool::new(false));
 
@@ -59,7 +66,11 @@ pub async fn run(cfg: &Config, cli: &Cli, prompt: &str) -> Result<()> {
 
             session_log::append_best_effort(&SessionLogRow::from_turn(
                 &backend,
-                &model,
+                // `general.default_backend` can select a backend without a
+                // model, and then the vendor CLI picks its own — which pie
+                // cannot name. The frozen row schema has no null, so the field
+                // is empty rather than an invented id.
+                model.as_deref().unwrap_or_default(),
                 &turn.usage,
                 elapsed_ms,
                 &turn.status,
@@ -71,7 +82,7 @@ pub async fn run(cfg: &Config, cli: &Cli, prompt: &str) -> Result<()> {
             // wall clock and is worth seeing in the totals.
             session_log::append_best_effort(&SessionLogRow::from_error(
                 &backend,
-                &model,
+                model.as_deref().unwrap_or_default(),
                 error.kind(),
                 elapsed_ms,
             ));
@@ -81,9 +92,10 @@ pub async fn run(cfg: &Config, cli: &Cli, prompt: &str) -> Result<()> {
 }
 
 /// Assemble the request from the command line.
-fn build_request(cli: &Cli, prompt: &str, model: &str) -> ChatRequest {
+fn build_request(cli: &Cli, prompt: &str, model: Option<&str>, profile: &Profile) -> ChatRequest {
     let mut request = ChatRequest::new(prompt);
-    request.model = Some(model.to_string());
+    request.model = model.map(str::to_string);
+    request.persona = profile.persona().map(str::to_string);
     request.effort = cli.effort.clone();
     request.resume = cli.resume.clone();
     request.cwd = cli

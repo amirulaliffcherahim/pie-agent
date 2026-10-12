@@ -8,6 +8,7 @@ pub mod auth;
 pub mod backends;
 pub mod models;
 pub mod print;
+pub mod profile;
 pub mod usage;
 
 use crate::cli::{Cli, Command};
@@ -29,6 +30,10 @@ pub async fn dispatch(cli: &Cli, cfg: &Config) -> Result<()> {
         }
         Some(Command::Usage { backend }) => usage::run(cfg, backend.as_deref()).await,
         Some(Command::Doctor) => backends::doctor(cfg).await,
+        // No `cfg`: `pie profile` never resolves a binary, so configuration is
+        // not part of its input. Deliberate — it keeps the command provably
+        // free of any spawn.
+        Some(Command::Profile) => profile::run(),
         None => match cli.print.as_deref() {
             Some(prompt) => print::run(cfg, cli, prompt).await,
             None => print_help(),

@@ -43,9 +43,16 @@ pub const EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 /// agy has no stdin prompt path, so the prompt must fit in argv.
 pub const PROMPT_ARGV_CAP: usize = 20_000;
 
-/// Hint shown when a prompt exceeds the argv cap.
+/// Hint shown when agy has no stdin prompt path and the *prompt* is too long.
 pub const PROMPT_CAP_HINT: &str =
     "agy has no stdin prompt path; shorten the prompt or split the task";
+
+/// Hint shown when the profile projection is what pushed the argv over the cap.
+///
+/// Pie never truncates a persona (DESIGN §10): the user is told which file to
+/// shorten instead, because silently dropping half a persona would answer with
+/// a different instruction set than the one that was configured.
+pub const PROJECTION_CAP_HINT: &str = crate::provider::PROJECTION_CAP_HINT;
 
 /// Provider id, also the `--model` prefix.
 pub const BACKEND: &str = "agy";
@@ -456,6 +463,9 @@ impl Provider for Agy {
             resume: true,
             stdin_prompt: false,
             max_prompt_argv: PROMPT_ARGV_CAP,
+            // agy has no system role at all, so the persona goes in front of
+            // the prompt text (DESIGN §10).
+            system_prompt: false,
         }
     }
 
@@ -661,11 +671,14 @@ pub fn require_subscription() -> Result<()> {
 ///     [--model <ID> --effort <E>] [--conversation <ID>]
 /// ```
 pub fn build_args(cfg: &Config, req: &ChatRequest) -> Result<Vec<OsString>> {
-    let mut args: Vec<OsString> = Vec::with_capacity(14);
+    let mut args: Vec<OsString> = Vec::with_capacity(16);
 
-    // `--print` consumes the next token as the prompt.
+    // `--print` consumes the next token as the prompt — and that prompt carries
+    // the profile projection folded in front of the task text, because agy has
+    // no system role (DESIGN §10). The same folded string reaches codex, which
+    // is M3's Done condition.
     args.push(OsString::from("--print"));
-    args.push(OsString::from(&req.prompt));
+    args.push(OsString::from(req.folded_prompt()));
 
     args.push(OsString::from("--dangerously-skip-permissions"));
     // Keeps a leading `/` in a prompt from being expanded as a slash command.
@@ -1305,7 +1318,16 @@ pub fn build_plan(cfg: &Config, req: &ChatRequest) -> Result<TurnPlan> {
     let args = build_args(cfg, req)?;
 
     let cap = cap_for(&self_caps(), cfg);
-    enforce_argv_cap("agy", &program_path, &args, cap, PROMPT_CAP_HINT)?;
+    // Name the projection when it is part of the payload: on this backend the
+    // projection competes with the user's own text for the same 20 000-char
+    // argv budget, so "shorten the prompt" would send the user to the wrong
+    // file.
+    let hint = if req.has_persona() {
+        PROJECTION_CAP_HINT
+    } else {
+        PROMPT_CAP_HINT
+    };
+    enforce_argv_cap("agy", &program_path, &args, cap, hint)?;
 
     Ok(TurnPlan {
         program: program_path,
@@ -1443,6 +1465,46 @@ mod tests {
         let err = build_plan(&cfg(), &r).unwrap_err();
         assert!(matches!(err, PieError::PromptTooLong { .. }));
         assert_eq!(err.exit_code(), 2);
+    }
+
+    /// M3: the projection is folded in front of the prompt, never truncated to
+    /// fit, and an argv that does not fit names the *projection* as the cause.
+    #[test]
+    fn a_folded_persona_is_carried_whole_or_the_turn_is_refused() {
+        let persona = "# Persona\ntone: terse";
+        let mut r = req();
+        r.persona = Some(persona.to_string());
+
+        let a = args_as_strings(&build_args(&cfg(), &r).unwrap());
+        assert_eq!(
+            a[1],
+            format!("{persona}{}hi", crate::profile::TASK_SEPARATOR),
+            "the persona goes immediately after --print, in front of the prompt"
+        );
+
+        // Too long: still built in full (nothing was dropped), then refused.
+        let mut huge = req();
+        huge.persona = Some("p".repeat(30_000));
+        let built = args_as_strings(&build_args(&cfg(), &huge).unwrap());
+        assert_eq!(
+            built[1].len(),
+            30_000 + crate::profile::TASK_SEPARATOR.len() + 2
+        );
+
+        let err = build_plan(&cfg(), &huge).unwrap_err();
+        assert!(matches!(err, PieError::PromptTooLong { .. }));
+        assert_eq!(err.exit_code(), 2);
+        assert!(
+            err.to_string().contains("projection"),
+            "the message must name the projection: {err}"
+        );
+    }
+
+    #[test]
+    fn without_a_persona_the_prompt_is_sent_untouched() {
+        let a = args_as_strings(&build_args(&cfg(), &req()).unwrap());
+        assert_eq!(a[1], "hi");
+        assert!(!a[1].contains(crate::profile::TASK_SEPARATOR));
     }
 
     #[test]

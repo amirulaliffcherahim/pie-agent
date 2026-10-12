@@ -15,7 +15,8 @@
 #
 # G4 is the milestone's offline acceptance command, one gate per milestone:
 # M0 `cargo run -- --list-backends`, M1 `cargo test --test parse_agy`,
-# M2 `cargo test --test parse_codex`. CI runs the same commands, through this
+# M2 `cargo test --test parse_codex`, M3 `cargo test --test profile` +
+# `cargo run -- profile`. CI runs the same commands, through this
 # same script (.github/workflows/ci.yml), so local and CI cannot drift apart.
 # Add the next milestone's command when it lands. `tests/acceptance.rs` asserts
 # what the M0 table actually prints, because this gate only sees the exit status.
@@ -148,6 +149,8 @@ run_gate 'G3b ignore reasons' check_ignore_reasons
 run_gate 'G4 acceptance (M0)' cargo run -- --list-backends
 run_gate 'G4 acceptance (M1)' cargo test --test parse_agy
 run_gate 'G4 acceptance (M2)' cargo test --test parse_codex
+run_gate 'G4 acceptance (M3 tests)' cargo test --test profile
+run_gate 'G4 acceptance (M3 profile)' cargo run -- profile
 run_gate 'G4 acceptance (M4 auth)' cargo run -- auth
 run_gate 'G4 acceptance (M4 usage)' cargo run -- usage
 

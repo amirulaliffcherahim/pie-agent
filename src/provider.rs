@@ -29,6 +29,24 @@ pub mod driver;
 /// Provider ids, in display and registry order.
 pub const BACKEND_IDS: [&str; 3] = ["agy", "codex", "claude"];
 
+/// Backend pie uses when the caller names neither a model nor a backend.
+///
+/// Measured, not guessed (`DESIGN.md` §10): codex answers a turn in ~3.6 s and
+/// agy in ~40 s (`knowledge/agy.md`), so an unnamed backend must be codex — a
+/// default that silently spends a slower premium subscription on a trivial
+/// question is exactly the failure routing exists to prevent.
+pub const DEFAULT_BACKEND: &str = "codex";
+
+/// Argv-cap hint used when the profile projection is part of the payload.
+///
+/// The projection competes with the user's own text for the same argv budget on
+/// a backend with no stdin prompt path, so the error must name it as the likely
+/// cause (`DESIGN.md` §10). Truncating the persona is never the answer: half a
+/// persona silently changes what the model was told.
+pub const PROJECTION_CAP_HINT: &str = "the profile projection (profile.toml + AGENTS.md + \
+                                       memory/*.md) is folded into the prompt; shorten the \
+                                       projection or the task — pie never truncates a persona";
+
 /// One selectable model.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Model {
@@ -65,6 +83,16 @@ pub struct Capabilities {
     pub stdin_prompt: bool,
     /// Maximum argv length for the prompt; `0` means unlimited.
     pub max_prompt_argv: usize,
+    /// Does the CLI have a system prompt pie can append to?
+    ///
+    /// `true` only for claude (`--append-system-prompt <text>`,
+    /// `knowledge/claude.md`). agy has no system role at all, and `codex exec`
+    /// has no verified system-prompt or instructions flag — writing an
+    /// `AGENTS.md` into the user's own workspace is rejected as invasive — so
+    /// both receive the projection **folded in front of the prompt text**
+    /// (`DESIGN.md` §10). The same bytes go either way; only the mechanism
+    /// differs.
+    pub system_prompt: bool,
 }
 
 /// One turn's request.
@@ -72,6 +100,13 @@ pub struct Capabilities {
 pub struct ChatRequest {
     /// The user prompt.
     pub prompt: String,
+    /// The assembled profile projection, when the user configured one.
+    ///
+    /// Loaded once per turn by `print.rs` and handed to *every* backend
+    /// unchanged, so agy and codex receive byte-identical text (M3's Done
+    /// condition). `None` — never `Some("")` — means the user configured no
+    /// persona, and no backend may receive one they did not write.
+    pub persona: Option<String>,
     /// Bare model id, backend already selected.
     pub model: Option<String>,
     /// Reasoning effort, backend-specific vocabulary.
@@ -89,12 +124,27 @@ impl ChatRequest {
     pub fn new(prompt: impl Into<String>) -> Self {
         Self {
             prompt: prompt.into(),
+            persona: None,
             model: None,
             effort: None,
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             resume: None,
             timeout: None,
         }
+    }
+
+    /// Whether a persona would be sent at all.
+    pub fn has_persona(&self) -> bool {
+        crate::profile::has_persona(self.persona.as_deref())
+    }
+
+    /// The prompt text as a backend with **no** system-prompt flag receives it.
+    ///
+    /// agy and codex both fold, and both call this one function, so their
+    /// payloads cannot drift apart. A backend with a real system prompt
+    /// (claude) uses [`Self::persona`] instead and sends `prompt` untouched.
+    pub fn folded_prompt(&self) -> String {
+        crate::profile::fold(self.persona.as_deref(), &self.prompt)
     }
 }
 
@@ -406,32 +456,59 @@ pub fn parse_model_spec(spec: &str) -> Result<(String, String)> {
 
 /// Which backend and model a run should use.
 ///
-/// Order: explicit `--model`, then `general.default_model`, then an error with
-/// actionable advice — never a silent default, because a wrong default spends
-/// the wrong subscription.
-pub fn resolve_target(cfg: &Config, model_flag: Option<&str>) -> Result<(String, String)> {
-    let spec = match model_flag
+/// Order: explicit `--model` → `general.default_model` →
+/// `general.default_backend` (that backend's own default model) → an error with
+/// actionable advice. Never a silent *fallback*: a misspelt backend name is a
+/// config error, because the alternative is answering with a different
+/// subscription than the one that was asked for.
+///
+/// The model is `None` when a **backend** was selected rather than a
+/// `provider/model` pair. pie then passes no `--model` at all and the vendor CLI
+/// picks its own default, which is why the model is optional here rather than
+/// invented.
+pub fn resolve_target(cfg: &Config, model_flag: Option<&str>) -> Result<(String, Option<String>)> {
+    let spec = model_flag
         .map(str::to_string)
-        .or_else(|| cfg.general.default_model.clone())
-    {
-        Some(s) => s,
-        None => {
-            return Err(PieError::Config(
-                "no model selected — pass `--model provider/model` or set \
-                 `general.default_model` in config.toml"
-                    .to_string(),
-            ))
-        }
-    };
+        .or_else(|| cfg.general.default_model.clone());
 
-    let (backend, model) = parse_model_spec(&spec)?;
-    if by_id(&backend).is_none() {
-        return Err(PieError::UnknownBackend {
-            backend,
-            known: BACKEND_IDS.iter().map(|s| (*s).to_string()).collect(),
-        });
+    if let Some(spec) = spec {
+        let (backend, model) = parse_model_spec(&spec)?;
+        require_known(&backend)?;
+        return Ok((backend, Some(model)));
     }
-    Ok((backend, model))
+
+    // A blank `default_backend` is the documented way to turn routing off and
+    // get the "no model selected" error back, so it reads as "unset".
+    let backend = cfg
+        .general
+        .default_backend
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty());
+
+    match backend {
+        Some(backend) => {
+            require_known(backend)?;
+            Ok((backend.to_string(), None))
+        }
+        None => Err(PieError::Config(
+            "no model selected — pass `--model provider/model`, or set \
+             `general.default_model` (a model) or `general.default_backend` (a backend) in \
+             config.toml"
+                .to_string(),
+        )),
+    }
+}
+
+/// Reject a backend id that is not in the registry.
+fn require_known(backend: &str) -> Result<()> {
+    if by_id(backend).is_some() {
+        return Ok(());
+    }
+    Err(PieError::UnknownBackend {
+        backend: backend.to_string(),
+        known: BACKEND_IDS.iter().map(|s| (*s).to_string()).collect(),
+    })
 }
 
 #[cfg(test)]
@@ -490,20 +567,99 @@ mod tests {
     #[test]
     fn resolve_target_prefers_flag_then_config_then_errors() {
         let mut cfg = Config::default();
-        assert!(matches!(
-            resolve_target(&cfg, None),
-            Err(PieError::Config(_))
-        ));
+        // M3 gives `general.default_backend` a built-in value (codex), so a
+        // default config no longer lands here. The error survives for a config
+        // that turns the default off, which is the only state in which there is
+        // neither a default *nor* a flag (DESIGN §10).
+        cfg.general.default_backend = None;
+        let err = resolve_target(&cfg, None).unwrap_err();
+        assert!(matches!(err, PieError::Config(_)));
+        assert!(err.to_string().contains("no model selected"));
 
         cfg.general.default_model = Some("codex/gpt-6-luna".into());
         assert_eq!(
             resolve_target(&cfg, None).unwrap(),
-            ("codex".to_string(), "gpt-6-luna".to_string())
+            ("codex".to_string(), Some("gpt-6-luna".to_string()))
         );
         assert_eq!(
             resolve_target(&cfg, Some("agy/gemini-3.8-flash")).unwrap(),
-            ("agy".to_string(), "gemini-3.8-flash".to_string())
+            ("agy".to_string(), Some("gemini-3.8-flash".to_string()))
         );
+    }
+
+    #[test]
+    fn the_default_backend_routes_without_a_model() {
+        let cfg = Config::default();
+        assert_eq!(
+            cfg.general.default_backend.as_deref(),
+            Some(DEFAULT_BACKEND),
+            "DESIGN §10: codex is the default (~3.6 s a turn against agy's ~40 s)"
+        );
+        assert_eq!(
+            resolve_target(&cfg, None).unwrap(),
+            ("codex".to_string(), None),
+            "no model is invented: codex is left to pick its own"
+        );
+
+        // A blank value disables routing and restores the error.
+        let mut off = Config::default();
+        off.general.default_backend = Some("  ".into());
+        assert!(matches!(
+            resolve_target(&off, None),
+            Err(PieError::Config(_))
+        ));
+    }
+
+    #[test]
+    fn an_unrecognised_default_backend_is_a_config_error_not_a_fallback() {
+        let mut cfg = Config::default();
+        cfg.general.default_backend = Some("geminy".into());
+
+        let err = resolve_target(&cfg, None).unwrap_err();
+        assert!(matches!(err, PieError::UnknownBackend { .. }));
+        assert_eq!(err.exit_code(), 2);
+
+        // An explicit flag still wins: the unused default is not validated.
+        assert_eq!(
+            resolve_target(&cfg, Some("agy/gemini-3.8-flash")).unwrap(),
+            ("agy".to_string(), Some("gemini-3.8-flash".to_string()))
+        );
+    }
+
+    #[test]
+    fn only_claude_declares_a_system_prompt_mechanism() {
+        let by_id = |id: &str| {
+            registry()
+                .into_iter()
+                .find(|p| p.id() == id)
+                .unwrap()
+                .capabilities()
+                .system_prompt
+        };
+        assert!(!by_id("agy"), "agy has no system role (PLAN §8)");
+        assert!(
+            !by_id("codex"),
+            "codex exec has no verified system-prompt flag"
+        );
+        assert!(
+            by_id("claude"),
+            "--append-system-prompt (knowledge/claude.md)"
+        );
+    }
+
+    #[test]
+    fn folding_uses_the_shared_rule_for_every_backend_without_a_system_prompt() {
+        let mut req = ChatRequest::new("do the thing");
+        req.persona = Some("# Persona\ntone: terse".into());
+        assert!(req.has_persona());
+        assert_eq!(
+            req.folded_prompt(),
+            "# Persona\ntone: terse\n---\ndo the thing"
+        );
+
+        let plain = ChatRequest::new("do the thing");
+        assert!(!plain.has_persona());
+        assert_eq!(plain.folded_prompt(), "do the thing");
     }
 
     #[test]

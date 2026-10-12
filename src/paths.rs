@@ -5,6 +5,15 @@
 
 use std::path::PathBuf;
 
+/// The structured persona file, relative to `PIE_HOME` (M3).
+pub const PROFILE_FILE: &str = "profile.toml";
+
+/// The freeform rules file, relative to `PIE_HOME` (M3).
+pub const AGENTS_FILE: &str = "AGENTS.md";
+
+/// The durable-memory directory, relative to `PIE_HOME` (M3).
+pub const MEMORY_DIR: &str = "memory";
+
 /// Root of pie's state directory. Honours `PIE_HOME`, else `~/.pie`.
 pub fn pie_home() -> PathBuf {
     if let Some(v) = non_empty_env("PIE_HOME") {
@@ -68,9 +77,19 @@ pub fn reports_dir() -> PathBuf {
     pie_home().join("reports")
 }
 
+/// `$PIE_HOME/profile.toml` — structured persona (M3).
+pub fn profile_file() -> PathBuf {
+    pie_home().join(PROFILE_FILE)
+}
+
+/// `$PIE_HOME/AGENTS.md` — freeform rules, appended after the persona (M3).
+pub fn agents_file() -> PathBuf {
+    pie_home().join(AGENTS_FILE)
+}
+
 /// `$PIE_HOME/memory/` — durable memory (M3).
 pub fn memory_dir() -> PathBuf {
-    pie_home().join("memory")
+    pie_home().join(MEMORY_DIR)
 }
 
 /// The legacy `~/.pie/auth.json` written by the earlier JS implementation.
@@ -126,6 +145,20 @@ mod tests {
         ]);
         assert_eq!(home_dir(), Some(PathBuf::from("/home/win")));
         assert_eq!(pie_home(), PathBuf::from("/home/win").join(".pie"));
+    }
+
+    /// M3's three sources, and the names `profile.rs` joins under an arbitrary
+    /// root. One source of truth, in the module that owns the layout.
+    #[test]
+    fn profile_sources_are_named_by_their_layout_constants() {
+        let _env = EnvGuard::set(&[("PIE_HOME", Some("/tmp/pie-home"))]);
+        let home = PathBuf::from("/tmp/pie-home");
+        assert_eq!(profile_file(), home.join("profile.toml"));
+        assert_eq!(agents_file(), home.join("AGENTS.md"));
+        assert_eq!(memory_dir(), home.join("memory"));
+        assert_eq!(PROFILE_FILE, "profile.toml");
+        assert_eq!(AGENTS_FILE, "AGENTS.md");
+        assert_eq!(MEMORY_DIR, "memory");
     }
 
     #[test]

@@ -473,15 +473,24 @@ pub fn redact(input: &str) -> String {
 /// under-redacting leaks a credential into a log (`RISKS.md` §10).
 const OPAQUE_RUN_MIN: usize = 40;
 
-/// Replace every unbroken run of `[A-Za-z0-9._-+/=]` that is long enough to be
-/// a secret.
+/// Replace every unbroken run of `[A-Za-z0-9._\-+=]` that is long enough to be a
+/// secret.
 ///
-/// `+`, `/` and `=` are included because standard base64 uses them; without them
-/// a single base64 credential is split at the first `+` or `/` into fragments
-/// that each fall under the threshold and survive.
+/// **`/` is deliberately NOT a run character.** It was added while fixing B13, to
+/// catch base64 secrets that contain it, and that over-corrected into a new bug: a
+/// diagnostic quoting a real path got the path redacted. `C:/Users/…/Temp/tmp.mYBqmsL2HF/config.toml`
+/// printed as `C:«redacted»\config.toml`, and a config error that cannot name the
+/// offending file is close to useless. Paths are far more common in diagnostics
+/// than unprefixed base64, so the path wins.
+///
+/// The residual gap is accepted and recorded: a long base64 secret containing `/`
+/// can survive in fragments. The precise mechanism is `SECRET_PREFIXES` below, which
+/// catches known credential shapes regardless of length; the run heuristic is the
+/// backstop for unknown shapes. `+` and `=` stay, since they are rare in paths and
+/// common in base64.
 fn collapse_long_runs(input: &str) -> String {
     fn is_run_char(c: char) -> bool {
-        c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+' | '/' | '=')
+        c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+' | '=')
     }
 
     fn flush(out: &mut String, run: &mut String) {
@@ -641,6 +650,31 @@ mod tests {
     /// Regression: standard base64 uses `+`, `/` and `=`. They were not run
     /// characters, so one credential was split at the first `+` or `/` into
     /// fragments that each fell under the threshold and survived intact.
+    /// Regression: adding `/` to the run charset (while fixing B13) made the
+    /// redactor eat file paths out of diagnostics. `C:/Users/…/Temp/tmp.X/config.toml`
+    /// printed as `C:«redacted»\config.toml`, which makes a config error unable to
+    /// say which file failed.
+    #[test]
+    fn a_long_path_in_a_diagnostic_is_not_redacted() {
+        let path = "C:/Users/amiru/AppData/Local/Temp/tmp.mYBqmsL2HF/config.toml";
+        let message = format!("config: {path}: TOML parse error at line 1");
+
+        let redacted = redact(&message);
+        assert!(
+            redacted.contains(path),
+            "the path must survive redaction, or the error cannot name the file: {redacted}"
+        );
+        assert!(redacted.contains("TOML parse error"));
+
+        // A unix-style path too.
+        let unix = "/home/someone/very/long/project/path/that/exceeds/the/threshold/config.toml";
+        assert!(
+            redact(unix).contains(unix),
+            "unix paths must survive too: {}",
+            redact(unix)
+        );
+    }
+
     #[test]
     fn redacts_base64_containing_plus_slash_and_equals() {
         let blob = format!(

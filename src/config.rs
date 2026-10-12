@@ -47,6 +47,14 @@ pub struct Config {
 pub struct General {
     /// `provider/model`, used when `--model` is omitted.
     pub default_model: Option<String>,
+    /// Backend used when neither `--model` nor `default_model` names one (M3).
+    ///
+    /// Defaults to [`crate::provider::DEFAULT_BACKEND`] (codex, on the measured
+    /// ~3.6 s-versus-~40 s grounds in `DESIGN.md` §10). Setting it to an empty
+    /// string turns routing off, so the "no model selected" error comes back.
+    /// A name that is not a known backend is a config error, never a silent
+    /// fallback to a different subscription.
+    pub default_backend: Option<String>,
     /// Whole-turn deadline.
     pub timeout_secs: u64,
     /// Hard cap on the argv we build for a CLI with no stdin prompt path.
@@ -61,6 +69,7 @@ impl Default for General {
     fn default() -> Self {
         Self {
             default_model: None,
+            default_backend: Some(crate::provider::DEFAULT_BACKEND.to_string()),
             timeout_secs: 600,
             prompt_argv_cap: 20_000,
             color: ColorMode::Auto,
@@ -215,6 +224,14 @@ impl Config {
         if let Some(v) = env_non_empty("PIE_DEFAULT_MODEL") {
             self.general.default_model = Some(v);
         }
+        // Deliberately not `env_non_empty`: a *set but empty* variable has to be
+        // honoured, because that is how a user turns routing off and gets the
+        // "no model selected" error back. Ignoring it would silently keep
+        // spending a backend the user just opted out of.
+        if let Ok(raw) = std::env::var("PIE_DEFAULT_BACKEND") {
+            let name = raw.trim();
+            self.general.default_backend = (!name.is_empty()).then(|| name.to_string());
+        }
         if let Some(v) = env_non_empty("PIE_TIMEOUT_SECS") {
             self.general.timeout_secs = parse_num(&v, "PIE_TIMEOUT_SECS")?;
         }
@@ -351,6 +368,12 @@ mod tests {
         assert_eq!(g.timeout_secs, 600);
         assert_eq!(g.prompt_argv_cap, 20_000);
         assert_eq!(g.color, ColorMode::Auto);
+        assert_eq!(
+            g.default_backend.as_deref(),
+            Some(crate::provider::DEFAULT_BACKEND),
+            "M3 routes to codex by default (DESIGN §10)"
+        );
+        assert!(g.default_model.is_none(), "no model is invented by default");
         assert_eq!(Agy::default().default_effort.as_deref(), Some("medium"));
         assert_eq!(Agy::default().print_timeout_secs, 0);
         assert!(!Claude::default().enabled, "claude stays off by default");
@@ -390,6 +413,44 @@ mod tests {
         let mut cfg = Config::default();
         let err = cfg.apply_env().unwrap_err();
         assert!(err.to_string().contains("PIE_CODEX_QUOTA_PROBE"));
+    }
+
+    /// M3 routing: the backend can be chosen from the file or the environment,
+    /// and an empty value is a *deliberate* opt-out rather than a no-op.
+    #[test]
+    fn the_default_backend_is_configurable_and_can_be_turned_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[general]\ndefault_backend = \"agy\"\n").unwrap();
+        assert_eq!(
+            Config::load_from(&path).unwrap().general.default_backend,
+            Some("agy".to_string())
+        );
+
+        let _env = EnvGuard::set(&[("PIE_DEFAULT_BACKEND", Some("agy"))]);
+        let mut cfg = Config::default();
+        cfg.apply_env().unwrap();
+        assert_eq!(cfg.general.default_backend.as_deref(), Some("agy"));
+    }
+
+    #[test]
+    fn an_empty_default_backend_means_no_default_at_all() {
+        let _env = EnvGuard::set(&[("PIE_DEFAULT_BACKEND", Some("  "))]);
+        let mut cfg = Config::default();
+        cfg.apply_env().unwrap();
+        assert_eq!(
+            cfg.general.default_backend, None,
+            "a set-but-empty variable must be honoured, not ignored"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[general]\ndefault_backend = \"\"\n").unwrap();
+        assert_eq!(
+            Config::load_from(&path).unwrap().general.default_backend,
+            Some(String::new()),
+            "read as unset by resolve_target, which is where it is consumed"
+        );
     }
 
     #[test]

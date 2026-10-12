@@ -91,6 +91,12 @@ pub enum Command {
 
     /// Check binaries, versions and auth without spending quota.
     Doctor,
+
+    /// Show the assembled persona projection and where each part came from.
+    ///
+    /// Reads pie's own files only: no vendor CLI is spawned and no session row
+    /// is written, so this costs nothing to run.
+    Profile,
 }
 
 #[cfg(test)]
@@ -148,6 +154,10 @@ mod tests {
         assert!(matches!(
             Cli::try_parse_from(["pie", "doctor"]).unwrap().command,
             Some(Command::Doctor)
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["pie", "profile"]).unwrap().command,
+            Some(Command::Profile)
         ));
     }
 

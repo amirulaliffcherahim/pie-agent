@@ -459,6 +459,12 @@ each other in the opposite order to the one they are listed in.
 
 ## 11. CLI surface for M0–M3
 
+Additions since M0–M2: `--resume <ID>` (M5-preview, see §10's note on ordering) and
+`profile` (M3). `profile` prints the assembled projection and the provenance of each
+contribution, spawns nothing, spends no quota and writes no session row — it exists
+so the persona is *inspectable*, because a persona you cannot read is one you cannot
+debug.
+
 ```
 pie --list-backends                 # M0 gate
 pie models [--backend B] [--refresh]

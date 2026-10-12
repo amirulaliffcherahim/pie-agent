@@ -12,6 +12,7 @@
 //! that loop until M9. Advertising a capability we cannot honour would make the
 //! agent loop branch into a path that does not exist.
 
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 use async_trait::async_trait;
@@ -51,6 +52,10 @@ impl Provider for Claude {
             resume: true,
             stdin_prompt: true,
             max_prompt_argv: 0,
+            // The one backend with a real system prompt: the persona goes
+            // through `--append-system-prompt` rather than being folded into
+            // the prompt text (`DESIGN.md` §10, `knowledge/claude.md`).
+            system_prompt: true,
         }
     }
 
@@ -110,10 +115,109 @@ impl Provider for Claude {
     }
 }
 
+/// Build the argv for one turn. Pure and unit-tested.
+///
+/// Written to spec from `knowledge/claude.md` and **unverified live**: there is
+/// no Claude subscription on this machine, so `stream()` is still
+/// [`PieError::Unsupported`] and nothing outside the tests calls this yet. It
+/// exists now because M3's contract is "one mechanism per backend, one identical
+/// persona", and the mechanism is the part that can be got wrong on paper.
+///
+/// ```text
+/// claude -p <PROMPT> --output-format stream-json --dangerously-skip-permissions
+///     --add-dir <CWD> [--model <ID>] [--append-system-prompt <PERSONA>]
+/// ```
+///
+/// The prompt is **not** folded here: claude has a system role, so the persona
+/// travels in `--append-system-prompt` and the task text stays the task text.
+/// The bytes handed over are the same bytes agy and codex fold in.
+pub fn build_args(cfg: &Config, req: &ChatRequest) -> Result<Vec<OsString>> {
+    let _ = cfg;
+    let mut args: Vec<OsString> = Vec::with_capacity(11);
+
+    args.push(OsString::from("-p"));
+    args.push(OsString::from(&req.prompt));
+    args.push(OsString::from("--output-format"));
+    args.push(OsString::from("stream-json"));
+    args.push(OsString::from("--dangerously-skip-permissions"));
+    args.push(OsString::from("--add-dir"));
+    args.push(req.cwd.clone().into_os_string());
+
+    if let Some(model) = &req.model {
+        args.push(OsString::from("--model"));
+        args.push(OsString::from(model));
+    }
+
+    // Never `Some("")`: an empty system prompt would still be an injection.
+    if let Some(persona) = req.persona.as_deref().filter(|p| !p.trim().is_empty()) {
+        args.push(OsString::from("--append-system-prompt"));
+        args.push(OsString::from(persona));
+    }
+
+    Ok(args)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
+
+    fn strings(args: &[OsString]) -> Vec<String> {
+        args.iter()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn the_persona_goes_through_append_system_prompt() {
+        let persona = "# Persona\ntone: terse";
+        let mut req = ChatRequest::new("hi");
+        req.persona = Some(persona.to_string());
+
+        let a = strings(&build_args(&Config::default(), &req).unwrap());
+        let at = a
+            .iter()
+            .position(|x| x == "--append-system-prompt")
+            .expect("claude takes the persona as a system prompt");
+        assert_eq!(a[at + 1], persona, "the projection verbatim, not folded");
+        assert_eq!(a[1], "hi", "the task text is not folded for claude");
+        assert!(!a[1].contains(crate::profile::TASK_SEPARATOR));
+    }
+
+    #[test]
+    fn without_a_persona_no_system_prompt_argument_is_added() {
+        let a = strings(&build_args(&Config::default(), &ChatRequest::new("hi")).unwrap());
+        assert!(!a.contains(&"--append-system-prompt".to_string()));
+
+        let mut blank = ChatRequest::new("hi");
+        blank.persona = Some("   ".into());
+        let a = strings(&build_args(&Config::default(), &blank).unwrap());
+        assert!(!a.contains(&"--append-system-prompt".to_string()));
+    }
+
+    #[test]
+    fn argv_matches_the_documented_print_mode_shape() {
+        let mut req = ChatRequest::new("hi");
+        req.cwd = PathBuf::from("C:/work");
+        req.model = Some("claude-sonnet-4-6".into());
+
+        let a = strings(&build_args(&Config::default(), &req).unwrap());
+        assert_eq!(a[0], "-p");
+        for required in [
+            "--output-format",
+            "stream-json",
+            "--dangerously-skip-permissions",
+            "--add-dir",
+            "C:/work",
+            "--model",
+            "claude-sonnet-4-6",
+        ] {
+            assert!(
+                a.contains(&required.to_string()),
+                "missing {required} in {a:?}"
+            );
+        }
+    }
 
     #[test]
     fn does_not_advertise_a_tool_loop_it_has_not_built() {
