@@ -283,9 +283,15 @@ The reviewer must not be the same agent that wrote the code.
 
 Appended as gates pass. Evidence = command + observed result, not a claim.
 
+**Convention:** every count and quoted output in this table is a *snapshot at the
+commit that recorded it*, not a claim about the current tree. The QC sweep caught
+the M0 row being read as current when its numbers were the M0 commit's. To learn
+what HEAD does, run `scripts/qc.ps1` / `scripts/qc.sh` — never trust a number
+here. A row is a record of what was verified, not a substitute for verifying.
+
 | Milestone | G1 | G2 | G3 | G4 | G5 | G6 | Verdict | Evidence |
 |---|---|---|---|---|---|---|---|---|
-| M0 | ✅ | ✅ | ✅ | ✅ | n/a | ✅ | **done** | 113 tests pass (100 lib + 6 `no_secrets` + 7 `process`), 5 live-smoke tests correctly ignored; `--list-backends` prints agy/codex/claude with agy `1.3.3`, codex `codex-cli 0.162.0`, claude `2.1.296` + `no-subscription`; `cargo check --target x86_64-unknown-linux-gnu --all-targets --no-default-features` clean |
+| M0 | ✅ | ✅ | ✅ | ✅ | n/a | ✅ | **done** | Snapshot at the M0 commit (`1ee7c18`). 113 tests passed then (100 lib + 6 `no_secrets` + 7 `process`), 5 live-smoke tests correctly ignored; `--list-backends` printed agy/codex/claude with agy `1.3.3`, codex `codex-cli 0.162.0`, claude `2.1.296` + `no-subscription`; `cargo check --target x86_64-unknown-linux-gnu --all-targets --no-default-features` clean. **Not the current total** — see the M1/M2 rows for HEAD, and re-run `scripts/qc.ps1` rather than trusting any number here |
 | M1 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | **done** | G4 `cargo test --test parse_agy` → 31 passed. G5 live: a real `agy/gemini-3.8-flash` turn printed `ok` (exit 0) and logged `{input_tokens:20661, cached_input_tokens:0, output_tokens:23, reasoning_tokens:22, ok:true, stop_reason:"SUCCESS"}`; no key material in stdout or stderr; a second live turn passed `agy_turn_succeeds_and_is_recorded` and the free probe passed `agy_usage_probe_reports_buckets`. `pie usage agy` rendered all 4 real buckets across 2 groups with group **and** window visible, and logged no session row. G6 clean |
 | M2 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | **done** | G4 `cargo test --test parse_codex` → 34 passed. G5 live: a real `codex/gpt-6-luna` turn printed `ok` (exit 0) and logged `{input_tokens:13424, cached_input_tokens:1792, output_tokens:5, reasoning_tokens:0, ok:true, stop_reason:"completed"}` — the full frozen schema, and the first live evidence that the vendor prefix cache actually operates (13.3% on a trivial turn). `pie usage codex` printed `30d 88.0% 2026-11-08T01:52:52Z` and logged **no** session row, proving a probe is not a turn. G6 clean |
 
