@@ -284,6 +284,11 @@ Invoke-Gate -Label 'G4 acceptance (M8 news)' -Argv @('test', '--test', 'news')
 Invoke-Gate -Label 'G4 acceptance (M8 report)' -Argv @('test', '--test', 'watchtower')
 Invoke-Gate -Label 'G4 acceptance (M8 command)' -Argv @('test', '--test', 'watch_cmd')
 
+# M9's stages. Its G5 is `n/a` rather than skipped: there is no Claude credential on this
+# machine, so no live turn is possible - recorded rather than silently absent.
+Invoke-Gate -Label 'G4 acceptance (M9 claude stream)' -Argv @('test', '--test', 'parse_claude')
+Invoke-Gate -Label 'G4 acceptance (M9 tool loop)' -Argv @('test', '--test', 'tool_loop')
+
 # --- G4 (M6 tui non-TTY) ----------------------------------------------------
 # ACCEPTANCE section 9: `pie tui` on a non-TTY stdin must fail with a clear message
 # rather than emitting escape codes into a pipe.

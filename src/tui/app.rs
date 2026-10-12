@@ -739,6 +739,18 @@ pub fn apply_event(app: &mut App, event: &StreamEvent) {
                 state: *state,
             });
         }
+        // A tool the **vendor is asking pie to run** (M9). It is displayed as a tool row
+        // because that is what the user sees, but it is recorded as `Active`: a call is
+        // the start of a step, and only a later `ToolStep` can say how it ended. The
+        // arguments are deliberately not rendered — they are the vendor's payload, not a
+        // sentence, and a transcript full of JSON is one nobody reads.
+        StreamEvent::ToolUse { name, .. } => {
+            app.tool_events.push((name.clone(), ToolState::Active));
+            app.transcript.push(Entry::Tool {
+                name: name.clone(),
+                state: ToolState::Active,
+            });
+        }
         StreamEvent::Usage(usage) => match app.last_usage.as_mut() {
             Some(existing) => existing.merge(usage.clone()),
             None => app.last_usage = Some(usage.clone()),

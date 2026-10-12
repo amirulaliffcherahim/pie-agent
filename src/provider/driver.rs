@@ -40,6 +40,22 @@ pub trait EventRouter: Send {
     /// Interpret one stdout line. Return an event to surface, or `None`.
     fn on_line(&mut self, line: &str) -> Option<StreamEvent>;
 
+    /// Events still owed from the line just handed to [`EventRouter::on_line`].
+    ///
+    /// **Default: none**, because a backend whose stream puts at most one event per line
+    /// owes nothing — agy and codex need no change here. claude is why this exists: one
+    /// `assistant` message may carry several content blocks (`text`, `tool_use`, `text`),
+    /// and the frozen `on_line` signature can only return one of them.
+    ///
+    /// It is a trait method rather than a note on `ClaudeRouter` because a router that
+    /// owes events and a `drive` that never asks would lose them **silently** — and the
+    /// one thing it would lose is a `tool_use`, which is a turn that never finishes. A
+    /// future session wiring claude to `drive` cannot get that wrong now: `drive` drains
+    /// unconditionally.
+    fn drain_pending(&mut self) -> Vec<StreamEvent> {
+        Vec::new()
+    }
+
     /// Build the outcome once stdout has closed.
     ///
     /// `exit_code`/`exit_status`/`stderr_tail` describe the child; a healthy
@@ -74,17 +90,13 @@ pub async fn drive(
     let summary = {
         let mut on_line = |line: &str| {
             if let Some(event) = router.on_line(line) {
-                if let StreamEvent::Unparsed(raw) = &event {
-                    // Redacted: this is a vendor stdout line, and with
-                    // `PIE_LOG=debug` it goes straight to stderr. A line like
-                    // `OPENAI_API_KEY=sk-…` used to be logged verbatim (I10).
-                    tracing::debug!(
-                        backend = %backend,
-                        line = %crate::error::truncate(&process::redact(raw), 200),
-                        "stdout line was not JSON"
-                    );
-                }
-                sink(event);
+                emit_event(&backend, sink, event);
+            }
+            // Unconditional: a router that owes events and a driver that never asks would
+            // lose them with nothing to notice. The default is empty, so this costs agy and
+            // codex nothing.
+            for extra in router.drain_pending() {
+                emit_event(&backend, sink, extra);
             }
         };
         process::run_streaming(&spec, &mut on_line).await?
@@ -123,6 +135,25 @@ pub async fn drive(
     }
 
     Ok(outcome)
+}
+
+/// Surface one event, with the redaction the unparsed case needs.
+///
+/// Split out of the closure so the drain loop and the primary event go through **one**
+/// path: a second `sink(event)` call with its own logging would be a place for the
+/// redaction to be forgotten (I10, and B15 was exactly that omission).
+fn emit_event(backend: &str, sink: &mut (dyn FnMut(StreamEvent) + Send), event: StreamEvent) {
+    if let StreamEvent::Unparsed(raw) = &event {
+        // Redacted: this is a vendor stdout line, and with `PIE_LOG=debug` it goes
+        // straight to stderr. A line like `OPENAI_API_KEY=sk-…` used to be logged
+        // verbatim (I10).
+        tracing::debug!(
+            backend = %backend,
+            line = %crate::error::truncate(&process::redact(raw), 200),
+            "stdout line was not JSON"
+        );
+    }
+    sink(event);
 }
 
 /// Measure the argv as it will reach `CreateProcess`, approximately.

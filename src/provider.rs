@@ -247,6 +247,25 @@ pub enum StreamEvent {
         /// Short description, when the CLI provides one.
         info: Option<String>,
     },
+    /// A tool the CLI is **asking pie to run** (M9).
+    ///
+    /// Additive: M6–M8 never see one, because `agy --print` and `codex exec` run their
+    /// own tools and cannot accept an injected result (`RISKS.md` §1). This is the event
+    /// that makes a `tool_use` → `tool_result` loop possible at all.
+    ///
+    /// [`StreamEvent::ToolStep`] could not carry it: that is the *display* event, and it
+    /// has neither the `tool_use_id` a `tool_result` must answer nor the arguments a
+    /// runner needs. Widening it would put tool input into the transcript for a reader
+    /// who never sees it, which is why this is a variant rather than a field.
+    #[serde(rename = "tool_use")]
+    ToolUse {
+        /// The vendor's id. The matching `tool_result` must echo it.
+        id: String,
+        /// Tool name, as the vendor spelled it.
+        name: String,
+        /// Arguments, opaque to pie — it routes them, it does not interpret them.
+        input: serde_json::Value,
+    },
     /// Token accounting.
     #[serde(rename = "usage")]
     Usage(Usage),
@@ -278,6 +297,7 @@ impl StreamEvent {
             StreamEvent::Init { .. } => "init",
             StreamEvent::TextDelta(_) => "text",
             StreamEvent::ToolStep { .. } => "tool",
+            StreamEvent::ToolUse { .. } => "tool_use",
             StreamEvent::Usage(_) => "usage",
             StreamEvent::Done { .. } => "done",
             StreamEvent::Other { .. } => "other",
@@ -763,6 +783,15 @@ mod tests {
                 name: "run_command".into(),
                 state: ToolState::Done,
                 info: None,
+            },
+            // M9's variant, and it needs its own place in this list for the reason the
+            // list exists: `--json` uses adjacent tagging precisely because an
+            // internally-tagged enum cannot hold a payload, and a variant carrying a
+            // `serde_json::Value` is the case most likely to be got wrong silently.
+            StreamEvent::ToolUse {
+                id: "toolu_1".into(),
+                name: "Bash".into(),
+                input: serde_json::json!({"command": "ls"}),
             },
             StreamEvent::Other {
                 kind: "mystery".into(),

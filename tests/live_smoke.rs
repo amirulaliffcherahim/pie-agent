@@ -499,3 +499,94 @@ fn a_real_agy_turn_renders_through_the_tui_reducer() {
 fn a_real_codex_turn_renders_through_the_tui_reducer() {
     assert_live_turn_renders("codex/gpt-6-luna");
 }
+
+// ---------------------------------------------------------------------------
+// M9 — claude
+// ---------------------------------------------------------------------------
+
+/// M9's live check: the envelope when a subscription exists, and the **refusal** when it
+/// does not.
+///
+/// `planning/ACCEPTANCE.md` §17 gives M9's G5 row as `n/a` rather than skipped: there is no
+/// Claude subscription here. `~/.claude/` exists but holds no credential and no history
+/// (checked 2026-10-12), so no envelope could be captured — which is why every claude
+/// fixture in `tests/parse_claude.rs` is constructed from `knowledge/claude.md` rather than
+/// recorded.
+///
+/// It is one test with two honest branches rather than an `#[ignore]`d one that would fail
+/// the moment the `-Live` gate ran it. Without a credential the assertion is that the turn
+/// **fails cleanly and names claude** — which is worth asserting today, because "refuses for
+/// a reason the user can act on" is the property that keeps a missing login from looking
+/// like a broken binary. With a credential it asserts the recorded turn, which is the
+/// evidence `knowledge/claude.md` never had: that document says its own shapes are
+/// *expected*, and only a live run can confirm them.
+#[test]
+#[ignore = "needs a Claude subscription to be meaningful; until then the credential branch \
+            runs and the envelope branch is unreachable"]
+fn a_live_claude_turn_matches_the_documented_envelope_or_refuses_cleanly() {
+    let home = tempfile::tempdir().unwrap();
+    let output = run_pie(
+        home.path(),
+        &[
+            "-p",
+            "Reply with the single word: ok",
+            "--model",
+            "claude/claude-sonnet-4-6",
+            "--timeout",
+            TURN_TIMEOUT_SECS,
+        ],
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let credential = dirs_claude_credential();
+
+    if !credential {
+        assert!(
+            !output.status.success(),
+            "with no Claude credential the turn must not report success: \nstdout: {stdout}\nstderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("claude") || stdout.contains("claude"),
+            "the refusal must name the backend, or a missing login looks like a broken binary: {stderr}"
+        );
+        // A refused turn **is** recorded, deliberately (M5 stage A: "the attempt is
+        // recorded even when it failed" — a timeout still costs wall clock and belongs in
+        // the totals). The first version of this assertion said the opposite, and the code
+        // was right: what must hold is that the row says the turn **failed** and spent
+        // nothing, not that no row exists.
+        let rows = session_rows(home.path());
+        assert!(
+            rows.len() <= 1,
+            "at most one attempt may be logged, got {rows:#?}"
+        );
+        if let Some(row) = rows.first() {
+            assert_eq!(
+                row["ok"], false,
+                "a refused turn must not log as a success: {row}"
+            );
+            assert_eq!(
+                row["input_tokens"].as_u64().unwrap_or(0),
+                0,
+                "a refused turn spent nothing, so it must not report tokens: {row}"
+            );
+        }
+        return;
+    }
+
+    assert!(
+        output.status.success(),
+        "a live claude turn failed: {stderr}\nstdout: {stdout}"
+    );
+    // The token must not appear anywhere (I3), and the turn must be recorded exactly once
+    // with the frozen schema — the same pair every other backend's live test asserts.
+    assert_turn_recorded(home.path(), "claude", &output);
+}
+
+/// Whether claude has a stored subscription credential.
+///
+/// Read *for presence only*, through the same helper the auth path uses — never parsed, and
+/// never logged (`RISKS.md` §10).
+fn dirs_claude_credential() -> bool {
+    pie::auth::claude_credentials_file().is_file()
+}

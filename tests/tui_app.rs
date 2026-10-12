@@ -917,3 +917,45 @@ fn the_reducer_source_never_names_a_terminal_crate_in_code() {
     );
     assert!(source.contains("pub fn apply_event(app: &mut App, event: &StreamEvent)"));
 }
+
+/// M9's `ToolUse` is a *call*, and the transcript must show it as one.
+///
+/// It is recorded as `Active` rather than `Done`: a call is the start of a step, and only
+/// a later `ToolStep` can say how it ended. Recording it as finished would claim an outcome
+/// the vendor has not reported, which is the same class of lie as rendering a failed turn
+/// as done.
+///
+/// The arguments are deliberately not rendered — they are the vendor's payload rather than
+/// a sentence, and a transcript full of JSON is one nobody reads. This test pins that too,
+/// so a later change cannot quietly start dumping tool input into the UI.
+#[test]
+fn a_tool_call_is_shown_as_an_active_step_and_its_arguments_stay_out_of_the_transcript() {
+    let mut app = App::new("claude", None, "s-1-2");
+    apply_event(
+        &mut app,
+        &StreamEvent::ToolUse {
+            id: "toolu_1".into(),
+            name: "Bash".into(),
+            input: serde_json::json!({"command": "cat /etc/shadow"}),
+        },
+    );
+
+    assert_eq!(
+        app.tool_events,
+        vec![("Bash".to_string(), ToolState::Active)],
+        "the call must be recorded as an in-flight step"
+    );
+    match app.transcript.last() {
+        Some(Entry::Tool { name, state }) => {
+            assert_eq!(name, "Bash");
+            assert_eq!(*state, ToolState::Active);
+        }
+        other => panic!("expected a tool entry, got {other:?}"),
+    }
+
+    let rendered = format!("{:?}", app.transcript);
+    assert!(
+        !rendered.contains("etc/shadow"),
+        "tool arguments must not reach the transcript: {rendered}"
+    );
+}
