@@ -10,16 +10,17 @@
 |---|---|
 | Repo | `C:/Users/amiru/Local/Code/pie` |
 | Branch | `feat/m0-m2-subscription-backends` |
-| Last commit | `588967c` (M6) — **not pushed**; the local tree is ahead of `origin` |
-| Tests | **498 passing**, 7 live correctly ignored, 19 test binaries |
-| Gates | **24/25 offline, 25/25 with `-Live`** — 6 standing checks (G1, G2, G3, G3b, G3c, G3d) + 17 G4 + G6, then G5 |
-| Milestones | **M0–M6 done**, each with a run-log row and per-stage gates |
-| Next | **M7** — contract frozen in `DESIGN.md` §16 and `ACCEPTANCE.md` §15; no code written |
+| Last commit | `b91c721` (M8) — **not pushed**; the local tree is ahead of `origin` |
+| Tests | **658 passing**, 7 live correctly ignored, 27 test binaries |
+| Gates | **32/33 offline, 33/33 with `-Live`** — 6 standing checks (G1, G2, G3, G3b, G3c, G3d) + 25 G4 + G6, then G5 |
+| Milestones | **M0–M8 done**, each with a run-log row and per-stage gates |
+| Next | **M9** — claude adapter + the `tool_use`→`tool_result` loop. Contract frozen in `DESIGN.md` §18; **not verifiable live here** (no Claude credential), so its verdict is `offline-verified` |
 
-**Gate count changed in M6.** G6 was a required gate with *no runner at all* and a command
-that could not pass as written (B25); G3c (no `mod.rs`) and G3d (no test may depend on
-machine vendor state, B32) are new; and M6 added six G4 rows of its own. If you remember
-"15/16 gates", that number is stale — run the runner rather than trusting any count.
+**Gate count changed twice since the handoff was written.** G6 was a required gate with
+*no runner at all* and a command that could not pass as written (B25); G3c (no `mod.rs`)
+and G3d (no test may depend on machine vendor state, B32) are new; and M6–M8 added 14 G4
+rows of their own. If you remember "15/16 gates", that number is two rewrites stale —
+run the runner rather than trusting any count here.
 
 Build the binary before manual checks: `cargo build --release` →
 `./target/release/pie.exe`.
@@ -138,48 +139,46 @@ bash scripts/qc.sh                                                       # unix/
 Live gate pieces, run separately when a payload changed:
 `PIE_LIVE=1 cargo test --test live_smoke -- --ignored --test-threads=1`
 
-## 6. Next task — M7, `learn` + `schedule`
+## 6. Next task — M9, the claude adapter and the tool loop
 
-Contract: `DESIGN.md` §16 and `ACCEPTANCE.md` §15. No code written yet.
+Contract: `DESIGN.md` §18, `ACCEPTANCE.md` §17 (added when M9 starts). **No code written.**
 
-**The design driver is that the default path spends nothing.** This machine has no cheap
-backend — every backend pie drives is subscription-locked — so `RISKS.md` §13's budget is
-implemented as a **gate rather than a note**: `learn` is extractive by rule (recurrence
-counting, explicit-preference phrases, stack/terminology from prompt text and tool names),
-no model is consulted to produce a candidate, and model-based consolidation is an opt-in
-extra behind the budget. That mirrors M5's compaction decision, which is the precedent.
+**This milestone cannot be verified live here.** `~/.claude/` exists but holds no credential
+and no history (checked 2026-10-12), so there is no Claude subscription: the verdict is
+`offline-verified` and says so, never `done`.
 
-Four stages, four test binaries, one per stage:
+Two halves, and the second is the substance:
 
-| Stage | Owns | Gate |
-|---|---|---|
-| A extract | `src/learn.rs`, `tests/learn.rs` | `cargo test --test learn` |
-| B consolidate | `src/learn.rs`, `tests/consolidate.rs` | `cargo test --test consolidate` |
-| C schedule + budget | `src/schedule.rs`, `tests/schedule.rs` | `cargo test --test schedule` |
-| D commands | `src/commands/learn.rs`, `src/commands/memory.rs`, `tests/memory_cmd.rs` | `cargo test --test memory_cmd` |
+1. **The claude adapter**, to spec in `knowledge/claude.md`. claude is the only backend with
+a real system prompt (`--append-system-prompt`), so it receives the persona through that
+flag rather than folded in front of the prompt — `Capabilities::system_prompt` is already
+`true` only for claude. The bytes must stay identical; only the mechanism differs.
+2. **The `tool_use` → `tool_result` loop.** `RISKS.md` §1 is why M0–M8 are delegate-mode:
+   `agy --print` and `codex exec` run their own tools and cannot accept an injected result.
+   claude in SDK mode can, so M9 is where pie finally owns a loop — and it is the code path
+   M10's HTTP backends reuse (`RISKS.md` §8). One implementation, two consumers.
 
-The cross-cutting gate to get right **first**, because everything else rests on it: with the
-default config a scheduled run performs **zero provider spawns** — asserted by *count*, using
-the counting-stand-in pattern `tests/cache.rs` already established — and a job whose estimate
-exceeds the budget is refused **before** any spawn, so a budget of `0` cannot be exceeded by
-one call. `due()` and `extract` take the clock as a parameter and never read it.
+The loop is only correct if all four hold, and each is a stage check: a `tool_use` is
+matched to its `tool_result` by `tool_use_id` and an unknown id is a stated protocol error;
+the child's stdin is written **without deadlocking on the stdout loop**; the loop is
+**bounded** by an iteration cap whose effect is reported; and it **cannot run against a
+delegate-mode backend** — `capabilities().tool_loop` gates it, so asking for the loop on
+agy or codex is a config error, not a hang.
 
-`/memory` in the TUI routes through `Action::Submit` (the loop inspects the submitted text
-for a leading `/`), **not** through a new `Input` — M6's `Input` enum is frozen.
+Nothing may spawn a real claude: the SDK protocol is exercised against a **scripted
+stand-in child** that emits recorded `stream-json` frames and reads `tool_result` frames
+back — the same stand-in pattern `tests/cache.rs` and `tests/process.rs` already use. A
+live test exists and is `#[ignore]`d with a stated reason, ready for the day a subscription
+appears.
 
-Then M8 (`DESIGN.md` §17), M9 (§18), M10 (§19).
+Then M10 (`DESIGN.md` §19).
 
 ## 7. Remaining milestones
 
 | | Scope | Done condition |
 |---|---|---|
-| M7 | `learn.rs` + `schedule.rs`: mine sessions → profile/memory, provenance, decay, **budgeted & opt-in** model use | profile reflects real habits; `/memory` shows what was learned and lets you revert it |
-| M8 | `watch.rs` + `watch/news.rs` + `watch/drift.rs` | `~/.pie/reports/watchtower-YYYY-MM.md` produced + notified; drift diff names any flag/schema/**policy** change and classifies it |
 | M9 | claude adapter + `tool_use`→`tool_result` loop | **unverifiable live here** — no Claude credential. Verdict is `offline-verified`, never `done` |
-| M10 | OpenRouter/DeepSeek from `DEFERRED-BACKENDS.md` | only where `cost_usd_micros` is real |
-
-M7 and M8 share one budget mechanism and one opt-in story — two consumers, not two
-mechanisms. `RISKS.md` §13 is the governing risk for both.
+| M10 | OpenRouter/DeepSeek from `DEFERRED-BACKENDS.md` | only where `cost_usd_micros` is real. Verdict depends on whether the user supplies keys |
 
 ## 8. Open items — decisions, not oversights
 
@@ -191,7 +190,7 @@ mechanisms. `RISKS.md` §13 is the governing risk for both.
   asks for it" is not a reason for the *default* to carry the account risk
   `knowledge/9router-findings.md` §0 describes. See DESIGN §9, ACCEPTANCE §5,
   TOKEN-ECONOMICS §10d.
-- **S1–S14** in `ACCEPTANCE.md` §14 — argv measured against the bin *name*; `println!`
+- **S1–S16** in `ACCEPTANCE.md` §14 — argv measured against the bin *name*; `println!`
   panics on broken pipe; `read_all` reads the whole log; version snapshot is a plain
   write; itsmini is env-only; `agent.compact_after_turns` named in the contract but
   not implemented; switch drops per-turn framing; `--switch`/`--model` use different
