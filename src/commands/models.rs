@@ -3,13 +3,27 @@
 //! Catalogs come from the CLI's own listing command and are cached on disk
 //! (`cache.rs`), so `--refresh` is the only path that spends a subprocess.
 
+use std::path::PathBuf;
+
 use crate::config::Config;
 use crate::error::{PieError, Result};
+use crate::paths;
 use crate::provider::{self, Provider};
 
 /// `pie models [--backend B] [--refresh]`
 pub async fn run(cfg: &Config, backend: Option<&str>, refresh: bool) -> Result<()> {
     let targets = select(cfg, backend)?;
+
+    if refresh {
+        let evicted = evict_model_caches(&targets);
+        if evicted.is_empty() {
+            println!("note: nothing cached to refresh for this selection.");
+        } else {
+            for path in evicted {
+                println!("refreshed: {path}");
+            }
+        }
+    }
 
     for p in targets {
         let id = p.id();
@@ -36,12 +50,51 @@ pub async fn run(cfg: &Config, backend: Option<&str>, refresh: bool) -> Result<(
         }
     }
 
-    if refresh {
-        println!("note: --refresh applies to backends with a cached catalog.");
+    Ok(())
+}
+
+/// Cache files a `--refresh` should invalidate, per backend id.
+///
+/// A backend with no cache (claude, whose catalog is static) contributes
+/// nothing, so `--refresh` is simply a no-op for it rather than an error.
+fn model_cache_paths(id: &str) -> Vec<PathBuf> {
+    match id {
+        "agy" => vec![paths::agy_model_cache()],
+        "codex" => vec![paths::codex_model_cache()],
+        _ => Vec::new(),
+    }
+}
+
+/// `--refresh` is implemented by **evicting the on-disk cache**, not by adding a
+/// parameter to `Provider::list_models`.
+///
+/// The provider's next call then misses and refetches. This keeps the trait free
+/// of CLI concerns (`--refresh` is a flag, not a capability), and it means a
+/// backend gains correct `--refresh` behaviour for free as soon as it caches
+/// anything at the path named above.
+///
+/// Returns the paths actually removed, so the user can see what was refreshed
+/// instead of having to trust that something happened.
+fn evict_model_caches(targets: &[Box<dyn Provider>]) -> Vec<String> {
+    let mut evicted = Vec::new();
+
+    for p in targets {
+        for path in model_cache_paths(p.id()) {
+            match std::fs::remove_file(&path) {
+                Ok(()) => evicted.push(path.display().to_string()),
+                // Nothing cached is the normal case on a first run.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                // A cache we cannot evict must not fail the command: results
+                // just come from the stale cache, which is what was already
+                // going to happen.
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), error = %e, "could not evict model cache")
+                }
+            }
+        }
     }
 
-    let _ = cfg;
-    Ok(())
+    evicted
 }
 
 /// The backends to list, or an `UnknownBackend` error naming the valid ids.
@@ -90,5 +143,41 @@ mod tests {
             Err(other) => panic!("wrong error: {other:?}"),
             Ok(_) => panic!("an unknown backend must not resolve"),
         }
+    }
+
+    #[test]
+    fn cache_paths_are_named_for_backends_that_cache() {
+        assert_eq!(model_cache_paths("agy").len(), 1);
+        assert_eq!(model_cache_paths("codex").len(), 1);
+        // claude's catalog is static, so it has nothing to refresh.
+        assert!(model_cache_paths("claude").is_empty());
+    }
+
+    /// `--refresh` must actually make the next `list_models` miss the cache,
+    /// and must be a harmless no-op when nothing is cached yet.
+    #[test]
+    fn refresh_evicts_the_cache_and_tolerates_a_missing_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let _env = crate::testing::EnvGuard::set(&[(
+            "PIE_HOME",
+            Some(&dir.path().to_string_lossy().to_string()),
+        )]);
+
+        let cache = paths::agy_model_cache();
+        std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
+        std::fs::write(&cache, "{\"fetched_at\":1,\"value\":[]}").unwrap();
+        assert!(cache.is_file());
+
+        // Missing cache first: must not error, must report nothing.
+        let empty = evict_model_caches(&select(&Config::default(), Some("claude")).unwrap());
+        assert!(empty.is_empty(), "claude has no cache: {empty:?}");
+
+        let evicted = evict_model_caches(&select(&Config::default(), Some("agy")).unwrap());
+        assert_eq!(evicted.len(), 1, "expected the agy cache to be evicted");
+        assert!(!cache.exists(), "the cache file should be gone");
+
+        // A second refresh finds nothing, and still does not error.
+        let again = evict_model_caches(&select(&Config::default(), Some("agy")).unwrap());
+        assert!(again.is_empty());
     }
 }
