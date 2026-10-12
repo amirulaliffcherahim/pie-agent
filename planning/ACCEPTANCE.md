@@ -396,6 +396,26 @@ here. A row is a record of what was verified, not a substitute for verifying.
 Verdict values: `done` (all applicable gates) · `offline-verified` (G5 skipped by
 user decision) · `blocked` (a gate fails) · `not started`.
 
+### Re-validation, 2026-10-12 (after M3)
+
+M0–M4 were re-validated bottom-up before starting M5, and the re-validation is
+**stronger evidence than the rows above**, not a repeat of them: M3 rewrote
+`build_args` for agy and codex to fold in the persona, which invalidated the M1 and
+M2 live evidence recorded at their own commits. A milestone's G5 does not survive a
+change to the argv it verifies.
+
+| Gate | Result |
+|---|---|
+| G1, G2, G3, G3b | pass — **260 tests**, 5 live correctly ignored |
+| G4 M0 / M1 / M2 / M3 ×2 / M4 ×2 | pass, all seven selected by name |
+| G6 cross-target `x86_64-unknown-linux-gnu` | clean |
+| G5 live: agy turn, agy probe, codex turn, codex probe, leak check | **5/5 pass** on the current tree |
+| G5 M3: persona marker honoured | pass on **both** backends (`hello` + `ZQ7-MARKER`) |
+
+No milestone regressed. The lesson worth keeping: **re-run a live gate after any
+change to the payload it proves** — otherwise the earlier green is a statement about
+a revision that no longer exists.
+
 ## 11. Bug log
 
 Every bug found, the gate that caught it, and the regression test that now
