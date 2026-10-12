@@ -774,3 +774,67 @@ reason M7 has four.
 installed (`RISKS.md` §14). The shipped path is "REA-lite" and labels itself as such;
 the structural branch is compiled and fixture-tested but has never run against a real
 binary. Say so; do not let the report imply a structural comparison it did not make.
+
+---
+
+## 17. M9 — claude adapter + the tool loop
+
+Contract: `DESIGN.md` §18. Done condition from `ROADMAP.md`: *"Implement claude adapter to
+spec; verify live when a subscription exists. Build `tool_use`→`tool_result` tool-loop
+(reused by HTTP backends)"*.
+
+> Appended as §17 rather than inserted after §9, to avoid renumbering cross-references.
+
+**The verdict for this milestone is `offline-verified`, never `done`.** `~/.claude/` exists
+but holds no credential and no history (checked 2026-10-12), so there is no Claude
+subscription on this machine and no live turn is possible. A green suite here is evidence
+about pie's protocol handling, not about claude.
+
+**Scope note, so the stages do not expand.** The milestone asks for the **loop**, not for a
+tool suite: the loop takes a `ToolRunner` and ships no concrete tools. `PLAN.md` §2's
+`agent/tools.rs` (read/bash/edit/write/grep/find/ls) is a separate concern with its own
+design questions — what a `bash` tool is allowed to do unattended is not a decision to make
+in passing — and inventing one here would put uninspected code on the paid path.
+
+### The interface problem this milestone has to solve first
+
+`StreamEvent::ToolStep { name, state, info }` cannot drive a loop: it carries no
+`tool_use_id` and no tool `input`, and both are required to answer (`tool_result` must
+name the id it answers, and the runner needs the arguments). The router therefore needs a
+way to surface a call, and the candidates were:
+
+| Option | Why not |
+|---|---|
+| Widen `ToolStep` | It is the *display* event the M6 TUI renders and its shape is asserted in `tui_app`/`tui_render`. Widening it to carry a JSON payload would put tool arguments into the transcript for no reader. |
+| A side channel in the claude router | Invisible to `--json`, untestable through the public surface, and M10's backends would need a second one. |
+| **Add `StreamEvent::ToolUse { id, name, input }`** | Chosen. Additive, serialised like every other event so `--json` carries it, and the compiler names every match that must handle it — which is exactly how the TUI's `apply_event` gets updated rather than silently ignoring calls. |
+
+Adding a variant is a compile-time-visible change to a frozen enum, which is the good kind:
+the four `StreamEvent` matches across the tree fail to compile until each has decided what a
+call means to it. The TUI renders it as a tool row (the vendor's call, per
+`VENDOR_TOOL_NOTE`); `driver` and the tests ignore it.
+
+**Acceptance, per stage.** Three stages, three test binaries, one per stage.
+
+| Stage | Command | Shape |
+|---|---|---|
+| A claude stream | `cargo test --test parse_claude` | the recorded `stream-json` envelope parses: `system`/`init` ⇒ `Init`, `assistant` content blocks ⇒ `TextDelta` **and** `ToolUse` (a message may hold both), `user`/`tool_result` ⇒ `Other` (pie does not answer its own calls), `result` ⇒ `Usage` + `Done`; a multi-byte character at an awkward offset does not panic; garbage tolerated (I5) |
+| B the loop | `cargo test --test tool_loop` | against a scripted child: a `tool_use` is answered with a `tool_result` naming **its own id**; two calls yield two results in order; a result for an unknown id is a stated protocol error; the iteration cap stops a model that calls tools forever **and says so**; the loop is refused on a backend whose `capabilities().tool_loop` is false |
+| C capability + wiring | `cargo test --test parse_claude` and `cargo test --test tool_loop` | `Claude::capabilities().tool_loop` is `true` **only once stage B exists**, and the test that pins it flips with it; `build_args` gains the `--input-format stream-json` shape the loop needs, without changing the `-p` one-shot path |
+| G5 | **n/a — stated, not skipped** | no Claude subscription on this machine. The live test exists and is `#[ignore]`d with that reason, so the day a subscription appears it runs rather than being reinvented |
+
+**Checks**
+
+- [ ] `tool_loop: true` is set **in the same commit** as the loop, and the test that asserted `false` is inverted rather than deleted — a capability flag that flips with nothing behind it is worse than one that stays false
+- [ ] a `tool_result` names the `tool_use_id` it answers; an unknown id is a stated protocol error, never a dropped frame
+- [ ] **the loop cannot deadlock**: the child's stdin is written while its stdout is being read, asserted against a stand-in that will not read stdin until it has written its whole output — the classic two-pipe deadlock, and the assertion is that the test *finishes*
+- [ ] the loop is **bounded** and the cap's effect is reported, not swallowed
+- [ ] asking for the loop on a delegate-mode backend is a **config error**, not a hang — asserted for agy and codex, since `RISKS.md` §1 is why they cannot accept an injected result
+- [ ] no stage spawns a real `claude`: every test drives a stand-in, so the whole milestone is machine-independent (gate G3d)
+- [ ] the `-p` one-shot path is unchanged: its argv is asserted byte-for-byte, because the loop's `--input-format` must not leak into the delegate path
+
+**Not verifiable here**: everything about claude itself. The envelope in
+`knowledge/claude.md` is documented as *expected* rather than captured, so the parser is
+tested against a fixture derived from that document — not from a real session. Say so in
+the verdict; a fixture written from a specification is not evidence that the specification
+is right, and M9's row must not read as though claude had been exercised.

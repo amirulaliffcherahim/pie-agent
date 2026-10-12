@@ -1275,6 +1275,43 @@ claude. The bytes must stay identical; only the mechanism differs (`DESIGN.md` �
 finally *owns* a tool loop, and it is the code path the M10 HTTP backends reuse
 (`RISKS.md` §8) — one implementation, two consumers, not two implementations.
 
+### `StreamEvent` needs one additive variant, and the compiler will say where
+
+`StreamEvent::ToolStep { name, state, info }` is the **display** event: it carries no
+`tool_use_id` and no tool `input`, and a loop needs both — a `tool_result` must name the id
+it answers, and the runner needs the arguments. So the loop cannot be built on `ToolStep`,
+and the two alternatives are worse than they look: widening `ToolStep` would put tool
+arguments into the transcript for a reader who never sees them, and a router-side side
+channel would be invisible to `--json` and would need a second copy for M10.
+
+```rust
+    /// A tool the CLI is **asking pie to run**. Additive: M6–M8 never see one.
+    #[serde(rename = "tool_use")]
+    ToolUse {
+        /// The vendor's id, echoed back by the matching `tool_result`.
+        id: String,
+        /// Tool name.
+        name: String,
+        /// Arguments, opaque to pie.
+        input: serde_json::Value,
+    },
+```
+
+Adding a variant to a frozen enum is a **compile-time-visible** change, which is the
+reason it is acceptable here: the four matches over `StreamEvent` fail to compile until
+each has decided what a tool call means to it. The TUI renders it as a tool row (the
+vendor's call, per `VENDOR_TOOL_NOTE`), `driver` and the parsers ignore it, and `--json`
+carries it like every other event so the loop is observable from outside.
+
+### Scope: the loop, not a tool suite
+
+`ROADMAP.md` M9 asks for the loop, and the loop takes an injected `ToolRunner` and ships
+**no concrete tools**. `PLAN.md` §2's `agent/tools.rs`
+(read/bash/edit/write/grep/find/ls) is a separate concern with its own design questions —
+what a `bash` tool may do unattended is not a decision to make in passing — and inventing
+one inside M9 would put uninspected code on the paid path. ACCEPTANCE §17 says the same
+thing in the same words, so the two documents cannot drift on it.
+
 The loop is only correct if all four of these hold, and each is a stage check:
 
 1. a `tool_use` block is matched to its `tool_result` by `tool_use_id`, and a result for
