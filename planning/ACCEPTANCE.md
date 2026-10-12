@@ -35,6 +35,23 @@ G1–G3 are the standing QC loop: run them after **every** code change, not only
 the end of a milestone. `scripts/qc.sh` (unix/WSL) and `scripts/qc.ps1` (Windows)
 run G1–G3 in order and stop at the first failure.
 
+### Invoke the gates so a failure actually blocks the commit
+
+Two of the bugs in §9 (B7, B9) are the same defect: the gate ran, but nothing was
+wired to *stop* on it. Both are easy to repeat, so the rule is explicit.
+
+- **Use the gate runners.** `scripts/qc.ps1` and `scripts/qc.sh` are fail-fast and
+  exit non-zero. An ad-hoc chain is not equivalent.
+- **Never pipe a gate into something that discards its status.** `cargo clippy … |
+  grep … ; git commit` always commits: the pipe makes the exit status that of
+  `grep`, and `;` runs the next command regardless. That is exactly how B9 landed.
+- **Stage before gating.** `cargo fmt --all` rewrites files it was not asked
+  about; if you then stage a subset and commit, the reformat is left behind and the
+  *committed* tree is red even though your working tree was green. That is B7.
+- **Prove a red tree at the commit, not in the working tree.** `git stash` and
+  re-run the failing gate, as B7 was diagnosed, before concluding which revision
+  is broken.
+
 ## 2. Global invariants (checked at every gate, every milestone)
 
 These are cross-cutting gates from `ROADMAP.md`. Each has an assertion somewhere:
@@ -248,6 +265,7 @@ prevents it. This is the record the milestone verdicts above rest on.
 | B6 | minor | Table truncated paths with `…[truncated]`, hiding which binary was meant. `agy\bin\agy.exe` was unreadable | `--list-backends` acceptance run | Added `short_path`: keep the last three components, clip to the column width | `long_paths_keep_the_identifying_tail`, `short_path_never_exceeds_the_column_width`, `unix_style_paths_are_shortened_too` |
 | B7 | minor (process) | **A committed tree failed G1.** `tests/live_smoke.rs` was committed unformatted, because `cargo fmt --all` was run *before* writing that file and the next commit staged only selected paths. The tree at HEAD was red | `cargo fmt --all --check` run with the change stashed, to prove HEAD rather than the working tree | Reformat committed; the habit is now **`cargo fmt --all` → `git add -A` → run G1–G3 → commit**, so a formatting change can never be left behind in the working tree | covered by G1 itself |
 | B8 | **blocker** | **The Windows gate runner did not run at all.** `scripts/qc.ps1` contained UTF-8 em-dashes and no BOM, so Windows PowerShell 5.1 read the file as Windows-1252, turned `—` into `\uFFFD?"` inside string literals, and failed to *parse* — `Unexpected token ')'`. The gate runner on the primary platform was dead, and nothing had ever executed it | Running it (`powershell -NoProfile -ExecutionPolicy Bypass -File scripts/qc.ps1`), which failed before G1 with parse errors | Both gate scripts converted to pure ASCII; the encoding rule documented in `qc.ps1`'s header; CI now parse-checks `qc.ps1` under `shell: powershell` **and** asserts it contains no byte > 127 | CI step "Gate runner self-check (parse + ASCII-only)" |
+| B9 | minor (process) | A commit landed with a **red G2**. `cargo clippy` failed in a test (`unnecessary_to_owned`) but the command was `cargo clippy … \| grep … ; git commit`: the pipe made the status that of `grep`, and `;` committed regardless. Same family as B7 - the gate ran, but could not gate | Reading the gate output in the same command that committed | Fixed the lint; the rule is now written into §1 | the gate runners themselves |
 
 ### Findings that are not code bugs
 
