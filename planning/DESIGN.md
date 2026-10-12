@@ -348,7 +348,7 @@ agy --print <PROMPT> --dangerously-skip-permissions --disable-slash-commands
 - Status is `SUCCESS` on success; anything else (`ERROR|FAILURE|CANCELLED|TIMEOUT`)
   ⇒ `PieError::Backend` including the `error` field when present.
 - Models: `agy models` → cache TTL 24h. `usage`: `agy --print /usage
-  --output-format json --print-timeout 30s` **without** `--disable-slash-commands`
+  --output-format json --print-timeout 0` **without** `--disable-slash-commands`
   (it needs slash expansion — note this asymmetry; it is deliberate).
 
 ### codex (M2, verified in `knowledge/codex.md`)

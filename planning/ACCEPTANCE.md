@@ -331,3 +331,15 @@ prevents it. This is the record the milestone verdicts above rest on.
 | F1 | **CLI drift**: agy reports `1.3.3`, but `knowledge/agy.md` documents `1.3.2`. This is precisely what I8 exists to catch | `knowledge/agy.md` and `knowledge/README.md` version updated; the flag/schema notes were left unchanged because nothing in the stream contract is known to have moved |
 | F2 | codex resolves to `node.exe` + `codex.js` on this machine (no native `codex.exe`, and the `codex.cmd` shim cannot be spawned directly). The BINARY column therefore shows node | Documented in `codex.rs` and `PLATFORMS.md`; the launch path is the verified one |
 | F3 | WSL2 is installed but cannot boot (`HCS_E_SERVICE_NOT_AVAILABLE`) | Linux is verified by G6 locally and by the CI matrix; see `PLATFORMS.md` |
+
+## 10. Open suggestions from the QC sweep
+
+Accepted as real, deliberately not done yet. Recorded here so they are decisions
+rather than oversights. None affects a milestone verdict.
+
+| # | Suggestion | Why it is deferred |
+|---|---|---|
+| S1 | `agy::build_plan` measures the argv against the configured binary *name* and `stream` then swaps in the resolved absolute path, so the measured length is not the spawned length | Harmless at the current numbers (20 000 cap versus a ~32 767 limit) and the measured value over-estimates rather than under-estimates. Fix when the cap is next touched |
+| S2 | `println!`/`print!` in `commands/*` panic on a write failure, so `pie -p … \| head -1` exits 101 with a broken-pipe message | Rust ignores `SIGPIPE`; the fix is `writeln!` on a locked stdout ignoring `Err`. Cosmetic, but it is the cheapest remaining panic |
+| S3 | `session_log::read_all` reads the whole log, and the log is append-only and never rotated | Correct today — totals must see every row, and truncating would make them silently wrong. Revisit only if a real log gets large, and use a tail read for the rolling windows rather than capping "all time" |
+| S4 | The version snapshot in `commands/backends.rs` is a plain `fs::write`, so a crash mid-write leaves a truncated file | The reader tolerates a corrupt cache (it is a miss), so the consequence is one wasted probe |

@@ -401,11 +401,21 @@ fn the_legacy_auth_file_is_left_untouched() {
         ["doctor"],
         ["--list-backends"],
     ] {
-        let _ = Command::new(env!("CARGO_BIN_EXE_pie"))
+        let output = Command::new(env!("CARGO_BIN_EXE_pie"))
             .args(args)
             .env("PIE_HOME", home.path())
             .output()
             .expect("failed to run the pie binary");
+
+        // Asserted, not discarded: a binary that panicked would also leave the
+        // file untouched, so the content assertion below would pass for a broken
+        // build. The QC sweep caught the discarded status.
+        assert!(
+            output.status.success(),
+            "`pie {}` failed while the legacy auth file was present: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     let after = std::fs::read_to_string(&legacy).unwrap();

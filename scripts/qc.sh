@@ -13,10 +13,12 @@
 #   G4  offline acceptance - M0: cargo run -- --list-backends
 #   G5  live acceptance                                ONLY with --live
 #
-# G4 is the milestone's offline acceptance command. Only the M0 command is
-# wired in here; as M1/M2 land, their acceptance commands (`cargo test --test
-# parse_agy`, `cargo test --test parse_codex`) are added next to it. CI runs the
-# same command (.github/workflows/ci.yml) so local and CI agree.
+# G4 is the milestone's offline acceptance command, one gate per milestone:
+# M0 `cargo run -- --list-backends`, M1 `cargo test --test parse_agy`,
+# M2 `cargo test --test parse_codex`. CI runs the same commands, through this
+# same script (.github/workflows/ci.yml), so local and CI cannot drift apart.
+# Add the next milestone's command when it lands. `tests/acceptance.rs` asserts
+# what the M0 table actually prints, because this gate only sees the exit status.
 #
 # FAIL-FAST: the first failing gate prints `FAIL: <gate>` on stderr and exits
 # immediately with that gate's exit status. Later gates do not run - a red G2
@@ -121,6 +123,21 @@ run_gate 'G2 lint'    cargo clippy --all-targets -- -D warnings
 # Live smoke tests are `#[ignore]`d and gated on PIE_LIVE=1, so a plain
 # `cargo test` never touches the network or spends quota.
 run_gate 'G3 tests'   cargo test
+
+# --- G3b (every `#[ignore]` carries a reason) --------------------------------
+# ACCEPTANCE section 1 makes "0 ignored-without-reason" part of G3's pass
+# condition, but `cargo test` reports an unreasoned ignore as merely ignored, so
+# nothing enforced it. A bare `#[ignore]` is a test that silently stopped running.
+check_ignore_reasons() {
+  local offenders
+  offenders="$(grep -rn --include=*.rs -E '^[[:space:]]*#\[ignore\][[:space:]]*$' src tests || true)"
+  if [ -n "$offenders" ]; then
+    printf '%s\n' "$offenders" >&2
+    return 1
+  fi
+  return 0
+}
+run_gate 'G3b ignore reasons' check_ignore_reasons
 
 # --- G4 (offline acceptance, one gate per milestone) ------------------------
 # The per-milestone acceptance commands from planning/ACCEPTANCE.md sections 3-5.

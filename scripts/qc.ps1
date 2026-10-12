@@ -133,6 +133,20 @@ Invoke-Gate -Label 'G2 lint' -Argv @('clippy', '--all-targets', '--', '-D', 'war
 # `cargo test` never touches the network or spends quota.
 Invoke-Gate -Label 'G3 tests' -Argv @('test')
 
+# --- G3b (every `#[ignore]` carries a reason) --------------------------------
+# ACCEPTANCE section 1 makes "0 ignored-without-reason" part of G3's pass
+# condition, but `cargo test` reports an unreasoned ignore as merely ignored, so
+# nothing enforced it. A bare `#[ignore]` is a test that silently stopped running.
+$ignoreHits = Select-String -Path (Get-ChildItem -Path src, tests -Recurse -Include *.rs).FullName `
+    -Pattern '^\s*#\[ignore\]\s*$'
+if ($ignoreHits) {
+    [Console]::Error.WriteLine('FAIL: G3b ignore reasons')
+    $ignoreHits | ForEach-Object { [Console]::Error.WriteLine("     $($_.Path):$($_.LineNumber)") }
+    exit 1
+}
+$script:GatesRun++
+Write-Host 'PASS: G3b ignore reasons'
+
 # --- G4 (offline acceptance, one gate per milestone) ------------------------
 # The per-milestone acceptance commands from planning/ACCEPTANCE.md sections 3-5.
 # G3 already runs every test binary, so these are partly redundant on purpose:

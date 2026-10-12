@@ -143,41 +143,22 @@ jobs:
       - name: "Docs: markdown tables are well-formed"
         run: node scripts/check-docs.js
 
-      # --- G1 -----------------------------------------------------------------
-      - name: "G1 format: cargo fmt --check"
-        run: cargo fmt --check
-
-      # --- G2 -----------------------------------------------------------------
-      # `--all-targets` covers lib, bin, tests and benches; `-D warnings` makes
-      # warnings fatal, which is what the acceptance table requires.
-      - name: "G2 lint: cargo clippy --all-targets -- -D warnings"
-        run: cargo clippy --all-targets -- -D warnings
-
-      # --- G3 -----------------------------------------------------------------
-      # `#[ignore]`d live smoke tests are skipped here by design (no quota in
-      # CI). Every ignored test must carry a reason — see ACCEPTANCE.md §1.
-      - name: "G3 tests: cargo test"
-        run: cargo test
-
-      # --- G4 (offline acceptance, one step per milestone) -------------------
-      # planning/ACCEPTANCE.md sections 3-5 name an acceptance command per
-      # milestone. G3 already runs every test binary, so these are partly
-      # redundant on purpose: a red step then names *which* milestone regressed
-      # instead of a generic "tests failed". Add the next milestone as it lands.
+      # --- G1-G4: the gate runner, per platform ------------------------------
+      # CI invokes the SAME script a developer runs, rather than an ad-hoc
+      # cargo chain that happens to match it. The reviewer audit found this was
+      # previously not the case: CI parsed qc.ps1 and checked it was ASCII, but
+      # never executed either runner, so a runner that mis-ran was invisible.
+      # The runner prints one PASS/FAIL line per gate including the command, so
+      # attribution is preserved in the log.
       #
-      # On a CI runner none of the three vendor CLIs is installed, so the M0 step
-      # proves the *degraded* path - every backend resolved and reported as
-      # `binary-missing` rather than panicking or hanging. The happy path is gate
-      # G5 on the developer's machine.
-      #
-      # `--locked` keeps CI reproducible: Cargo.lock is committed, and a
-      # dependency resolving differently on a runner than it did locally is a
-      # class of failure that should be caught, not smoothed over.
-      - name: "G4 acceptance (M0): cargo run --locked -- --list-backends"
-        run: cargo run --locked -- --list-backends
+      # On a CI runner none of the three vendor CLIs is installed, so G4 proves
+      # the *degraded* path: every backend resolved and reported rather than
+      # panicking or hanging. The happy path is G5 on the developer machine.
+      - name: "Gates G1-G4: bash scripts/qc.sh"
+        if: runner.os != 'Windows'
+        run: bash scripts/qc.sh
 
-      - name: "G4 acceptance (M1): cargo test --locked --test parse_agy"
-        run: cargo test --locked --test parse_agy
-
-      - name: "G4 acceptance (M2): cargo test --locked --test parse_codex"
-        run: cargo test --locked --test parse_codex
+      - name: "Gates G1-G4: scripts/qc.ps1"
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/qc.ps1
