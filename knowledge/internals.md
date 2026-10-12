@@ -55,7 +55,10 @@ is only a `--ignore-scripts` fallback launcher).
 - **codex** — `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` (full transcripts),
   `session_index.jsonl` (`{id, thread_name, updated_at}`),
   `history.jsonl` (`{session_id, ts, text}`), and `state_*.sqlite`. Resume with
-  `codex exec resume <id>` / `--last`.
+  `codex exec [exec-flags] resume <id>` / `--last` — the exec-level options must
+  come **before** `resume`, which is a subcommand, not a flag (`codex.md`,
+  verified by probe; getting this backwards produces `unexpected argument
+  '--cd' found`).
 - **claude** — per-project session transcripts under `~/.claude/`; resume with
   `--resume <session-id>` / `--continue`.
 

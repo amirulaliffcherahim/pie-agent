@@ -202,16 +202,38 @@ cargo run -- usage codex
 ```
 
 - `hi` turn prints a reply, exits 0, appends a `provider:"codex"` row to the session log
-- `usage codex` prints 5h + weekly buckets from `wham/usage`
+- `usage codex` prints the quota window(s) from `wham/usage`
 - the token appears in **no** output, error, or log line (I3 — grep the captured output)
 - refusal path: with an API-key-only credential the backend reports
   `NoSubscription`, exit 3, instead of silently billing (I9)
+
+**Revised against live evidence, 2026-10-12** (see §9 B11/B12)
+
+- **The window set is not "5h + weekly".** This account returns a single
+  **30-day** window with `secondary_window: null`
+  (`limit_window_seconds: 2592000`, 12% used, reset `2026-11-08T01:52:52Z`), which
+  renders as `30d  88.0%  2026-11-08T01:52:52Z`. The criterion is therefore: **a
+  bucket per window the endpoint actually returns**, labelled from its real
+  duration, with a null `secondary_window` treated as normal — not a fixed pair.
+  `PLAN.md` §6's "5h/weekly buckets" must not be assumed.
+- **The real `auth_mode` is `"chatgpt"`**, not `"subscription"`. The classifier
+  must accept it as the subscription mode.
+- **codex has no `--effort` flag.** Effort is a config value; requesting an effort
+  must produce a clear warning rather than an invented `-c` key.
+- **Resume ordering:** `exec`-level options precede the `resume` subcommand —
+  `codex exec <flags> resume <id> <prompt>`. The reverse order is rejected with
+  `unexpected argument '--cd' found`.
 
 **Checks**
 
 - [ ] never spawns `codex.cmd`; resolves `node <…>/codex/bin/codex.js` (or native `codex.exe`) (DESIGN §9)
 - [ ] `--approve-for-me` and `--sandbox` are never both passed (they are mutually exclusive)
 - [ ] `--skip-git-repo-check` always passed (pie runs in non-repo workspaces)
+- [ ] every `exec`-level option precedes the `resume` subcommand
+- [ ] a bucket is labelled from `limit_window_seconds` / the window's real duration,
+      and a null `secondary_window` is not an error
+- [ ] `codex.quota_probe = "off"` constructs **no** HTTP request and still lets
+      `pie usage codex` print session-log totals
 - [ ] auth gate reads `auth_mode` from `~/.codex/auth.json` and requires subscription
 - [ ] `~/.pie/auth.json` (legacy, holds extracted tokens) is never read — assert with a test that the path is untouched/no reader exists
 
@@ -289,6 +311,8 @@ prevents it. This is the record the milestone verdicts above rest on.
 | B8 | **blocker** | **The Windows gate runner did not run at all.** `scripts/qc.ps1` contained UTF-8 em-dashes and no BOM, so Windows PowerShell 5.1 read the file as Windows-1252, turned `—` into `\uFFFD?"` inside string literals, and failed to *parse* — `Unexpected token ')'`. The gate runner on the primary platform was dead, and nothing had ever executed it | Running it (`powershell -NoProfile -ExecutionPolicy Bypass -File scripts/qc.ps1`), which failed before G1 with parse errors | Both gate scripts converted to pure ASCII; the encoding rule documented in `qc.ps1`'s header; CI now parse-checks `qc.ps1` under `shell: powershell` **and** asserts it contains no byte > 127 | CI step "Gate runner self-check (parse + ASCII-only)" |
 | B9 | minor (process) | A commit landed with a **red G2**. `cargo clippy` failed in a test (`unnecessary_to_owned`) but the command was `cargo clippy … \| grep … ; git commit`: the pipe made the status that of `grep`, and `;` committed regardless. Same family as B7 - the gate ran, but could not gate | Reading the gate output in the same command that committed | Fixed the lint; the rule is now written into §1 | the gate runners themselves |
 | B10 | **major** | **Three `/usage` probes gave three different wrong answers, because the shell rewrote the argument.** git-bash/MSYS turns a leading-slash argument into a Windows path, so `agy --print /usage` reached agy as the literal prompt text `C:/Program Files/Git/usage`. Consequences: one probe burned a real ~20 700-token model turn answering *"how much disk space does Git use"*; another returned an empty payload with `num_turns: 0`; that empty one was recorded as the fixture. The near-miss: I concluded `/usage` was broken and quota-costing and drafted a design change to drop `pie usage agy` entirely. It is in fact free (`num_turns: 0`, all usage zero) and returns a full quota payload | Re-running with `MSYS_NO_PATHCONV=1`, which returned the real payload. The discriminator is cheap and should have been used first: a **mangled** probe shows `num_turns: 1` with ~20 700 input tokens, while a **real** expansion shows `num_turns: 0` and all-zero usage - a free probe reporting 20 700 tokens spent is a probe-harness bug, not CLI behaviour | Corrected `tests/fixtures/agy_usage.json` to the real capture; fixed `usage_args()` to `--print-timeout 0` (with `30s` the expansion returned an empty payload); **reverted a false claim I had written into `knowledge/agy.md`** from the corrupted capture; documented the trap in `knowledge/agy.md` and `PLATFORMS.md`; ACCEPTANCE section 4 now requires a manual probe to set `MSYS_NO_PATHCONV=1` | Real-capture parser tests (4 buckets across 2 groups, `remaining_fraction` ~= 0.8849); ACCEPTANCE section 4 checks. Note pie's own spawn path was never affected - `std::process::Command` does no rewriting |
+| B11 | **major** | **The resume argv was wrong, and it was mine from M0.** `build_args` emitted `codex exec resume <id> --cd … --approve-for-me …`. Codex rejects that: `resume` is a subcommand, so `exec`-level options after it are not recognised, and `codex exec resume <id> --cd . --approve-for-me --json --help` returns `error: unexpected argument '--cd' found`. Every resumed codex turn would have failed. M0 had flagged the ordering as unverified ("NOTE(M2): confirm against `codex exec --help`") and the confirmation found it wrong | The M2 agent probed `codex exec resume <id> --cd . --approve-for-me --json --help` instead of trusting the note, and wrote the failing test first | Reordered to `exec <flags> resume <id> <prompt>`; regression test `every_exec_option_precedes_the_resume_subcommand`; documented in `knowledge/codex.md` and `internals.md` | `tests/parse_codex.rs`; ACCEPTANCE section 5 check |
+| B12 | minor | **A frozen acceptance criterion was wrong.** Section 5 required `usage codex` to print "5h + weekly buckets", following `PLAN.md` §6. A live probe shows this account returns a single **30-day** window with `secondary_window: null` (`limit_window_seconds: 2592000`, reset `2026-11-08T01:52:52Z`). An implementation written to the criterion would have rendered nothing, or invented a missing bucket | The M2 agent's zero-cost live probe of the endpoint, reported rather than coded around | Section 5 revised to "a bucket per window the endpoint actually returns", labelled from its real duration; `knowledge/codex.md` records the observed shape. Same class of error as the agy section 4 revision (B10): a criterion derived from a plan document rather than from the CLI | ACCEPTANCE section 5; parser tests over the observed payload |
 
 ### Findings that are not code bugs
 
