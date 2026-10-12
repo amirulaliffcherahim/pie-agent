@@ -114,7 +114,7 @@ clean. **The interfaces are frozen, so the three layers can be built in parallel
 |---|---|---|
 | A state + reducer | `src/tui/app.rs`, `tests/tui_app.rs` | `cargo test --test tui_app` |
 | B render | `src/tui/render.rs`, `tests/tui_render.rs` | `cargo test --test tui_render` |
-| C loop + wiring | `src/tui/mod.rs`, `src/commands/tui.rs`, `tests/tui_loop.rs` | `cargo test --test tui_loop` |
+| C loop + wiring | `src/tui.rs`, `src/commands/tui.rs`, `tests/tui_loop.rs` | `cargo test --test tui_loop` |
 
 The maintainer wires `cli.rs`/`commands.rs` (`pie tui`, opt-in — a bare `pie` keeps
 printing help so CI can never enter the TUI).

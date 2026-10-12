@@ -10,7 +10,12 @@
 #   G1  cargo fmt --check                             no diff
 #   G2  cargo clippy --all-targets -- -D warnings      zero warnings
 #   G3  cargo test                                     all pass
+#   G3b every #[ignore] carries a reason
+#   G3c module layout: no mod.rs files
+#   G3d no vendor state: the whole suite with HOME redirected to an empty dir
 #   G4  offline acceptance - M0: cargo run -- --list-backends
+#       ... one per milestone, and one per M5/M6 stage
+#   G4  `pie tui` on a pipe refuses with a message and no escape codes
 #   G6  cargo check --target x86_64-unknown-linux-gnu --all-targets
 #       --no-default-features  (cross-target; SKIPped loudly if the target is
 #       not installed). `--no-default-features` is required, not optional: the
@@ -146,6 +151,72 @@ check_ignore_reasons() {
 }
 run_gate 'G3b ignore reasons' check_ignore_reasons
 
+# --- G3c (module layout: no `mod.rs`) ---------------------------------------
+# ACCEPTANCE section 3 requires "no `mod.rs` files; `provider.rs` sits beside
+# `provider/`" - one idiom for a parent module and its directory (DESIGN section 2).
+#
+# Nothing enforced it: no test, no script, no CI job. M6's own plan then named
+# `src/tui/mod.rs`, the scaffold created exactly that file, and the whole suite
+# stayed green - the same family as B20 (a rule with nothing able to contradict
+# it) and the same shape as the G6 gap found in the same session. A convention
+# with no check is a convention that lasts until the next agent does not read the
+# section.
+#
+# Cheap to check and impossible to argue with: if the directory holds a `mod.rs`,
+# the parent module file is in the wrong place.
+check_no_mod_rs() {
+  local offenders
+  offenders="$(find src -name mod.rs -print || true)"
+  if [ -n "$offenders" ]; then
+    printf 'no mod.rs files - the parent module file belongs BESIDE its directory (e.g. provider.rs + provider/)\n' >&2
+    printf '%s\n' "$offenders" >&2
+    return 1
+  fi
+  return 0
+}
+run_gate 'G3c module layout' check_no_mod_rs
+
+# --- G3d (no test may depend on machine vendor state) -----------------------
+# The whole suite is run again with `HOME` and `USERPROFILE` redirected to an empty
+# directory, because **that is what a CI runner is**.
+#
+# This exists because four tests in `tests/parse_agy.rs` were passing only on a
+# machine with agy logged in. `Agy::stream` refuses without a subscription
+# credential, their helper pointed `PIE_HOME` at a scratch directory but left `HOME`
+# alone, and the developer's real `~/.gemini` satisfied the gate. On every CI runner
+# it did not, so `G4 acceptance (M1)` - M1's own named gate - was red on ubuntu,
+# windows and macos while the local gate run was green and the docs claimed CI was
+# the real Linux evidence. Nothing could have caught it locally.
+#
+# A green suite whose greenness comes from the machine is not evidence, and it is
+# invisible from the machine. This gate is the general form of that observation.
+#
+# `RUSTUP_HOME`/`CARGO_HOME` are carried over explicitly only because rustup cannot
+# find a toolchain once `HOME` moves; they are toolchain plumbing, not vendor state.
+check_no_vendor_state() {
+  local real_home empty status
+  real_home="$HOME"
+  empty="$(mktemp -d)"
+  printf '\n==> G3d no vendor state: cargo test (HOME redirected to an empty directory)\n'
+  # `set +e` around the call: under `set -e` a failing cargo test would abort the
+  # script here instead of returning, and the FAIL line below would never print.
+  set +e
+  HOME="$empty" USERPROFILE="$empty" \
+  RUSTUP_HOME="${RUSTUP_HOME:-$real_home/.rustup}" \
+  CARGO_HOME="${CARGO_HOME:-$real_home/.cargo}" \
+    cargo test
+  status=$?
+  set -e
+  rm -rf "$empty"
+  if [ "$status" -ne 0 ]; then
+    printf 'a test passed only because this machine has a vendor CLI logged in, or other state\n' >&2
+    printf 'under HOME. Every test must pass where none of that exists, because that is what\n' >&2
+    printf 'CI is. Have the test establish the state it asserts about.\n' >&2
+  fi
+  return "$status"
+}
+run_gate 'G3d no vendor state' check_no_vendor_state
+
 # --- G4 (offline acceptance, one gate per milestone) ------------------------
 # The per-milestone acceptance commands from planning/ACCEPTANCE.md sections 3-8.
 # G3 already runs every test binary, so these are partly redundant on purpose:
@@ -169,6 +240,56 @@ run_gate 'G4 acceptance (M5 ocr)' cargo test --test ocr
 # Stage E's server has its own binary, so its gate is its own command: the stdio
 # handshake, driven through the built binary rather than through the library.
 run_gate 'G4 acceptance (M5 mcp)' cargo test --test mcp
+
+# M6's stages each have their OWN test binary, so a red gate names the stage that
+# broke rather than just "the TUI failed" (ACCEPTANCE sections 8 and 9: M5 shipped
+# two gates that could not fail their own stage). Stage D gets its own binary even
+# though it refines stage A's subject matter, for exactly that attribution reason.
+run_gate 'G4 acceptance (M6 tui_app)' cargo test --test tui_app
+run_gate 'G4 acceptance (M6 tui_render)' cargo test --test tui_render
+run_gate 'G4 acceptance (M6 tui_loop)' cargo test --test tui_loop
+run_gate 'G4 acceptance (M6 tui_keys)' cargo test --test tui_keys
+
+# --- G4 (M6 tui non-TTY) ----------------------------------------------------
+# ACCEPTANCE section 9: `pie tui` on a non-TTY stdin must fail with a clear message
+# rather than emitting escape codes into a pipe.
+#
+# A property of the BUILT BINARY, so it cannot be a cargo test, and `'' |` makes
+# stdin a pipe deterministically rather than depending on how the runner was
+# invoked. Both halves are asserted: the exit code alone would pass for a run that
+# printed escapes and then failed, and the no-escapes half alone would pass for one
+# that failed for an unrelated reason.
+run_gate 'G4 acceptance (M6 tui build)' cargo build
+# Resolve the binary once: on unix it is `pie`, and under git-bash/MSYS (where this
+# script runs only as a courtesy) it is `pie.exe`. Hardcoding either name makes the
+# check fail for the *wrong* reason on the other platform, which is worse than not
+# running it.
+PIE_BIN='./target/debug/pie'
+if [ -f "$PIE_BIN.exe" ]; then
+  PIE_BIN="$PIE_BIN.exe"
+fi
+check_tui_refusal() {
+  local out status
+  # `|| status=$?` rather than a bare assignment: under `set -e` a failing command
+  # substitution in an assignment aborts the script, so this refusal - a NON-ZERO
+  # exit is the pass condition - would have killed the runner before it printed
+  # anything. Same trap as the PowerShell runner's NativeCommandError.
+  status=0
+  out="$(printf '' | "$PIE_BIN" tui 2>&1)" || status=$?
+  if [ "$status" -eq 0 ]; then
+    printf 'pie tui must NOT succeed with stdin on a pipe\n' >&2
+    return 1
+  fi
+  if printf '%s' "$out" | grep -q $'\033\['; then
+    printf 'escape codes reached the pipe before the refusal: %s\n' "$out" >&2
+    return 1
+  fi
+  case "$out" in
+    *terminal*) return 0 ;;
+    *) printf 'the refusal must name the reason; got: %s\n' "$out" >&2; return 1 ;;
+  esac
+}
+run_gate 'G4 acceptance (M6 tui non-TTY)' check_tui_refusal
 
 # --- G6 (cross-target check) ------------------------------------------------
 # ACCEPTANCE section 1. Linux cannot be *run* locally (WSL2 is installed but

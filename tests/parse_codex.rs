@@ -11,7 +11,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use pie::auth::classify_codex_mode;
@@ -26,7 +26,7 @@ use pie::provider::codex::{
 #[cfg(feature = "http")]
 use pie::provider::codex::{buckets_from_usage, describe_http_failure, iso8601_utc, quota_notes};
 use pie::provider::driver::EventRouter;
-use pie::provider::{ChatRequest, Model, Provider, StreamEvent, ToolState};
+use pie::provider::{ChatRequest, Model, Provider, StreamEvent, ToolState, Usage};
 
 /// The live-recorded four-line turn (`knowledge/codex.md`).
 const TURN: &str = include_str!("fixtures/codex_turn.jsonl");
@@ -594,6 +594,126 @@ async fn an_api_key_only_credential_is_refused_with_no_subscription() {
         "an API-key-only store must be refused, got {err:?}"
     );
     assert_eq!(err.exit_code(), 3);
+}
+
+/// A stand-in `codex` that ignores its argv and prints a recorded turn.
+///
+/// The same shape as `stand_in_agy` in `tests/parse_agy.rs`: the vendor CLI is
+/// never spawned, so the test spends no quota. The payload is a file the script
+/// `type`s, rather than text embedded in the script, because a `.bat` cannot
+/// carry JSONL without escaping every quote on the line.
+fn stand_in_codex(dir: &Path, fixture: &str) -> PathBuf {
+    let payload = dir.join("stand-in-codex-payload.jsonl");
+    std::fs::write(&payload, fixture).unwrap();
+
+    #[cfg(windows)]
+    {
+        let script = dir.join("stand-in-codex.bat");
+        std::fs::write(
+            &script,
+            format!("@echo off\r\ntype \"{}\"\r\n", payload.display()),
+        )
+        .unwrap();
+        script
+    }
+
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join("stand-in-codex.sh");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\nexec cat \"{}\"\n", payload.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        script
+    }
+}
+
+/// `planning/ACCEPTANCE.md` §5 names **codex** for `turn.completed ⇒ Usage +
+/// Done`, so the criterion has to be proven through codex's own path: a fix
+/// verified only on agy would leave the stated requirement unproven.
+///
+/// The turn is driven end to end — spawn, parse, outcome — because that is the
+/// only place the finished usage exists at all: `turn.completed` arrives as a
+/// single stdout line, so the accounting it carries is complete only once the
+/// child has exited and the driver has built the outcome. `Usage` therefore
+/// follows `Done` on the stream, which is what `pie -p --json` writes
+/// (`DESIGN.md` §13), and a `--json` consumer sees both.
+#[tokio::test]
+async fn a_finished_codex_turn_streams_usage_after_done() {
+    let dir = tempfile::tempdir().unwrap();
+    let _home = HomeGuard::new(dir.path());
+
+    // `Codex::stream` refuses before spawning anything when there is no
+    // subscription credential (I9), and `HomeGuard` moved HOME to `dir`, so the
+    // store must exist for the turn to run at all. `auth_mode` is the value a
+    // real `~/.codex/auth.json` on this machine carries; no token is ever read.
+    let codex_dir = dir.path().join(".codex");
+    std::fs::create_dir_all(&codex_dir).unwrap();
+    std::fs::write(
+        codex_dir.join("auth.json"),
+        r#"{"auth_mode":"chatgpt","tokens":{"access_token":"stub"}}"#,
+    )
+    .unwrap();
+
+    let mut cfg = Config::default();
+    cfg.codex.bin = stand_in_codex(dir.path(), TURN).display().to_string();
+    cfg.codex.use_node_shim = false;
+
+    let mut request = ChatRequest::new("hi");
+    request.cwd = dir.path().to_path_buf();
+
+    let mut events: Vec<StreamEvent> = Vec::new();
+    let outcome = {
+        let mut sink = |event: StreamEvent| events.push(event);
+        Codex
+            .stream(&cfg, &request, &mut sink)
+            .await
+            .expect("the recorded turn streams")
+    };
+
+    assert_eq!(outcome.status, "completed");
+    assert_ne!(
+        outcome.usage,
+        Usage::default(),
+        "the fixture reports tokens, so this turn must not have a zero usage"
+    );
+
+    let seen: Vec<&'static str> = events.iter().map(StreamEvent::kind).collect();
+    let usage_events: Vec<&Usage> = events
+        .iter()
+        .filter_map(|event| match event {
+            StreamEvent::Usage(usage) => Some(usage),
+            _ => None,
+        })
+        .collect();
+
+    // The assertion that would have caught the defect, and the one that names
+    // the criterion it defends.
+    assert!(
+        !usage_events.is_empty(),
+        "planning/ACCEPTANCE.md §5 (turn.completed ⇒ Usage + Done): the stream carried \
+         no usage event, so `--json` cannot report what the turn cost — saw {seen:?}"
+    );
+    assert_eq!(
+        usage_events.len(),
+        1,
+        "accounting is emitted once per turn; a duplicate is its own defect — saw {seen:?}"
+    );
+    assert!(
+        seen.contains(&"done"),
+        "`done` must still be streamed: {seen:?}"
+    );
+    assert!(
+        matches!(events.last(), Some(StreamEvent::Usage(_))),
+        "the stream reads `…, done, usage`: {seen:?}"
+    );
+    assert_eq!(
+        usage_events[0], &outcome.usage,
+        "the event must carry the turn's real figures, not a zero-filled placeholder"
+    );
 }
 
 // ---------------------------------------------------------------------------

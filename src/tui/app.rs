@@ -10,7 +10,7 @@
 //! backend's [`StreamEvent`] into the transcript; the loop that actually drives a
 //! turn lives in [`super`].
 
-use crate::provider::{StreamEvent, ToolState, Usage};
+use crate::provider::{Model, StreamEvent, ToolState, Usage};
 
 /// One key, with no terminal behind it.
 ///
@@ -70,6 +70,32 @@ pub enum Action {
     PickerAccept,
 }
 
+impl Action {
+    /// The two-or-three-word name the keymap help prints for this action.
+    ///
+    /// Derived from the variant rather than written into the help table beside it. A
+    /// separate display string is a second copy of the same fact, and the failure it
+    /// produces is silent: the help would describe an action the reducer does not
+    /// produce, which is exactly the drift `ACCEPTANCE.md` §9 forbids ("the keybinding
+    /// help and the reducer read the **same** table"). The match has no wildcard arm
+    /// on purpose — a new `Action` variant cannot compile without a name, so it cannot
+    /// reach the footer as a blank.
+    pub fn label(self) -> &'static str {
+        match self {
+            Action::None => "no action",
+            Action::Quit => "quit",
+            Action::Submit => "submit",
+            Action::Cancel => "cancel",
+            Action::ScrollUp => "scroll up",
+            Action::ScrollDown => "scroll down",
+            Action::OpenPicker => "pick a model",
+            Action::PickerNext => "next model",
+            Action::PickerPrev => "previous model",
+            Action::PickerAccept => "take the model",
+        }
+    }
+}
+
 /// What the conversation is doing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Status {
@@ -81,6 +107,20 @@ pub enum Status {
     Done,
     /// The last turn failed, with a short reason.
     Failed(String),
+}
+
+impl Status {
+    /// Whether a turn is in flight.
+    ///
+    /// A predicate rather than the comparison it replaces, because the comparison
+    /// *was* a defect: `Enter` asked `status == Idle`, `apply_event(Done)` set `Done`,
+    /// nothing returned to `Idle`, and the TUI sent one turn and then went inert
+    /// forever (B26, `ACCEPTANCE.md` §13). The lifecycle is stated in terms of a turn
+    /// running (`DESIGN.md` §12), so the code asks the question in the same terms
+    /// rather than restating the lifecycle as a chain of equality tests.
+    pub fn is_running(&self) -> bool {
+        matches!(self, Status::Running)
+    }
 }
 
 /// One line of the transcript.
@@ -146,6 +186,48 @@ impl Picker {
         let last = self.items.len() - 1;
         let next = self.selected as isize + delta;
         self.selected = next.clamp(0, last as isize) as usize;
+    }
+
+    /// The rows for one backend's catalog, in the catalog's own order.
+    ///
+    /// Pure on purpose: no catalog read, no clock, no `provider::list_models` call.
+    /// The catalog itself costs a vendor CLI on a cache miss (`src/tui.rs`'s
+    /// `fill_picker`), so a picker that could only be filled *through* a backend would
+    /// be a picker no offline test could fill — and a test that reached a backend
+    /// would spend subscription quota to prove a layout.
+    ///
+    /// The label leads with the `backend/model` spelling `--model` accepts, because a
+    /// row sets **both** `App::backend` and `App::model` (`DESIGN.md` §12) and a bare
+    /// model id would not say which subscription the row switches to — the loop merges
+    /// every backend's catalog into one list, so two rows can otherwise read alike.
+    pub fn from_models(backend: &str, models: &[Model]) -> Self {
+        let items = models
+            .iter()
+            .map(|model| {
+                // An empty display name must not be rendered as an empty bracket, and a
+                // display name equal to the id adds nothing the label does not already
+                // say. Same rule as the loop's own rows, so a `display`-less catalog
+                // does not look different depending on which path built it.
+                let display = model.display.trim();
+                let label = if display.is_empty() || display == model.id {
+                    format!("{}/{}", backend, model.id)
+                } else {
+                    format!("{}/{} ({})", backend, model.id, display)
+                };
+                PickerItem {
+                    backend: backend.to_string(),
+                    model: model.id.clone(),
+                    label,
+                }
+            })
+            .collect();
+
+        Self {
+            items,
+            // The first row, not a remembered one: the catalog is new, so any previous
+            // highlight points at a row that no longer exists.
+            selected: 0,
+        }
     }
 }
 
@@ -226,6 +308,193 @@ impl App {
     }
 }
 
+/// The state a keymap row is documented in.
+///
+/// The keymap is modal — `Enter`, `Tab`, `Up`, `Down` and `Esc` each mean two things —
+/// so a row is only a contract together with the state it holds in. Naming that state
+/// as data rather than in prose is what lets the keymap test *drive* every row through
+/// [`reduce`] instead of reasoning about it, which is the difference between a checked
+/// table and a comment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindingState {
+    /// Nothing running, no picker, and text in the prompt.
+    PromptReady,
+    /// A turn is in flight.
+    Running,
+    /// The model picker is open.
+    PickerOpen,
+}
+
+/// One row of the frozen keymap (`DESIGN.md` §12).
+///
+/// Data, not an overlay's code path: `Input` has no help-toggle variant and must not
+/// get one, so the help is a footer rendered from this table rather than a screen a key
+/// opens. `action` is the [`Action`] variant the row must produce, not a description of
+/// it — the test drives the row through [`reduce`] and compares against this field, so a
+/// row that lies about its key or its action fails rather than reading plausibly.
+#[derive(Debug, Clone, Copy)]
+pub struct KeyBinding {
+    /// The key, as the help prints it.
+    pub keys: &'static str,
+    /// What the key does, printed after [`Self::keys`].
+    pub description: &'static str,
+    /// The [`Input`] the row is driven with.
+    pub input: Input,
+    /// The state the row holds in.
+    pub state: BindingState,
+    /// The [`Action`] [`reduce`] must return for this row.
+    pub action: Action,
+}
+
+/// The whole keymap, as the one table the help and the reducer both read.
+///
+/// A `const` rather than a function returning a slice, because every field is a
+/// `&'static str`, an [`Input`] or an [`Action`] and all of them are const-constructible
+/// — so the table is a value with no call to make and nothing to allocate per frame. A
+/// `fn keybindings()` would add an indirection that buys nothing.
+///
+/// Rows repeat their key where the keymap is modal (`Enter` submits and accepts, `Tab`
+/// opens and then no-ops, `Esc` cancels and then quits), because folding those together
+/// is how the second half of a modal row goes missing from the help.
+///
+/// The descriptions are deliberately terse: sixteen rows have to fit a two-row footer
+/// (`render::HELP_ROWS`), so a phrase like "submit the prompt unless a turn is running"
+/// would push two other rows off the screen. The state lives in [`Self::state`], which
+/// is what the test uses.
+pub const KEYBINDINGS: &[KeyBinding] = &[
+    KeyBinding {
+        keys: "char",
+        description: "type at the cursor",
+        input: Input::Char('x'),
+        state: BindingState::PromptReady,
+        action: Action::None,
+    },
+    KeyBinding {
+        keys: "backspace",
+        description: "delete a character",
+        input: Input::Backspace,
+        state: BindingState::PromptReady,
+        action: Action::None,
+    },
+    KeyBinding {
+        keys: "left",
+        description: "cursor left",
+        input: Input::Left,
+        state: BindingState::PromptReady,
+        action: Action::None,
+    },
+    KeyBinding {
+        keys: "right",
+        description: "cursor right",
+        input: Input::Right,
+        state: BindingState::PromptReady,
+        action: Action::None,
+    },
+    KeyBinding {
+        keys: "ctrl-x",
+        description: "ignored",
+        input: Input::Ctrl('x'),
+        state: BindingState::PromptReady,
+        action: Action::None,
+    },
+    KeyBinding {
+        keys: "ctrl-c",
+        description: "quit always",
+        input: Input::Ctrl('c'),
+        state: BindingState::PromptReady,
+        action: Action::Quit,
+    },
+    KeyBinding {
+        keys: "enter",
+        description: "send prompt",
+        input: Input::Enter,
+        state: BindingState::PromptReady,
+        action: Action::Submit,
+    },
+    KeyBinding {
+        keys: "enter",
+        description: "take model, picker open",
+        input: Input::Enter,
+        state: BindingState::PickerOpen,
+        action: Action::PickerAccept,
+    },
+    KeyBinding {
+        keys: "tab",
+        description: "open picker",
+        input: Input::Tab,
+        state: BindingState::PromptReady,
+        action: Action::OpenPicker,
+    },
+    KeyBinding {
+        keys: "tab",
+        description: "no-op, picker open",
+        input: Input::Tab,
+        state: BindingState::PickerOpen,
+        action: Action::None,
+    },
+    KeyBinding {
+        keys: "up",
+        description: "scroll up",
+        input: Input::Up,
+        state: BindingState::PromptReady,
+        action: Action::ScrollUp,
+    },
+    KeyBinding {
+        keys: "down",
+        description: "scroll down",
+        input: Input::Down,
+        state: BindingState::PromptReady,
+        action: Action::ScrollDown,
+    },
+    KeyBinding {
+        keys: "up",
+        description: "previous model, picker open",
+        input: Input::Up,
+        state: BindingState::PickerOpen,
+        action: Action::PickerPrev,
+    },
+    KeyBinding {
+        keys: "down",
+        description: "next model, picker open",
+        input: Input::Down,
+        state: BindingState::PickerOpen,
+        action: Action::PickerNext,
+    },
+    KeyBinding {
+        keys: "esc",
+        description: "cancel turn, close picker",
+        input: Input::Esc,
+        state: BindingState::Running,
+        action: Action::Cancel,
+    },
+    KeyBinding {
+        keys: "esc",
+        description: "quit when nothing to cancel",
+        input: Input::Esc,
+        state: BindingState::PromptReady,
+        action: Action::Quit,
+    },
+];
+
+/// The keymap as the single line of help the footer draws, derived from
+/// [`KEYBINDINGS`].
+///
+/// The words have exactly one source. A help string written here instead would be a
+/// second copy of the keymap that nothing could contradict — which is the shape of the
+/// claim `ACCEPTANCE.md` §9 rejects: the assertion has to be that every documented row
+/// *produces* its documented action through [`reduce`], not that a help string exists.
+///
+/// Returns a `String` rather than a `&'static str` because a `const` cannot concatenate
+/// the table's fields; the footer is redrawn per frame either way, and the allocation is
+/// one line of text.
+pub fn help_text() -> String {
+    KEYBINDINGS
+        .iter()
+        .map(|binding| format!("{} {}", binding.keys, binding.description))
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
 /// Turn one key into a state change plus, when the caller must act, an [`Action`].
 ///
 /// The frozen keybinging table (`DESIGN.md` §12). Every row is a contract with
@@ -237,13 +506,14 @@ impl App {
 /// | `Char(c)` | `None` | insert `c` at the cursor |
 /// | `Backspace` | `None` | delete the character before the cursor |
 /// | `Left` / `Right` | `None` | move the cursor, clamped to the prompt |
-/// | `Enter`, picker open | `PickerAccept` | highlight taken as the model; picker closed |
-/// | `Enter`, prompt submittable, `Idle` | `Submit` | prompt cleared, `Status::Running` |
+/// | `Enter`, picker open | `PickerAccept` | `backend` **and** `model` taken from the highlight; picker closed |
+/// | `Enter`, prompt submittable, status **not `Running`** | `Submit` | `Entry::User` pushed; prompt cleared; `Status::Running` |
 /// | `Enter`, otherwise | `None` | nothing |
-/// | `Tab` | `OpenPicker` | picker opened **empty** for the caller to fill |
+/// | `Tab`, picker closed | `OpenPicker` | picker opened **empty** for the caller to fill |
+/// | `Tab`, picker already open | `None` | nothing — a re-open would discard the catalog the caller filled in |
 /// | `Up` / `Down`, picker open | `PickerPrev` / `PickerNext` | highlight moved and clamped |
 /// | `Up` / `Down`, otherwise | `ScrollUp` / `ScrollDown` | scroll moved, never below zero |
-/// | `Esc`, a turn is running or a picker is open | `Cancel` | picker closed, status back to `Idle` |
+/// | `Esc`, a turn is running or a picker is open | `Cancel` | picker closed; `Idle` **only if the turn was running** |
 /// | `Esc`, nothing to cancel | `Quit` | `should_quit` |
 /// | `Ctrl('c')` | `Quit` | `should_quit` |
 /// | any other `Ctrl(..)` | `None` | nothing |
@@ -254,12 +524,142 @@ impl App {
 /// **`Up`/`Down` mean different things depending on the picker**, because the
 /// picker is modal; overloading them is what keeps the keymap small enough to
 /// document in full.
-pub fn reduce(_app: &mut App, _input: Input) -> Action {
-    // SCAFFOLD — stage A replaces this body with the table above and asserts
-    // every row of it in `tests/tui_app.rs`. It returns `None` rather than
-    // panicking because `lib.rs` denies `panic`/`unwrap`/`expect` outside tests,
-    // and because a stub that cannot compile is worse than one that does nothing.
-    Action::None
+///
+/// Three rows above were wrong in the first freeze, and each is worth a sentence
+/// because the reason is not visible from the code (B26, `ACCEPTANCE.md` §13).
+///
+/// * **`Enter` submits whenever the status is not `Running`, not only from `Idle`.**
+///   The original table read `Idle` and `apply_event(Done)` set `Done`, with nothing
+///   anywhere returning to `Idle` — so after the first answer `Enter` was inert
+///   forever and the TUI could hold exactly one turn. [`Status::is_running`] exists so
+///   the question is asked once, in the lifecycle's own terms.
+/// * **`Tab` while the picker is open is a no-op.** `Tab` opens the picker empty for
+///   the caller to fill from a catalog that is read asynchronously, so a second `Tab`
+///   that reset it to [`Picker::default`] threw that catalog away — a picker that
+///   emptied itself under a repeated keypress, with nothing on screen to explain it.
+/// * **`Esc` returns to `Idle` only when a turn was running.** Closing an overlay is
+///   not a status change, and the status it used to clear was a `Failed` reason the
+///   user had not read yet.
+///
+/// `Submit` also pushes the submitted text as an [`Entry::User`] **before** it clears
+/// the prompt: `Action::Submit` carries no payload, and the prompt is gone by the time
+/// `reduce` returns — so the caller cannot record the question without re-deriving
+/// state the reducer already decided, and the TUI would show answers with no questions
+/// (`ACCEPTANCE.md` §9, stage B's checklist: "both `User` and `Assistant` entries
+/// appear"). `src/tui.rs` must not also append a `User` entry, or the turn is recorded
+/// twice.
+pub fn reduce(app: &mut App, input: Input) -> Action {
+    // `Ctrl('c')` is answered first and unconditionally: it is the one key that
+    // must work while a turn is running and while the picker is modal, because it
+    // is the user's way out when nothing else responds. `Esc` cannot serve that
+    // role — `Esc` is `Cancel` in exactly those two states.
+    if matches!(input, Input::Ctrl('c')) {
+        app.should_quit = true;
+        return Action::Quit;
+    }
+
+    match input {
+        Input::Ctrl(_) => Action::None,
+        Input::Char(c) => {
+            app.prompt = insert_char(&app.prompt, app.cursor, c);
+            // Clamped, not `+= 1`: a prompt assigned from outside (a test, a
+            // restored draft) can leave the cursor past the end, and an
+            // unclamped cursor is the offset the multi-byte editing bug rides in
+            // on.
+            app.cursor = (app.cursor + 1).min(char_count(&app.prompt));
+            Action::None
+        }
+        Input::Backspace => {
+            if app.cursor > 0 {
+                app.prompt = remove_char_before(&app.prompt, app.cursor);
+                app.cursor -= 1;
+            }
+            Action::None
+        }
+        Input::Left => {
+            app.cursor = app.cursor.saturating_sub(1).min(char_count(&app.prompt));
+            Action::None
+        }
+        Input::Right => {
+            app.cursor = (app.cursor + 1).min(char_count(&app.prompt));
+            Action::None
+        }
+        Input::Enter => {
+            // The picker is modal, so it takes `Enter` first: accepting a row and
+            // submitting a prompt on the same key would send a turn the user was
+            // still choosing a model for.
+            if app.picker.is_some() {
+                if let Some(item) = app.picker.as_ref().and_then(Picker::current).cloned() {
+                    app.backend = item.backend;
+                    app.model = Some(item.model);
+                }
+                app.picker = None;
+                return Action::PickerAccept;
+            }
+
+            if !app.status.is_running() && app.prompt_is_submittable() {
+                let submitted = std::mem::take(&mut app.prompt);
+                app.cursor = 0;
+                app.transcript.push(Entry::User(submitted));
+                app.status = Status::Running;
+                return Action::Submit;
+            }
+            Action::None
+        }
+        Input::Esc => {
+            // Read both facts before either is changed: one `Cancel` covers the turn and
+            // the overlay, but only a running turn may move the status.
+            let running = app.status.is_running();
+            let overlay_open = app.picker.is_some();
+            if running || overlay_open {
+                app.picker = None;
+                // `Idle` only when a turn was running. Clearing a `Failed` reason as a
+                // side effect of closing the picker destroyed the one thing the user
+                // still had to read (B26).
+                if running {
+                    app.status = Status::Idle;
+                }
+                Action::Cancel
+            } else {
+                app.should_quit = true;
+                Action::Quit
+            }
+        }
+        Input::Tab => {
+            if app.picker.is_some() {
+                // A no-op, not a second `OpenPicker`: the picker is opened **empty** for
+                // the caller to fill from a catalog read asynchronously, so resetting it
+                // here discards the rows the loop has just fetched (B26).
+                return Action::None;
+            }
+            // Frozen: opened **empty**. The caller fills it from the backend's
+            // catalog, which needs I/O and therefore cannot happen here.
+            app.picker = Some(Picker::default());
+            Action::OpenPicker
+        }
+        Input::Up => {
+            if let Some(picker) = app.picker.as_mut() {
+                picker.move_by(-1);
+                Action::PickerPrev
+            } else {
+                app.scroll = app.scroll.saturating_sub(1);
+                Action::ScrollUp
+            }
+        }
+        Input::Down => {
+            if let Some(picker) = app.picker.as_mut() {
+                picker.move_by(1);
+                Action::PickerNext
+            } else {
+                // Saturating, not `+= 1`: `u16` overflow panics in debug, and
+                // `lib.rs` denies indexing that can panic for the same reason.
+                // The upper bound is render's, because only render knows how many
+                // lines the transcript occupies.
+                app.scroll = app.scroll.saturating_add(1);
+                Action::ScrollDown
+            }
+        }
+    }
 }
 
 /// Fold one backend event into the app.
@@ -285,9 +685,130 @@ pub fn reduce(_app: &mut App, _input: Input) -> Action {
 ///   (unknown vendor events, banner lines) and `PIE_LOG` already records them; a
 ///   `Notice` per unparsed line would fill the transcript with vendor chatter
 ///   during a normal turn.
-pub fn apply_event(_app: &mut App, _event: &StreamEvent) {
-    // SCAFFOLD — stage A replaces this body with the behaviour above and asserts
-    // it in `tests/tui_app.rs`.
+///
+/// Two details the table above states as prose, implemented as narrowly as
+/// written. `Init` with no `conversation_id` **keeps** an id already recorded: the
+/// field exists so a later `--resume` has something to take, and a resumed turn
+/// that reported `None` must not erase it. And `Done` re-sends `text` only when
+/// nothing in the current turn streamed any answer, where "the current turn" is
+/// the transcript since the last [`Entry::User`] — not "the last entry", because a
+/// turn that ends on a tool step would otherwise append the whole reply a second
+/// time, and not "the transcript", because that would suppress turn 2's text
+/// merely because turn 1 had streamed.
+pub fn apply_event(app: &mut App, event: &StreamEvent) {
+    match event {
+        StreamEvent::Init {
+            conversation_id,
+            tools,
+            ..
+        } => {
+            if let Some(id) = conversation_id {
+                app.vendor_id = Some(id.clone());
+            }
+            // The id and the tool count are both shown here so a user can see
+            // what `--json` would have told them; the count is the vendor's own
+            // catalog, which is also how the UI can say the tools are the
+            // vendor's (`VENDOR_TOOL_NOTE`).
+            let conversation = conversation_id
+                .clone()
+                .unwrap_or_else(|| "(none reported)".to_string());
+            let notice = format!(
+                "{} · conversation {} · {} tools available",
+                app.backend,
+                conversation,
+                tools.len()
+            );
+            app.transcript.push(Entry::Notice(notice));
+        }
+        StreamEvent::TextDelta(delta) => {
+            let appended = match app.transcript.last_mut() {
+                Some(Entry::Assistant(text)) => {
+                    text.push_str(delta);
+                    true
+                }
+                _ => false,
+            };
+            if !appended {
+                app.transcript.push(Entry::Assistant(delta.clone()));
+            }
+        }
+        StreamEvent::ToolStep { name, state, .. } => {
+            app.tool_events.push((name.clone(), *state));
+            app.transcript.push(Entry::Tool {
+                name: name.clone(),
+                state: *state,
+            });
+        }
+        StreamEvent::Usage(usage) => match app.last_usage.as_mut() {
+            Some(existing) => existing.merge(usage.clone()),
+            None => app.last_usage = Some(usage.clone()),
+        },
+        StreamEvent::Done { text, .. } => {
+            app.status = Status::Done;
+            // An empty terminal text is not an answer, and pushing it would leave
+            // a blank line in the transcript that no input produced.
+            if !text.is_empty() && !this_turn_streamed_an_answer(app) {
+                app.transcript.push(Entry::Assistant(text.clone()));
+            }
+        }
+        // Deliberately ignored, and the reason is in the table above: a `Notice`
+        // per unparsed banner line would fill the transcript with vendor chatter
+        // during a normal turn, and `PIE_LOG` already holds them.
+        StreamEvent::Other { .. } | StreamEvent::Unparsed(_) => {}
+    }
+}
+
+/// Characters in `s`, which is **not** `s.len()`.
+///
+/// `App::cursor` is a character offset, so every edit has to be expressed in
+/// characters. The byte version of this function is the classic bug here: on a
+/// prompt of `é` or `日本語`, `s.len()` is larger than the number of characters,
+/// and an offset taken from it lands inside a character — `String::insert` either
+/// inserts in the wrong place or panics on the non-boundary. Measured in
+/// characters, both are impossible.
+fn char_count(s: &str) -> usize {
+    s.chars().count()
+}
+
+/// `s` with `c` inserted before character `index`, rebuilt rather than spliced.
+///
+/// Rebuilding keeps this free of a byte offset that could be a non-boundary — the
+/// reason `char_count` exists — and an out-of-range `index` inserts at the end
+/// rather than panicking, because `lib.rs` denies indexing that can panic.
+fn insert_char(s: &str, index: usize, c: char) -> String {
+    let mut out = String::with_capacity(s.len() + c.len_utf8());
+    out.extend(s.chars().take(index));
+    out.push(c);
+    out.extend(s.chars().skip(index));
+    out
+}
+
+/// `s` without the character before `index`; `index == 0` removes nothing.
+///
+/// Removing by character position rather than by byte is what makes `Backspace`
+/// after `Char('é')` remove the whole character and not half of it.
+fn remove_char_before(s: &str, index: usize) -> String {
+    s.chars()
+        .enumerate()
+        .filter(|(i, _)| *i + 1 != index)
+        .map(|(_, c)| c)
+        .collect()
+}
+
+/// Whether the turn in progress has already put answer text on screen.
+///
+/// Looks only at the entries since the last [`Entry::User`], which is what makes
+/// the `Done` rule per-turn: scanning the whole transcript would stop suppressing
+/// the duplicate after the first turn, and looking only at the last entry would
+/// re-append the answer after a trailing tool step. A delta that carried no text
+/// does not count — an empty `Assistant` entry would otherwise swallow the only
+/// copy of the answer.
+fn this_turn_streamed_an_answer(app: &App) -> bool {
+    app.transcript
+        .iter()
+        .rev()
+        .take_while(|entry| !matches!(entry, Entry::User(_)))
+        .any(|entry| matches!(entry, Entry::Assistant(text) if !text.is_empty()))
 }
 
 #[cfg(test)]

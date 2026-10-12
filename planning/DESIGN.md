@@ -636,6 +636,28 @@ must not blank it; and `Picker`/`PickerItem`, because picking a model has to pro
 
 ### The keybinding table is the specification
 
+It is exposed as **data** so the help and the reducer cannot drift: `app::KEYBINDINGS`
+is a `const` slice of `KeyBinding { keys, action, description, input }`, `Action::label()`
+gives the footer's word, and `app::help_text()` renders the table. `render.rs` draws it
+between the prompt and the status line, so the status line stays the frame's last row.
+
+**Measured, and part of the criterion:** the footer is pre-wrapped by `render.rs`
+(`help_lines(width)`, greedy at whitespace) and drawn **without** `Wrap`, so the pane
+reserves a height it has counted rather than guessed, and `render::help_rows(width,
+height)` is the single function the test reads the region from. The whole keymap is
+visible from **35 columns x 24 rows**; at **80x24** — an ordinary terminal — it uses 5
+rows and leaves 15 for the transcript. Below 35 columns it clips.
+
+That measurement is the criterion, not a footnote. The first version reserved two rows
+and fitted whole only from about **200 columns**, so `ACCEPTANCE.md` §9's "every
+keybinding is documented in help" was true only on a terminal nobody has: at 80 columns
+the buffer omitted `tab` entirely. A test at a generous width would have kept that
+hidden, which is the same defect one level down.
+
+`KeyBinding::action` holds the `Action` **variant** rather than a display string on
+purpose: the keymap test then compares `reduce`'s return mechanically, so a documented
+row cannot agree with a string while disagreeing with the code.
+
 The frozen `Input → Action` mapping. Stage D asserts it row by row, and the help text
 is generated from it, so the table cannot drift from the behaviour:
 
@@ -645,12 +667,13 @@ is generated from it, so the table cannot drift from the behaviour:
 | `Backspace` | `None` | delete the character before the cursor |
 | `Left` / `Right` | `None` | move the cursor, clamped to the prompt |
 | `Enter`, picker open | `PickerAccept` | highlight taken as the model; picker closed |
-| `Enter`, prompt submittable, `Idle` | `Submit` | prompt cleared, `Status::Running` |
+| `Enter`, prompt submittable, **status is not `Running`** | `Submit` | `Entry::User` pushed; prompt cleared; `Status::Running` |
 | `Enter`, otherwise | `None` | nothing |
-| `Tab` | `OpenPicker` | picker opened **empty**, for the caller to fill |
+| `Tab`, picker closed | `OpenPicker` | picker opened **empty**, for the caller to fill |
+| `Tab`, picker already open | `None` | nothing — re-opening must not discard the catalog the caller filled in |
 | `Up` / `Down`, picker open | `PickerPrev` / `PickerNext` | highlight moved, clamped |
 | `Up` / `Down`, otherwise | `ScrollUp` / `ScrollDown` | scroll moved, never below zero |
-| `Esc`, a turn is running or a picker is open | `Cancel` | picker closed; status back to `Idle` |
+| `Esc`, a turn is running or a picker is open | `Cancel` | picker closed; `Idle` **only if the turn was running** |
 | `Esc`, nothing to cancel | `Quit` | `should_quit` |
 | `Ctrl('c')` | `Quit` | `should_quit` |
 | any other `Ctrl(..)` | `None` | nothing |
@@ -660,6 +683,51 @@ text**, so a turn is never spent on an empty prompt — the one keystroke a user
 by accident that costs real subscription quota. And **`Up`/`Down` mean different
 things depending on the picker**, because the picker is modal; overloading them is what
 keeps the keymap small enough to document in full.
+
+### The turn lifecycle, and the bug freezing it too tightly caused
+
+The row above reads **"status is not `Running`"**, not "`Idle`", and that distinction was
+a real defect in the first freeze rather than a wording preference. The original table
+sent `Submit` only from `Idle` and had `Done` set `Status::Done`, with nothing anywhere
+returning to `Idle` — so **the TUI could send exactly one turn and then never
+submitted again.** Stage A implemented the table faithfully and reported the
+contradiction instead of quietly patching it, which is the behaviour that rule exists
+to produce; the contract was wrong, not the code.
+
+The lifecycle is now stated once, here:
+
+| From | Event | To |
+|---|---|---|
+| `Idle` | `Submit` | `Running` |
+| `Running` | `apply_event(Done)` | `Done` |
+| `Running` | the loop's `Finished(Err(e))` | `Failed(e)` |
+| `Running` | `Esc` (`Cancel`) | `Idle` |
+| `Done` / `Failed` | `Submit` | `Running` |
+
+Two consequences worth naming:
+
+* **The loop's `Finished` is the authoritative terminal status.** `apply_event(Done)`
+sets `Done` from the *stream*, but the turn's real outcome arrives on the channel, and a
+`Done` whose vendor status is an error must end as `Failed` rather than as `Done`.
+`Finished` therefore overwrites, and a test asserts exactly that ordering (a `Done`
+followed by `Finished(Err(..))` ends `Failed`). The residual case — `Finished(Ok)` whose
+`Done` carried a non-success vendor string — is logged as an open suggestion, because
+recognising success vocabulary is backend knowledge and pie's agy parser already turns
+`status: "ERROR"` into an error, so the TUI should not guess a second time.
+* **`Esc` while the picker is open does not touch the status.** Closing an overlay must
+not erase a failure reason the user has not read yet; `Cancel` therefore returns to
+`Idle` only when a turn was actually running.
+
+`Action::Submit` and `Action::PickerAccept` carry no payload, so the state change has to
+happen inside `reduce`: `Submit` pushes `Entry::User` with the submitted text, and
+`PickerAccept` sets **both** `App::backend` and `App::model` from the highlighted
+`PickerItem`. The loop must not push a second `User` entry — it sees the same submission
+and would otherwise double it.
+
+`App::scroll` has **no ceiling in the reducer**, deliberately: how far down is meaningful
+depends on the transcript's rendered height, which only `render` knows. `reduce` clamps
+at zero from below and `render` clamps what it draws, so a `scroll` past the end is an
+empty window rather than a panic or an out-of-range draw.
 
 ### `apply_event`'s frozen behaviour
 
@@ -677,19 +745,51 @@ delta would grow the transcript without bound on a long answer. The `Done` rule 
 twin of `B21`'s fix on the backend side — a terminal event must not duplicate what has
 already been delivered.
 
+"**nothing was streamed**" means *since the last `Entry::User`*, and an empty delta does
+**not** count as streaming. The first draft left this open and both halves bit:
+scoping to the whole transcript suppresses the answer on **every turn after the first**,
+and counting an empty delta as streaming means a turn that ends on a tool step renders
+as having no answer at all. Both are asserted.
+
 ### Stages, and who owns which file
 
 | Stage | Owns | Gate |
 |---|---|---|
 | A state + reducer | `src/tui/app.rs`, `tests/tui_app.rs` | `cargo test --test tui_app` |
 | B render | `src/tui/render.rs`, `tests/tui_render.rs` | `cargo test --test tui_render` |
-| C loop + wiring | `src/tui/mod.rs`, `src/commands/tui.rs`, `tests/tui_loop.rs` | `cargo test --test tui_loop` |
-| D picker + keys | `src/tui/app.rs`, `tests/tui_app.rs` | `cargo test --test tui_app` |
+| C loop + wiring | `src/tui.rs`, `src/commands/tui.rs`, `tests/tui_loop.rs` | `cargo test --test tui_loop` |
+| D picker + keys | `src/tui/app.rs`, `tests/tui_keys.rs` | `cargo test --test tui_keys` |
 | G5 | a **real turn's** events through `apply_event`, asserting the rendered buffer | live, by hand |
+
+### Correcting a contract mid-flight invalidates the artefacts written from it
+
+B26 is the case that made this rule explicit. The keybinding table was corrected while
+stage A and stage D were both writing against it, and stage A had already encoded the
+**old** `Tab` row into a test helper (`tests/tui_app.rs`'s
+`documented_action_with_picker_open`). Stage D implemented the corrected row, and that
+helper then failed — correctly, and for the right reason.
+
+Two things made this recoverable rather than a mess. Stage D **reported the conflict
+instead of editing another stage's file**, which is rule 1 doing its job; and the
+corrected row had its own named regression test in stage D's file, so the stale helper
+was identifiable as stale rather than as the code being wrong. The maintainer fixed the
+one-line helper.
+
+The generalisable rule: **when a frozen table is corrected after a stage has written
+against it, grep for the old row before declaring the milestone green.** A contract is
+not just read once; anything derived from its earlier version is a derived artefact, and
+the session's other lesson — every claim needs something that would fail if it were
+false — applies to those too.
 
 Each stage gate names the stage's **own** test binary. That is not boilerplate: in M5
 two of three stages shipped with a gate that could not fail them, because the gate ran
 a different stage's tests (`ACCEPTANCE.md` §8).
+
+Stage D refines A's own subject matter, so the tempting choice is to add D's tests to
+`tests/tui_app.rs` and let one gate cover both. It is rejected on purpose: a red gate
+has to say **which** stage broke, and "the reducer suite failed" cannot distinguish A's
+invariants from D's keymap. D therefore gets its own binary, and the small amount of
+fixture duplication that costs is worth the attribution.
 
 `cli.rs`, `commands.rs` and `lib.rs` stay with the maintainer; stage C adds
 `src/commands/tui.rs` and the maintainer wires it, so no agent edits a shared file.
@@ -762,3 +862,283 @@ M3 profile/memory projection · M4 unified auth/usage tables · M5 agent loop +
 sessions + OCR MCP · M6 ratatui TUI · M7 learn · M8 watchtower · M9 claude +
 tool-loop · M10 HTTP backends. `tool_loop` stays `false` for every M0–M2 backend;
 the flag exists now so the loop can branch on it later (RISKS §1, §2).
+
+---
+
+## 16. Daily learn + schedule (M7)
+
+Roadmap: `schedule.rs` + `learn.rs`: mine pie + CLI sessions → profile/memory updates;
+consolidation + provenance + decay; local-only; cheap/local model budget. Done:
+*after a few sessions, `profile.toml`/`memory/*.md` reflect real habits; `/memory`
+shows what pie learned and lets you revert it.*
+
+> Appended as §16 rather than inserted after §11, to avoid renumbering the
+> cross-references these documents already make to existing sections.
+
+### The design driver: the default path spends nothing
+
+This is the whole shape of M7. `RISKS.md` §13 is the governing risk — "an
+LLM-summarizing job can silently spend premium subscription quota" — and this machine
+has **no cheap backend**: every backend pie drives is subscription-locked, so PLAN
+§11b's "cheap/local model by default" has nothing to name today. The honest reading is
+therefore stronger, not weaker: **the default path makes no model call at all.**
+
+`learn` is *extractive by rule*, exactly as M5's compaction is (`DESIGN.md` §11 —
+"extractive: head + state block + tail; spawns nothing"). It counts recurrences,
+recognises explicit preference statements (`always`, `never`, `I prefer`, `don't`), and
+derives stack and terminology from prompt text and tool names. No model is consulted to
+produce a candidate, so `pie learn` is quota-free, deterministic and testable, and
+model-based consolidation becomes an **opt-in extra** rather than the mechanism.
+
+The second reason matters more: a rule-based extractor has no failure mode that can
+spend money silently. A model-based one has exactly one, and it is the risk `RISKS.md`
+§13 already names.
+
+### Decisions
+
+| Decision | Choice | Why |
+|---|---|---|
+| Default model use | **none** | No cheap backend exists, so `RISKS.md` §13's budget becomes a gate rather than a note |
+| Model consolidation | opt-in, budgeted, **off** by default | Requires config naming a backend **and** a token budget; refuses *before* spawning if the budget cannot cover the job |
+| Scheduling | opt-in cadence; `due()` is a **pure function of `(last_run, cadence, now)`** | A job runner that reads the clock inside its own decision cannot be tested |
+| Artifacts | every run writes a dated report listing candidates, what was written, and what was skipped | "never silent" (PLAN §11) — a job whose effect you cannot read is one you cannot revert |
+| Provenance | every learned line carries its source session id and turn index | a fact you cannot trace is one you cannot judge |
+| Decay | a candidate not re-observed within the window loses confidence and is demoted, **never** silently deleted | memory that rots invisibly is `RISKS.md` §16 |
+| Revert | `pie memory revert <ID>` restores the pre-apply state from a journal | "reviewable and revertible" (PLAN §11b) is a testable claim, so it gets a test |
+| Privacy | pie's own sessions by default; vendor stores (`~/.gemini`, `~/.codex`, `~/.claude`) are **opt-in, read-only, never written** | `RISKS.md` §15. No M7 path sends anything off-machine |
+| Stable prefix | consolidation **appends** to a later section and never reorders the head of the projection | `TOKEN-ECONOMICS.md` §3: rewriting the head invalidates the vendor's cached prefix once a day |
+
+### Frozen interfaces
+
+M7's stages are less parallel than M6's — consolidation needs extraction's output, and
+`/memory` reads what consolidation wrote — so only the cross-stage types are frozen,
+and each stage owns its own files.
+
+```rust
+// src/learn.rs
+pub enum CandidateKind { Preference, Stack, Convention, Terminology, Habit }
+pub enum Source { PieSession, AgyHistory, CodexHistory, ClaudeHistory }
+pub struct Provenance { pub session_id: String, pub turn_index: usize, pub source: Source }
+pub struct Candidate {
+    pub kind: CandidateKind, pub text: String, pub provenance: Provenance,
+    pub hits: u32, pub last_seen_ms: u64,
+}
+
+pub fn extract(turns: &[MinedTurn]) -> Vec<Candidate>;          // pure: no spawn, no clock
+pub fn consolidate(existing: &MemoryDoc, candidates: &[Candidate], now_ms: u64) -> Consolidation;
+pub fn apply(consolidation: &Consolidation, home: &Path) -> Result<Journal>;  // the revert handle
+pub fn revert(journal: &Journal, home: &Path) -> Result<()>;
+
+// src/schedule.rs
+pub fn due(last_run_ms: Option<u64>, cadence: Cadence, now_ms: u64) -> bool;   // pure
+pub struct Budget { pub max_tokens: u64, pub spent: u64 }
+pub fn check_budget(budget: &Budget, estimate: u64) -> Result<()>;            // refuses BEFORE spawning
+```
+
+Two rules carried over from M6 because they are what made M6 testable: **`extract` and
+`due` take the clock as a parameter and never read it**, and **nothing in `learn.rs` or
+`schedule.rs` calls `provider::stream` except behind `check_budget`.**
+
+### `/memory` in the TUI does not extend M6's `Input`
+
+The TUI reaches `/memory` through the ordinary `Submit` path: the loop inspects the
+submitted prompt for a leading `/` and dispatches a *pie-local* command in-process.
+M6's `Input` enum is frozen and stays frozen — a slash command is a property of the
+submitted text, not a new keystroke. That is what `Action::Submit` was specified as
+"the caller decides what a submission means" for.
+
+### The cross-cutting gate, as a gate
+
+`ROADMAP.md`'s cross-cutting list requires background jobs to be *budgeted* and
+*opt-in*. Prose cannot enforce that, so M7 ships it as assertions with teeth, using the
+counting-stand-in pattern `tests/cache.rs` already established:
+
+* with the **default** config, a scheduled run performs **zero** provider spawns — and
+the *count* is asserted, not merely the absence of an error;
+* a job whose estimate exceeds the budget is **refused before any spawn**, so a budget
+of `0` cannot be "exceeded by one call";
+* `due()` is asserted at and around its boundary, not only in the middle;
+* the ledger records `spent`, so a second run inside the same window cannot re-spend it.
+
+### CLI surface
+
+```
+pie learn [--dry-run] [--report]      # extract + consolidate; --dry-run writes nothing
+pie memory [show|revert <ID>]         # what was learned, with provenance; revert it
+pie schedule [status|run <JOB>]       # what is due, what last ran, and the budget state
+```
+
+All three are quota-free under the default config. `pie learn --model b/m` is the opt-in
+model consolidation, and is refused without a configured budget.
+
+---
+
+## 17. Monthly watchtower (M8)
+
+Roadmap: `watch/news.rs` + `watch/drift.rs`. Done: `~/.pie/reports/watchtower-YYYY-MM.md`
+produced and notified; the drift diff shows any flag, schema or policy change.
+
+### Layout follows `provider.rs`, not `mod.rs`
+
+`src/watch.rs` beside `src/watch/{news,drift}.rs` — the same shape as `provider.rs`
+beside `provider/*.rs`. ACCEPTANCE §3 forbids `mod.rs`, and until M6 that rule had no
+enforcement at all (see the bug log): the M6 plan named `src/tui/mod.rs`, broke the
+rule, and the suite stayed green. M8 gets the shape right and the rule gets a gate.
+
+### Two jobs, one report, and neither spends model tokens by default
+
+PLAN §11a: *"monthly, configurable, network-only (no model tokens unless you ask for a
+digest)"*. That single clause decides M8's shape, and it is the same decision M7 makes:
+
+* **`drift`** spawns each CLI for its own `version` and `--help` — the probes I8 already
+  established. They cost **no** model tokens (a `--help` is not a turn), which is why
+  drift is safe to run on a schedule at all.
+* **`news`** fetches configured sources over the network and ranks them by **rule**
+  against the stack configured in `profile.toml`. No model is consulted.
+* A model-written digest is an **opt-in extra** behind the same budget gate as M7's
+  model consolidation. One budget mechanism, two consumers — not two mechanisms.
+
+### Compliance framing is a requirement, not a tone choice
+
+PLAN §11a is explicit: the watchtower *"flags when a change means pie must change
+behavior or stop, never how to evade a safety measure"*. So the drift report classifies
+every finding into exactly one of three outcomes, and the classification is part of the
+contract because it is what the report is *for*:
+
+| Class | Meaning |
+|---|---|
+| `compatible` | a flag or field appeared; pie needs no change |
+| `pie-must-change` | a flag moved, was renamed, or a stream field changed shape; a named pie file must follow |
+| `pie-must-stop` | a new policy, consent, or anti-automation measure; driving the CLI is no longer the sanctioned path, and the report says so plainly |
+
+A digest that only reported findings would be a changelog. The class is what makes it
+usable, and every finding that cannot be classified must be reported as *unclassified*
+rather than defaulting to `compatible` — a silent downgrade to "fine" is the failure
+mode that would make the whole job worthless.
+
+### Snapshots are compared, so the first run has nothing to compare to
+
+A drift check with no previous snapshot must report "first snapshot taken, nothing to
+diff" and **never** "no drift found". Those two are indistinguishable in a report that
+only prints findings, and only one of them is true.
+
+### Frozen interfaces
+
+```rust
+// src/watch.rs
+pub enum DriftClass { Compatible, PieMustChange, PieMustStop, Unclassified }
+pub struct CliSnapshot { pub backend: String, pub version: String, pub help: String, pub strings: Vec<String>, pub taken_ms: u64 }
+pub struct Drift { pub backend: String, pub class: DriftClass, pub what: String, pub detail: String }
+
+pub fn snapshot_dir(home: &Path) -> PathBuf;                       // $PIE_HOME/watch
+pub fn diff(previous: &CliSnapshot, current: &CliSnapshot) -> Vec<Drift>;   // pure
+pub fn classify(entry: &Drift) -> DriftClass;                      // pure, table-driven
+pub fn render_report(month: &str, drifts: &[Drift], news: &[NewsItem], first_run: bool) -> String;
+
+// src/watch/news.rs
+pub struct NewsItem { pub title: String, pub url: String, pub source: String, pub impact: u32, pub matched: Vec<String> }
+pub fn rank(items: Vec<NewsItem>, stack: &[String]) -> Vec<NewsItem>;   // pure, rule-based
+pub fn fetch(source: &Source, client: &HttpClient) -> Result<Vec<NewsItem>>;  // network
+```
+
+Three rules carry over, and each has already been paid for once in this project:
+
+1. **The clock is a parameter.** `render_report` takes `month: &str`; nothing reads the
+   system clock to decide a file name, so `watchtower-YYYY-MM.md` is testable at any
+   date instead of only in the current month.
+2. **A network failure is a stated error, never an empty success.** The same rule M5's
+   `ocr` stage shipped (`ACCEPTANCE.md` §8): an unreachable source produces a report
+   line naming the source and the failure, and the report says the digest is
+   incomplete. A digest silently missing a source reads as "nothing happened".
+3. **The vendor CLIs are probed, never configured.** Drift reads `--help` output; it
+   does not read or write `~/.codex/config.toml` or `~/.claude/settings.json` (§10's
+   static check applies here too).
+
+### The REA half, stated as the degradation it is
+
+`RISKS.md` §14: there is no disassembler on this machine, so the structural REA check
+degrades to version + `--help` + binary-strings diff — "REA-lite". Full structural checks
+become available only after `rea setup`. The report labels which mode produced it, so a
+"REA-lite" report is never mistaken for a structural one.
+
+### CLI surface
+
+```
+pie watch [news|drift|report] [--dry-run] [--month YYYY-MM]
+```
+
+Opt-in: with the default config nothing is due and nothing is fetched.
+
+---
+
+## 18. claude backend + the tool loop (M9)
+
+Roadmap: implement the claude adapter to spec; verify live when a subscription exists;
+build the `tool_use` → `tool_result` loop, reused by the HTTP backends.
+
+**This milestone cannot be verified live here.** `~/.claude/` exists but holds no
+credential and no history (checked 2026-10-12), so there is no Claude subscription on
+this machine. M9's verdict is therefore `offline-verified` and says so; it is never
+`done`.
+
+### claude is the only backend with a real system prompt
+
+`knowledge/claude.md`: `--append-system-prompt <text>`. Every other backend folds the
+projection in front of the prompt because it has no system role (agy) or no verified
+system-prompt flag (codex) — see `Capabilities::system_prompt`, already `true` only for
+claude. The bytes must stay identical; only the mechanism differs (`DESIGN.md` §10).
+
+### The tool loop is the substance, and it inverts the delegate assumption
+
+`RISKS.md` §1 is the reason M0–M8 exist in delegate mode: `agy --print` and
+`codex exec` are one-shot, they run their own tools, and they cannot accept an injected
+`tool_result`. claude in SDK mode can
+(`-p --input-format stream-json --output-format stream-json`). So M9 is where pie
+finally *owns* a tool loop, and it is the code path the M10 HTTP backends reuse
+(`RISKS.md` §8) — one implementation, two consumers, not two implementations.
+
+The loop is only correct if all four of these hold, and each is a stage check:
+
+1. a `tool_use` block is matched to its `tool_result` by `tool_use_id`, and a result for
+   an unknown id is a stated protocol error rather than a silently dropped frame;
+2. the child's stdin is written without deadlocking on the stdout loop (**the classic
+   two-pipe deadlock** — a synchronous write while the child blocks writing stdout);
+3. the loop is **bounded**: a model that requests tools forever is stopped by an
+   iteration cap, and the cap's effect is reported rather than swallowed;
+4. the loop cannot run against a delegate-mode backend. `capabilities().tool_loop`
+   gates it, so asking for the loop on agy or codex is a config error, not a hang.
+
+### Nothing here spends quota
+
+claude is `enabled = false` and unauthenticated, so no M9 stage may spawn a real
+claude. The SDK protocol is exercised against a **scripted stand-in child** that emits
+recorded `stream-json` frames and reads `tool_result` frames back — the same
+stand-in pattern `tests/cache.rs` and `tests/process.rs` already use. A live test exists
+and is `#[ignore]`d with a stated reason, ready for the day a subscription appears.
+
+---
+
+## 19. HTTP backends (M10)
+
+Roadmap: re-enable OpenRouter and DeepSeek from `DEFERRED-BACKENDS.md`. The scope, the
+wire shapes and the model lists live in that document and are not duplicated here.
+
+Three decisions this milestone owes, because they are the ones that could silently
+break an invariant that is already green:
+
+1. **These are the first backends that legitimately use an API key.** I9
+   ("subscription-only auth, never an API key") is an invariant about the *CLI*
+   backends. The HTTP backends need the key in the request and must never be handed a
+   vendor CLI's credential — and a missing key is a **stated** error, never a quiet
+   fallback to a different backend, because "answered with a different subscription than
+the one asked for" is the failure `resolve_target` was written to prevent.
+2. **`cost_usd_micros` renders again only where it is real.** M4 removed the cost column
+   because every subscription backend reports zero, and a permanent `$0.00` implies cost
+   is measured when it is not (`TOKEN-ECONOMICS.md` §10c). That reasoning cuts the other
+   way here: these backends must report a real cost or the column stays absent for them.
+3. **The tool loop comes from M9, not from a second copy.** A backend that needs
+   `tool_calls` and finds `tool_loop` unimplemented is an error, not a degraded path.
+
+Not verifiable live without the user's own API keys: the transport is tested against a
+recorded SSE corpus and a stand-in HTTP layer, and the verdict says which half ran.
+

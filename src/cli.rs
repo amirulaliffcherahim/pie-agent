@@ -141,6 +141,20 @@ pub enum Command {
     /// is spent, and the command writes no session row of its own.
     Sessions,
 
+    /// Open the interactive terminal UI.
+    ///
+    /// **Opt-in, and deliberately not the default.** A bare `pie` keeps printing
+    /// help (`DESIGN.md` §12), so no existing test and no CI job can ever enter
+    /// the TUI by accident, and a script that runs `pie` gets text rather than a
+    /// terminal takeover. Refuses to start unless stdin and stdout are both
+    /// terminals, so piping it fails with a message instead of emitting escape
+    /// codes into the pipe.
+    ///
+    /// The same persona projection, backend routing and session recording as
+    /// `pie -p`, so a turn taken here costs the same and is learned from the same
+    /// way (`DESIGN.md` §12).
+    Tui,
+
     /// Convert an image or scanned PDF to text through itsmini.
     ///
     /// Spawns no vendor CLI and spends no model quota: the work happens on
@@ -251,6 +265,24 @@ mod tests {
         assert!(cli.print.is_none());
         assert!(cli.command.is_none());
         assert!(!cli.list_backends);
+    }
+
+    /// `pie tui` is reachable only by asking for it.
+    ///
+    /// The two assertions are a pair on purpose: the subcommand parses, **and** a
+    /// bare invocation still has no command. Without the second, making `tui` the
+    /// default would pass the first and take over the terminal for every existing
+    /// script and CI job (`DESIGN.md` §12).
+    #[test]
+    fn the_tui_is_opt_in_and_never_the_default() {
+        assert!(matches!(
+            Cli::try_parse_from(["pie", "tui"]).unwrap().command,
+            Some(Command::Tui)
+        ));
+        assert!(
+            Cli::try_parse_from(["pie"]).unwrap().command.is_none(),
+            "a bare `pie` must keep printing help, never enter the TUI"
+        );
     }
 
     #[test]

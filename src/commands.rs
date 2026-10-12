@@ -12,6 +12,7 @@ pub mod ocr;
 pub mod print;
 pub mod profile;
 pub mod sessions;
+pub mod tui;
 pub mod usage;
 
 use crate::cli::{Cli, Command};
@@ -40,6 +41,12 @@ pub async fn dispatch(cli: &Cli, cfg: &Config) -> Result<()> {
         // Likewise no `cfg`: `pie sessions` reads pie's own index and nothing
         // else, so it is quota-free and spawn-free by construction.
         Some(Command::Sessions) => sessions::run(),
+        // `pie tui` is the one command that DOES take `cfg`, because it drives
+        // real turns: it resolves the backend, loads the same persona projection
+        // `pie -p` does, and records each turn to the same log and session store.
+        // It refuses to start without a terminal, so this arm is safe to reach
+        // from a pipe.
+        Some(Command::Tui) => tui::run(cfg).await,
         // And no `cfg` here either: `pie ocr` reads the itsmini base URL from the
         // environment at call time, so it needs nothing resolved first.
         Some(Command::Ocr {

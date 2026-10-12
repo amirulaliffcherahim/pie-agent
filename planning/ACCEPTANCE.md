@@ -93,6 +93,7 @@ These are cross-cutting gates from `ROADMAP.md`. Each has an assertion somewhere
 | I9 | Subscription-only auth, never an API key | codex `auth_mode` gate + no key injection; `NoSubscription` error path exists |
 | I10 | No credential is hardcoded, printed, or persisted by pie | `tests/no_secrets.rs`: a static scan for credential-shaped literals plus a behavioural run of the real binary with API keys in the environment, asserting they appear in no output and in no file under `PIE_HOME` |
 | I11 | The legacy `~/.pie/auth.json` (extracted OAuth tokens) is never read, written, or recreated | `tests/no_secrets.rs::the_legacy_auth_file_is_left_untouched` and a `session_log` unit test |
+| I12 | **No test passes only because this machine has vendor state** | **`G3d no vendor state`**: the entire suite is run again with `HOME`/`USERPROFILE` redirected to an empty directory, because that is what a CI runner is. Each test must establish the state it asserts about — `tests/parse_agy.rs`'s `PinHome` installs a scratch `~/.gemini` for exactly this reason. Added after **B32**: four agy tests were green locally and red in CI, because the developer's real home satisfied a subscription gate the tests never mentioned |
 
 ## 3. M0 — Scaffold + provider trait
 
@@ -433,14 +434,17 @@ gate that does not name the stage's own tests is decorative.
 | A state + reducer | `cargo test --test tui_app` | every `Input` maps to the documented `Action`; typing, submit, cancel, scroll, picker transitions; `apply_event` folds a `StreamEvent` into the transcript; no crossterm type appears in the reducer's signature |
 | B render | `cargo test --test tui_render` | with `TestBackend`: the prompt line, the status, and both `User` and `Assistant` entries appear; a long transcript scrolls rather than overflowing; a picker renders its options; the buffer is asserted, not merely non-empty |
 | C loop + wiring | `cargo test --test tui_loop` | the turn runs as a task and its events reach the app through the channel without blocking: assert a scripted sequence of events lands in order while the loop stays responsive to a quit input |
-| D picker + keys | `cargo test --test tui_app` | the documented keybindings each produce their action; choosing a model updates `App::model`; every keybinding is documented in help |
+| D picker + keys | `cargo test --test tui_keys` | the documented keybindings each produce their action; choosing a model updates `App::model`; every keybinding is documented in help; a second turn can be submitted after the first completes |
 | G5 | live, by hand | drive a **real** turn's `StreamEvent`s through `apply_event` and assert the rendered buffer contains the answer, then `pie tui` starts and quits cleanly |
 
 **Checks**
 
-- [ ] the reducer takes no crossterm type — `src/tui/app.rs` has zero `crossterm` imports
+- [ ] the reducer takes no crossterm type — `src/tui/app.rs` has zero crossterm imports, asserted by **reading the file's own source** in a test, not asserted in a doc comment
 - [ ] `render` is asserted through `TestBackend`, so it is tested without a terminal
 - [ ] the UI does not block on a turn: events arrive while the loop still accepts input
+- [ ] **a second turn can be submitted after the first completes.** The first freeze made the TUI single-turn (`Done` set a terminal status and only `Idle` could submit); the lifecycle is now stated in `DESIGN.md` §12 and asserted, because "the TUI can hold one conversation" is the kind of defect that looks like working software
+- [ ] the keybinding help and the reducer read the **same** table, so the documented keys cannot drift from the implemented ones — the assertion is that every documented row produces its documented action through `reduce`, not that a help string exists
+- [ ] **the whole keymap is visible at 80x24**, an ordinary terminal — asserted, because the first version fitted whole only from ~200 columns and omitted `tab` at 80, which is a criterion satisfied on a terminal nobody has
 - [ ] a bare `pie` still prints help and never enters the TUI
 - [ ] `pie tui` is opt-in, and no existing test or CI job can enter it accidentally
 - [ ] the UI states that tool steps are the *vendor's*, since delegate mode means pie runs none of its own
@@ -511,6 +515,7 @@ here. A row is a record of what was verified, not a substitute for verifying.
 | M3 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | **done** | G4 `cargo test --test profile` → 12 passed; `cargo run -- profile` → exit 0 with a provenance table (KIND / BYTES / SOURCE). G5 live: a rule in `profile.toml` requiring the token `ZQ7-MARKER` was honoured by **both** backends — agy replied `hello` + `ZQ7-MARKER`, codex replied `hello` + `ZQ7-MARKER` — so the persona is honoured, not merely sent. Payload equality (agy's persona text == codex's) is asserted without quota in `tests/profile.rs`, and determinism was verified by assembling from two different working directories and byte-comparing. G6 clean. Two findings: the contract's vendor-config check contradicted M1's own agy auth probe, so the contract was wrong and section 7 now allows exactly that one presence check; and the B13 redaction fix had over-corrected into destroying paths in diagnostics (B23) |
 | M4 | ✅ | ✅ | ✅ | ✅ | n/a | ✅ | **done** | Closed out of sequence: its work was built during M0–M2 and had no verdict until now. G4 `cargo run -- auth` and `cargo run -- usage` both exit 0 **with no `--model`**, which is the roadmap's Done condition. `tests/acceptance.rs` asserts the rendered rows, all three usage windows and the totals block, plus that neither command writes a session row. Two deviations recorded in section 6. G5 is `n/a`: neither command spends model tokens |
 | M5 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | **done** | Six stages, each with its own gate: **A** persist, **B** `--continue`/`--session`, **C** compact, **D** ocr, **E** mcp, **F** switch. 392 tests. **G5 live**: turn 1 seeded a session (replied `ok`), turn 2 with `--continue` replied **`41`** from turn 1's context, both reporting the same session id; `pie sessions` showed 2 turns; `usage.jsonl` grew to 2 rows and still has exactly its 14 frozen keys. Independent MCP handshake against the real binary: 3 stdout lines, **all** valid JSON, `tools == ["ocr"]` (count 1). G6 clean. **Known gap, stated rather than glossed**: a multi-line switched payload is not delivered end-to-end on Windows, because batch stand-ins reject multi-line argv — stages B and F both hit it, and it is payload-tested plus a cfg-gated half with Linux CI getting the stronger half |
+| M6 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | **done** | Six stages, each with its own gate: **A** state+reducer, **B** render (`TestBackend`), **C** loop + channel + wiring, **D** picker + keymap. 498 tests, 7 live correctly ignored, across 19 binaries. **G4** gained a named gate per M6 stage — `tui_app` 36, `tui_render` 20, `tui_loop` 19, `tui_keys` 20 — plus a check on the **built binary** that `pie tui` refuses a pipe: non-zero exit, no escape codes, a message naming the reason, and all four of its branches proved able to fail with a stand-in. **G5 live**: a real `agy/gemini-3.8-flash` turn and a real `codex/gpt-6-luna` turn were each driven through `apply_event` and asserted **in the rendered buffer** (`a_real_*_turn_renders_through_the_tui_reducer`) — that is the roadmap's Done condition, not a proxy for it; plus both quota probes and the leak check, 7/7. **The first G5 run FAILED** (`codex_usage_probe_reports_buckets`, stale against the new default — B33), so M6 was not declared done until a later run was green. G6 clean. **24 offline gates green** (G1/G2/G3/G3b/G3c/G3d + 17 G4 + G6), **25/25 with `-Live`**. **Not verifiable here**: human interaction — keystrokes are covered through the reducer and rendering through the buffer, but "does this feel usable" stays a judgement for the user, and no verdict above should be read as claiming it |
 
 Verdict values: `done` (all applicable gates) · `offline-verified` (G5 skipped by
 user decision) · `blocked` (a gate fails) · `not started`.
@@ -568,6 +573,36 @@ prevents it. This is the record the milestone verdicts above rest on.
 | B22 | medium | **Unbounded input from sources pie does not control.** `Instant::now() + spec.timeout` panics on overflow and the timeout is an unvalidated `u64`; `argv_char_len` counted chars where Windows counts UTF-16 code units, under-measuring non-BMP prompts into an opaque `CreateProcessW` failure; `kill_tree` awaited `taskkill` with no deadline, on the timeout path it exists to enforce; `cache::read` read any file whole; and the argv cap measured the configured binary name before `stream` swapped in the resolved path | QC sweep, robustness lens | `checked_add` with a config error; UTF-16 counting on Windows; `kill_tree` bounded by a 5 s timeout; a 16 MiB size guard on cache reads, with the reason in the code | `an_implausibly_large_cache_file_is_a_miss_not_an_allocation`, existing cap tests |
 | B23 | **major** | **The fix for B13 introduced over-redaction that destroyed file paths in diagnostics.** Adding `/` to the opaque-run charset (to catch base64 secrets containing it) meant any unix-style path over 40 characters was redacted: a real config error printed `C:«redacted»\config.toml` instead of naming the file, and an error that cannot name the offending file is close to useless. A path is not a secret, and paths appear in almost every diagnostic | Running the real binary with a long `PIE_HOME` and deliberately invalid TOML — not by a test, which is the point: the security lens that found B13 could not have found this, because over-redaction looks like success | `/` removed from the run charset, with the trade-off written into the code: paths are far more common in diagnostics than unprefixed base64, so the path wins. The precise mechanism is `SECRET_PREFIXES`, which catches known credential shapes regardless of length; the run heuristic is only the backstop for unknown ones. Residual gap recorded rather than hidden: a long base64 secret *containing* `/` can survive in fragments | `a_long_path_in_a_diagnostic_is_not_redacted`, which asserts both a Windows and a unix path survive |
 
+### M6
+
+| # | Sev | Symptom | Caught by | Fix | Regression test |
+|---|---|---|---|---|---|
+| B25 | **blocker (gate)** | **A required gate had no runner, and its command could not pass as written.** G6 is listed as required in §1 and every run-log row reports it green, but neither `qc.ps1`, `qc.sh` nor CI invoked it — the column rested on a hand-run command and a claim with nothing able to contradict it. And `cargo check --target x86_64-unknown-linux-gnu --all-targets` as documented **fails** locally (`failed to find tool "x86_64-linux-gnu-gcc"`), because the default `http` feature pulls reqwest → rustls → ring and needs a C compiler for the target; `--no-default-features` is required, not optional | Wiring M6's new dependencies and *looking for* the gate rather than trusting the column | Both runners now invoke G6 with the working flag, and **SKIP it loudly and count it separately** when the target is missing rather than passing silently. §1's row corrected. The cost is stated: `--no-default-features` means G6 does not cover `cfg(feature = "http")` for Linux, which only CI's ubuntu job can | the runner itself; the verdict line now distinguishes green from skipped |
+| B26 | **blocker (contract)** | **The frozen M6 contract made the TUI single-turn.** The keybinding table sent `Submit` only from `Status::Idle`, and `apply_event(Done)` set `Status::Done`; **nothing anywhere returned to `Idle`**, so after the first answer `Enter` was inert forever. A TUI that can hold one conversation is not the milestone | Stage A read the table against its own implementation and **reported the contradiction instead of patching it**, which is exactly what the "report, never silently deviate" rule exists to produce. The contract was wrong, not the code | The table now reads *status is not `Running`*, and §12 states the whole lifecycle in one place. `Esc` also stopped erasing a `Failed` reason, and a second `Tab` no longer discards the catalog the caller filled in | `a_second_turn_can_be_submitted_after_the_first_completes`, `a_failed_reason_survives_closing_the_picker`, `tab_twice_does_not_discard_the_catalog` |
+| B27 | minor (process) | **The no-`mod.rs` convention had no enforcement** and M6's own plan broke it: §3 requires "no `mod.rs` files; `provider.rs` sits beside `provider/`", and the M6 stage table named `src/tui/mod.rs`. The scaffold created it, the suite stayed green, and nothing anywhere would ever have noticed | Reading §3's checklist *as a checklist* and running its commands by hand instead of assuming a green suite meant the list was satisfied | The TUI module became `src/tui.rs` beside `src/tui/`, matching `provider.rs`; both runners now assert the convention, so a future `mod.rs` fails a gate instead of silently joining the tree | `G3c module layout` in both runners |
+| B28 | **major (criterion unmet)** | **No backend ever emits `StreamEvent::Usage`, so `pie -p --json` never carries token accounting.** ACCEPTANCE §5's frozen criterion says `turn.completed` ⇒ `Usage` **+** `Done`; `codex.rs` and `agy.rs` construct only `Done`. The event kind exists in the frozen `StreamEvent` set, `--json` is documented as emitting "the same StreamEvent serde shape", and the TUI's `apply_event` `Usage` row was dead code as a result — the status line would have claimed every turn cost nothing | Stage C, by grepping for constructions rather than assuming a type in the enum is a type on the wire. **A frozen criterion from M2 was an over-claim for ten milestones and no gate could have caught it**, because every M2 test asserts the router's *outcome*, not the event stream | the driver emits `Usage` from the finalised outcome, **after `Done`**. The complete figure only exists once the process has exited and `outcome()` has merged every partial report, so the driver is the only place holding it whole; `done` stays terminal for the *answer*, and `usage` is accounting. Buffering `Done` so `usage` could precede it was considered and rejected — it buys a cosmetic ordering for a new failure mode where an error path swallows an already-produced `Done`. All-zero usage is **suppressed**, because `Usage::merge`'s convention is that a zero field means "not reported" and emitting zeros would assert a turn cost nothing | `a_finished_agy_turn_streams_usage_after_done` and `a_finished_codex_turn_streams_usage_after_done`, both confirmed RED first (`saw ["init", "tool", "tool", "text", "done"]`) |
+| B32 | **blocker (CI red)** | **Four `tests/parse_agy.rs` tests passed only on a machine with agy logged in, so `G4 acceptance (M1)` — M1's own named gate — was red on all three CI platforms while the local run was green.** `Agy::stream` calls `require_subscription()?` first, and `auth::agy_credential()` returns `Credential::Absent` when `$HOME/.gemini` is not a directory. The tests' `PinHome` helper pointed `PIE_HOME` at a scratch dir but left `HOME`/`USERPROFILE` alone, so on the developer's machine the real `~/.gemini/config/config.json` satisfied the gate and on a CI runner it did not. Each test then failed on `Err(AuthRequired)` where it expected `BinaryMissing`, `Timeout`, success, or a `Config` error naming the model. **Every document in this repository that treats CI's ubuntu job as the real Linux evidence was resting on a job that fails** | **Not a gate, and not the local suite: a sweep of every test binary with `HOME` redirected to an empty directory.** The trigger was a stage report noting almost in passing that an existing `stream` test "satisfies the gate by leaving `HOME` alone (the real `~/.gemini` exists here)" — a claim worth testing rather than accepting | `PinHome` now also points `HOME`/`USERPROFILE` at the scratch dir and installs a scratch `~/.gemini/config/config.json`, so the tests establish the state they assert about instead of inheriting it. `require_subscription` itself is unchanged: the gate is deliberate (§13 B14) and blocking a turn without a login is correct | the five tests themselves, plus the new **`G3d no vendor state`** gate, which runs the entire suite with `HOME` redirected so a future test cannot reintroduce this invisibly |
+| B29 | minor (latent panic) | **A large `App::scroll` panics inside ratatui.** `render` hands `App::scroll` straight to `Paragraph::scroll`, and ratatui 0.29 then computes `y + area.height` and overflows: `attempt to add with overflow` at `paragraph.rs:483`. Measured boundary at 60x20 — last OK `65519`, first panic `65520` — i.e. it panics whenever `scroll + transcript_height > u16::MAX` | **Not a stage.** Found by the maintainer sweeping adversarial payloads across a width×height grid while verifying stage B's *different* panic claim. Stage B's own scroll tests used ordinary values | Clamp the offset inside `render` before handing it to `Paragraph` | a sweep over `App::scroll` including `u16::MAX`, at several sizes |
+| B30 | minor (process) | **A dependency feature was enabled on an assumption nothing checked, and was never used.** `crossterm`'s non-default `event-stream` feature was added to `Cargo.toml` with a comment stating it was *required* for the loop to select over the terminal stream and the turn channel. `EventStream` does implement `futures_core::Stream`, but `futures-core` is only a *transitive* dep, so calling `.next()` needs `futures-util` — `use futures_core::stream::Stream;` fails `E0433`. The loop reads keys with `event::read()` on a detached thread instead, and nothing referenced the feature | Stage C, which tried to compile the dependency the maintainer had documented as necessary and reported `E0433` rather than working around it silently | Feature removed and the comment replaced with why it is absent and what was actually built. An unused feature is worse than no feature: the next reader treats it as load-bearing | the `Cargo.toml` comment plus the loop's own tests |
+| B31 | minor (cosmetic) | The non-TTY refusal message reads `...needs a terminal on both stdin and stdout, and stdin and stdout is not one` — the placeholder is substituted with a compound subject, so the singular verb is wrong for the both-streams case | Reading `pie tui`'s actual output on a pipe during verification, which is the only place it is visible | Reworded so the sentence holds for each of the three cases; the three assertions pinning the old phrasing move with it | `a_pipe_on_either_end_refuses_to_start_the_tui` |
+
+**B29 is the one worth dwelling on.** It was found by attacking the *same area* stage B had already tested and passed, with a grid sweep and payloads B had no reason to try. Stage B's own finding (the 2-column `WordWrapper` panic) was real and its guard is load-bearing — verified by dropping `MIN_WRAPPED_COLUMNS` to 1 and reproducing `index outside of buffer` at width 2, then restoring it. But two panics lived in one function, and the stage found one. **A stage's report is a statement about what it looked for, and independent verification is what turns "tested" into "tested by someone trying to break it".**
+
+The two M6 entries that belong to the harness and the quota decision are recorded above (B24) and in the `wham/usage` commit respectively. **The pattern across B25–B30 and S12 is one thing, and it is the most useful result of this milestone.** In every case **the artefact existed and the thing connecting it to a failure did not**:
+
+| Artefact that looked like coverage | What was actually missing |
+|---|---|
+| G6's row in §1, green in every run-log row | any runner that invoked it (B25) |
+| §3's "no `mod.rs` files" checklist item | any check (B27) |
+| a dependency feature documented as *required* | any code referencing it (B30) |
+| M2's "`turn.completed` ⇒ `Usage` + `Done`" criterion | any test asserting the event stream rather than the outcome (B28) |
+| `VERSIONING.md`'s changelog-and-tag rule | any signal, since none is mechanically decidable (S12) |
+| the frozen keybinding table | anyone walking every row against the lifecycle (B26) |
+
+A gate with no runner, a rule with no check, a contract table nobody traversed, and a criterion only ever asserted on a different surface all read as coverage. **The generalisable rule: for every claim, name the thing that would fail if the claim were false. If the answer is "nothing, but it is written down", the claim is not evidence.** Six of them were found in one milestone, from four directions — wiring a new dependency, reading a checklist, implementing a frozen table, and sweeping an already-tested function with adversarial input (B29). **None was found by a stage's own gate passing.**
+
+| B33 | minor (artefact drift) | **The first G5 run failed, and the re-run is what caught it.** `codex_usage_probe_reports_buckets` asserted real quota buckets with no environment set, so it started failing the moment `codex.quota_probe` defaulted to `off` — the very decision it was supposed to help verify. It is the same shape as B26: a decision changed, and an artefact derived from the old one did not | Running G5, which the `wham/usage` change required — this is the existing rule "re-run a live gate after any change to the payload it proves" working as intended, not an accident | Split into a pair, because the two halves have different costs and only one needs money: the **default is off** is asserted offline in `tests/acceptance.rs` (no network, no credential — the disabled path returns before the credential is read), and **opting in still returns real buckets** stays live in `tests/live_smoke.rs`, where `run_pie_with_env` passes `PIE_CODEX_QUOTA_PROBE=http` explicitly | `the_default_codex_usage_probe_is_disabled_and_says_so` (offline) and `codex_usage_probe_reports_buckets_when_it_is_opted_in` (live) |
+
 ### Test harness
 
 | # | Sev | Symptom | Caught by | Fix | Regression test |
@@ -601,3 +636,123 @@ rather than oversights. None affects a milestone verdict.
 | S6 | `DESIGN` §11 names `agent.compact_after_turns`, but **no such config key exists** — the compaction threshold is a constant of 40 | A contract that promises a setting the code does not offer is the kind of drift that makes a doc untrustworthy. Either wire the key or stop naming it; stage F used the constant directly, which is the honest behaviour while the key is absent |
 | S7 | On a **switched** turn, `compact::assemble` replaces stage B's per-turn framing, so a failed turn's `stop_reason` reaches the payload only via the state block instead of a `## turn N` marker | `src/compact.rs` is frozen by stage C's brief, so the composition was reported rather than patched. The consequence is a slightly coarser history on switched turns, not a correctness problem |
 | S8 | `--switch <unknown>` yields `PieError::Config` while `--model <unknown>/x` yields `PieError::UnknownBackend`; both print `known: agy, codex, claude` and both exit 2, but the variants differ | Stage F followed its brief literally and reported the divergence instead of quietly choosing. User-visible behaviour is consistent; only the internal variant differs, so this is tidiness rather than a defect |
+| S9 | `apply_event(Done)` sets `Status::Done` even when the vendor's own status string says otherwise. The authoritative terminal status is the loop's `Finished`, so a genuine failure arrives as `Failed` — but a backend that returned `Ok` with a non-success `Done` would render as done | The agy parser already maps `status: "ERROR"` to `PieError::Backend`, so the combination cannot arise from agy; teaching the TUI another backend's success vocabulary would put backend knowledge in the layer that deliberately has none (`DESIGN.md` §12). A test asserts the ordering that matters — `Finished(Err)` after `Done` ends `Failed` |
+| S10 | `App::scroll` has no upper bound in the reducer; `render` clamps what it draws | How far down is *meaningful* depends on the transcript's rendered height, which only `render` knows. `reduce` clamps at zero from below, so a scroll past the end draws an empty window rather than panicking or drawing out of range. Recorded so the asymmetry is a decision rather than an omission |
+| S11 | `tests/tui_render.rs` briefly failed to compile while stage B was mid-edit (`usize == u16`), which broke the *other* stages' `cargo clippy --all-targets` and would have failed the full gate | Not a defect — it is the documented cost of three stages sharing one checkout, which is why every M6 brief carries "a transient compile error may not be yours". Stage A reported it without touching the file, which is the behaviour the line is there to produce. Recorded because a real defect could wear exactly the same clothes, so the distinction should be visible in the log rather than resolved by memory |
+| S12 | **`VERSIONING.md`'s changelog and tagging rules are unenforced, and both were unmet.** The `[Unreleased]` block was empty while M1–M6 had landed, and `git tag` was empty although the same file says to tag each release. The `[Unreleased]` block is populated as part of closing M6, so the rule is now satisfied for this state of the tree | **No gate is added, deliberately.** "Was the changelog updated as work landed" is not mechanically decidable from the repository, so the only cheap checks available — that an `[Unreleased]` heading exists, or that the top released version matches `Cargo.toml` — would pass for the exact tree that was wrong. A gate that cannot fail the thing you care about is the defect `ACCEPTANCE.md` §1 and M5's two decorative gates are about, so adding one here would make the situation worse by lending it credibility. The honest handling is a checklist item at release time: **promote `[Unreleased]` and tag in the same commit**, and treat an empty `[Unreleased]` above a non-empty commit range as the signal |
+| S13 | The TUI's picker overlay is 50% of the frame, and a merged agy+codex catalog can exceed it, so the list scrolls with **no indicator that it is scrollable** | Verified not to be a selection bug: ratatui 0.29's list rendering auto-scrolls to keep the highlighted row visible, so a `PickerAccept` can never take a row the user could not see. What is missing is only the affordance, which no M6 criterion requires. Left for a follow-up pass rather than added under a milestone that is closing |
+| S14 | `Agy::stream` calls `require_subscription()` **before** `build_plan`, so on a machine with no agy login a purely static argv error (`--effort` the model does not offer) is reported as `AuthRequired` rather than as a config error naming the model | Deliberate ordering — the gate is the security-relevant check and runs "before anything expensive" (§13 B14) — but it does mean a config error is unreachable without a credential. No correctness impact: both exit non-zero and name a fix, and a user with no login cannot use the backend at all. Recorded because it is the kind of precedence that looks like a bug when a test asserts the config error and gets the auth one, which is exactly what B32 hit |
+
+---
+
+## 15. M7 — daily learn + schedule
+
+Contract: `DESIGN.md` §16. Done condition from `ROADMAP.md`: *"after a few sessions,
+`profile.toml`/`memory/*.md` reflect real habits; `/memory` shows what pie learned and
+lets you revert it"*.
+
+> Appended as §15 rather than inserted after §9, to avoid renumbering the
+> cross-references these documents already make to existing sections.
+
+**Acceptance, per stage.** Every stage gets its **own** gate named after its **own**
+test binary. M7 has four stages and four distinct binaries for exactly that reason —
+M5's two decorative gates and M6's stage D both came from a gate that ran a *different*
+stage's tests, and M7 is the largest surface yet.
+
+| Stage | Command | Shape |
+|---|---|---|
+| A extract | `cargo test --test learn` | recurrence counting, explicit-preference recognition, stack/terminology from prompt text and tool names; **pure** — no spawn, no clock read, deterministic across two calls on the same input |
+| B consolidate | `cargo test --test consolidate` | merge/dedupe against the existing doc, confidence decay outside the window, provenance retained; `apply` returns a journal and `revert` restores the pre-apply bytes exactly |
+| C schedule | `cargo test --test schedule` | `due()` at and around its boundary; the budget refuses *before* spawning; the ledger's `spent` prevents a second spend in the same window |
+| D commands | `cargo test --test memory_cmd` and `cargo run -- memory` | `pie learn`/`memory`/`schedule` render; `--dry-run` writes nothing; `pie memory revert <ID>` undoes a real apply; TUI `/memory` routes through `Submit`, not a new `Input` |
+| G5 | live, by hand | run A–D on **real** sessions and read the artifacts |
+
+**Checks**
+
+- [ ] **the cross-cutting gate, asserted rather than described:** with the **default**
+      config a scheduled run performs **zero** provider spawns — the *count* is
+      asserted, using the counting-stand-in pattern of `tests/cache.rs`, not merely
+      the absence of an error
+- [ ] a job whose estimate exceeds the budget is refused **before any spawn**, so a
+      budget of `0` cannot be "exceeded by one call"
+- [ ] model consolidation is **off** by default: `pie learn` with the default config
+      spawns nothing and `grep`ping the run for a backend invocation finds none
+- [ ] `pie learn --model b/m` without a configured budget is a **config error**, not a
+      silent spend
+- [ ] the default path is deterministic: two `extract` runs over the same turns produce
+      byte-identical candidates, so a report can be diffed
+- [ ] every learned line carries provenance (session id + turn index) and `pie memory
+      show` prints it
+- [ ] decay **demotes**, it never deletes: a fact outside the window is still present
+      with lower confidence, asserted by re-reading the doc
+- [ ] `apply` then `revert` restores the pre-apply bytes **exactly** (byte comparison,
+      not "looks right")
+- [ ] consolidation never reorders the head of the projection: assert the projection's
+      first N bytes are unchanged across a consolidation (`TOKEN-ECONOMICS.md` §3)
+- [ ] no M7 path writes a vendor store, and no M7 path reads one unless the config
+      opts in — assert with a temp `HOME` that `~/.gemini`, `~/.codex` and `~/.claude`
+      are untouched after a full run
+- [ ] `pie learn`, `pie memory` and `pie schedule` write no session-log row and spend
+      no model quota (I7)
+- [ ] a scheduled run that fails mid-apply leaves the memory doc **readable** — the
+      journal is written before the doc is touched, so a crash is recoverable by
+      `revert` rather than leaving a half-written file
+- [ ] `no mod.rs files` still holds: `src/watch.rs` + `src/watch/{news,drift}.rs` is the
+      M8 shape, mirroring `provider.rs` + `provider/*.rs`. This was an **unenforced**
+      convention until M6 broke it and the suite stayed green — see the bug log
+
+**Not verifiable here**: whether the learned preferences are *good*. Extraction is
+rule-based and its output is inspectable, but "does this reflect how I actually work"
+is a judgement for the user, and M7's verdict says so rather than claiming quality.
+
+**Also not verifiable here**: importing the vendor session stores end-to-end. Checked
+rather than assumed, 2026-10-12: `~/.gemini/antigravity-cli/history.jsonl` and
+`conversation_summaries.db` exist with real data, `~/.codex/history.jsonl`,
+`session_index.jsonl` and `sessions/` exist with real data, and `~/.claude/` exists but
+holds only `backups/`, `cache/`, `ide/`, `sessions/`, `settings.json` — **no history and
+no credential**, consistent with there being no Claude subscription on this machine.
+So the agy and codex importers have real material to be verified against, and the
+claude importer has **none**: it is fixture-tested only. Say so; do not let a green
+suite imply a claude import that has never seen a claude session. Note also that
+these imports are **opt-in** by design, so the shipped default never reads any of them
+and the default-path test is `zero reads`, not `reads one of them`.
+
+---
+
+## 16. M8 — monthly watchtower
+
+Contract: `DESIGN.md` §17. Done condition from `ROADMAP.md`: *"
+`~/.pie/reports/watchtower-YYYY-MM.md` produced + notified; drift diff shows any
+flag/schema/policy change"*.
+
+> Appended as §16 rather than inserted after §9, to avoid renumbering
+> cross-references.
+
+**Acceptance, per stage.** Four stages, four distinct test binaries — for the same
+reason M7 has four.
+
+| Stage | Command | Shape |
+|---|---|---|
+| A drift | `cargo test --test drift` | `diff` over two snapshot fixtures: a renamed flag, a changed schema line and a changed version each yield a distinct finding **with the right class**; an identical pair yields **none**; `render_report` with `first_run` says "nothing to diff" and never "no drift found" |
+| B news | `cargo test --test news` | source fixtures parsed (**no network in any test**); rule-based impact ranking against a configured stack — a stack match outranks a non-match, and an empty stack ranks nothing above zero; an unreachable source is a stated error, never an empty digest |
+| C report | `cargo test --test watchtower` | the file is named from the **injected** month, not the system clock; the report contains every finding with its class; an unclassifiable finding is reported as `unclassified`, never as `compatible`; the REA mode is labelled |
+| D command | `cargo test --test watch_cmd` | `pie watch` with the default config fetches nothing and spawns no model; `--dry-run` writes no file; a real run writes exactly one file under `$PIE_HOME/reports/`; a network failure is reported rather than swallowed |
+| G5 | live, by hand | probe the **real** agy and codex, take a real snapshot, and diff a real `--help` change |
+
+**Checks**
+
+- [ ] `--help` probing costs **no** model tokens: assert the probe argv contains no turn flag, and that a probe run logs no session row (I7) — this is the claim that makes a *scheduled* drift job safe at all
+- [ ] `render_report` never reads the clock; the month is a parameter, asserted by rendering two different months from one call site
+- [ ] an unclassifiable drift entry is `Unclassified`, and `suggestions`/`Compatible` is never the fallback — assert with a deliberately unknown finding
+- [ ] the first run (no previous snapshot) reports "first snapshot taken", and a test asserts it is **not** the string "no drift" (the two are indistinguishable in a findings-only report, and only one is true)
+- [ ] a digest that lost a source says so in the report, and the run exits non-zero rather than writing an empty digest as success
+- [ ] the report classifies findings as `compatible` / `pie-must-change` / `pie-must-stop`, and a `pie-must-stop` finding names the pie file that must change — never a route to continue
+- [ ] nothing reads or writes vendor **config** (`~/.codex/config.toml`, `~/.claude/settings.json`) — the §10/§7 static check covers `src/watch/**` too
+- [ ] `pie watch` writes no session-log row (I7), and with the default config nothing is due
+- [ ] the budget gate is shared with M7: one mechanism, two consumers, and a test proves the news digest cannot spawn a model without a configured budget
+- [ ] `no mod.rs` holds: `src/watch.rs` beside `src/watch/{news,drift}.rs`
+
+**Not verifiable here**: the full structural REA check, because no disassembler is
+installed (`RISKS.md` §14). The shipped path is "REA-lite" and labels itself as such;
+the structural branch is compiled and fixture-tested but has never run against a real
+binary. Say so; do not let the report imply a structural comparison it did not make.

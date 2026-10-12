@@ -8,6 +8,63 @@ never 1.0.0 without explicit consent.
 
 ## [Unreleased]
 
+M1-M6 plus the defects found while closing M6. **Not yet promoted or tagged** — see
+`planning/VERSIONING.md` and ACCEPTANCE §14's S12: promoting this block and tagging are
+one release action, and the version in `Cargo.toml` has not moved since M0's `0.1.0`
+despite six `feat:` milestones, so the bump is a deliberate decision rather than an
+automatic one.
+
+### Added
+
+- **M1/M2** — the `agy` and `codex` delegate-mode backends: stream normalisation for
+  both vendor formats, model catalogs cached with a 24h TTL, quota reporting, and a
+  subscription gate that refuses an API-key-only or absent credential.
+- **M3** — one profile projected into every backend: `profile.toml`, `AGENTS.md` and
+  `memory/*.md`, assembled deterministically so agy and codex receive byte-identical
+  text, plus `pie profile` to show the projection and where each part came from.
+- **M4** — `pie auth` and `pie usage`: unified tables that work with no model selected
+  and spend no model quota.
+- **M5** — sessions and tools: a turn is persisted and resumable (`--continue`,
+  `--session`, `--switch <backend>`), compaction is extractive and spawns nothing,
+  and `pie ocr` is available both as a command and as an MCP server for the
+  delegate CLIs.
+- **M6** — an interactive ratatui TUI (`pie tui`): transcript and streaming output,
+  a model picker, a keymap help footer, and per-turn recording identical to `pie -p`.
+  Opt-in, so a bare `pie` still prints help and no existing script or CI job can
+  enter it. The reducer, the renderer and the terminal loop are separate, so all but
+  the loop itself is tested without a terminal.
+- New gate checks: **G6** (cross-target) is now actually wired into both runners,
+  **G3c** asserts the `no mod.rs` module layout, and **G3d** re-runs the whole suite
+  with `HOME` redirected to an empty directory so no test can pass only because the
+  developer's machine has vendor state.
+
+### Changed
+
+- **`codex.quota_probe` now defaults to `off`.** `pie usage codex` no longer calls
+  the private `chatgpt.com/backend-api/wham/usage` endpoint unless it is opted in
+  with `quota_probe = "http"` or `PIE_CODEX_QUOTA_PROBE=http`. The capability is
+  kept because the call is read-only using the user's own credential; the default is
+  off because an account risk nobody opted into is not a reasonable thing for a
+  default to spend. Session-log totals are unaffected.
+
+### Fixed
+
+- **`pie -p --json` now reports what a turn cost.** `StreamEvent::Usage` was never
+  emitted by any backend, so the frozen criterion "`turn.completed` ⇒ `Usage` +
+  `Done`" was unmet and a `--json` consumer could not see token accounting at all.
+  The event is emitted from the finalised outcome, after `Done`, and suppressed when
+  usage is all-zero (zero means "not reported", not "nothing was spent").
+- **Four `agy` tests no longer depend on the machine being logged in**, which had made
+  M1's own gate — and therefore every CI job — fail while the local run was green.
+- **`EnvGuard` panics with the fix instead of deadlocking** when a test takes it
+  twice on one thread; the deadlock hung the whole suite with no timeout to break it.
+- TUI: a second turn can be submitted after the first completes (previously `Enter`
+  was inert forever once a turn had finished); `Esc` no longer erases a failure
+  reason; a repeated `Tab` no longer discards the model catalog; and a large scroll
+  offset no longer panics inside ratatui.
+- The non-TTY refusal message for `pie tui` reads correctly when both streams are
+  redirected.
+
 ## [0.1.0] - 2026-10-12
 
 M0 — scaffold, provider contract, and the three CLI backends as stubs with

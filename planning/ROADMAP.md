@@ -1,7 +1,14 @@
 # pie — Roadmap (move one milestone at a time)
 
-Nothing is built yet. Work in order; don't start M(n+1) until M(n)'s checks pass.
-Read `RISKS.md` before M0/M3/M5/M7/M8. Versioning per `VERSIONING.md` (start 0.0.0).
+> **Status lives in `ACCEPTANCE.md` §12's run log, not here.** This file says what to
+> build and what each milestone's Done condition is; §12 records which milestones
+> passed a gate, at which commit, with what evidence. Do not infer progress from this
+> file. (An earlier version opened with "Nothing is built yet", which stayed there for
+> six milestones — a stale line at the top of the entry-point document is how a fresh
+> session concludes there is nothing to continue.)
+
+Work in order; don't start M(n+1) until M(n)'s checks pass.
+Read `RISKS.md` before M0/M3/M5/M7/M8. Versioning per `VERSIONING.md`.
 
 **Live path = agy + codex.** claude is future-proofing (no subscription); the HTTP
 backends are commented out. Neither blocks anything below.

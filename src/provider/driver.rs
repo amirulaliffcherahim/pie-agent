@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use crate::error::{PieError, Result};
 use crate::process::{self, RunSpec};
-use crate::provider::{Capabilities, StreamEvent, TurnOutcome};
+use crate::provider::{Capabilities, StreamEvent, TurnOutcome, Usage};
 
 /// Everything needed to execute one turn of a CLI backend.
 #[derive(Debug, Clone)]
@@ -96,6 +96,32 @@ pub async fn drive(
         &summary.stderr_tail,
     )?;
     outcome.duration = started.elapsed();
+
+    // Token accounting goes out **after** `Done`, and only here can it be sent
+    // whole.
+    //
+    // `Done` is emitted by the router *during* `on_line`, because it is what
+    // makes the answer final. The complete usage figure, by contrast, exists
+    // only once the process has exited and `outcome()` has merged every partial
+    // report the stream carried, so this driver is the first place that has it.
+    // The stream therefore reads `…, done, usage`: `done` stays terminal for the
+    // answer, and `usage` is accounting a consumer of `--json` — one JSON object
+    // per line, `DESIGN.md` §13 — can read from the last line.
+    //
+    // Deferring `Done` so that `usage` could precede it was considered and
+    // rejected: buffering the terminal event introduces a new failure mode where
+    // an error path swallows a `Done` that was already produced, to buy a purely
+    // cosmetic ordering.
+    //
+    // Emitted only when the backend reported something. `Usage::merge`'s
+    // documented convention is that a zero field means "not reported", not
+    // "reported as zero", so sending `Usage::default()` would assert that the
+    // turn cost nothing — a claim no backend made, and the criterion in
+    // `planning/ACCEPTANCE.md` §5 asks for accounting that exists.
+    if outcome.usage != Usage::default() {
+        sink(StreamEvent::Usage(outcome.usage.clone()));
+    }
+
     Ok(outcome)
 }
 

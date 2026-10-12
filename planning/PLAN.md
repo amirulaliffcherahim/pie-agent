@@ -49,19 +49,19 @@ pie/
 │   ├── session.rs         # session JSONL (mirrors pi's shape)
 │   ├── schedule.rs        # daily/monthly background job runner
 │   ├── learn.rs           # daily "know me": mine sessions → profile/memory
-│   ├── watch/             # monthly watchtower
-│   │   ├── mod.rs
+│   ├── watch.rs           # monthly watchtower (parent module - no mod.rs; DESIGN §2)
+│   ├── watch/
 │   │   ├── news.rs        # AI news digest (sources + impact ranking)
 │   │   └── drift.rs       # CLI drift check (version/help/strings; REA opt-in)
+│   ├── agent.rs           # the loop: prompt -> tools -> stream -> persist
 │   ├── agent/
-│   │   ├── mod.rs         # the loop: prompt → tools → stream → persist
 │   │   ├── tools.rs       # read, bash, edit, write, grep, find, ls
-│   │   ├── ocr.rs         # file → OCR text via itsmini (Baidu), cached
+│   │   ├── ocr.rs         # file -> OCR text via itsmini (Baidu), cached
 │   │   └── system.rs      # minimal system prompt (tools + short rules)
-│   ├── mcp_ocr.rs         # MCP server exposing `ocr` → itsmini (all CLIs)
+│   ├── mcp_ocr.rs         # MCP server exposing `ocr` -> itsmini (all CLIs)
+│   ├── provider.rs        # Provider trait + registry + selection
 │   ├── provider/
-│   │   ├── mod.rs         # Provider trait + registry + selection
-│   │   ├── cli.rs         # shared subprocess + NDJSON/JSONL streaming
+│   │   ├── driver.rs      # shared subprocess + NDJSON/JSONL streaming
 │   │   ├── agy.rs
 │   │   ├── codex.rs
 │   │   ├── claude.rs

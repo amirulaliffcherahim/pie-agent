@@ -77,13 +77,27 @@ fn ready(model: &str) {
 /// real `~/.pie/usage.jsonl` is not polluted with test rows, and the presence of
 /// a session-log row becomes an assertion we can make.
 fn run_pie(home: &Path, args: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_pie"))
+    run_pie_with_env(home, args, &[])
+}
+
+/// The same, with extra environment for the child.
+///
+/// Exists because one live test has to *opt in* to something the shipped default
+/// turns off: `codex.quota_probe` defaults to `off`, so a test that asserts real
+/// quota buckets must ask for the probe explicitly. Reaching a vendor endpoint from
+/// a default is a decision the user owns; reaching it when a test says so is what
+/// proves the capability still exists.
+fn run_pie_with_env(home: &Path, args: &[&str], env: &[(&str, &str)]) -> std::process::Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_pie"));
+    command
         .args(args)
         .env("PIE_HOME", home)
         // Live runs must not inherit a strip-env opt-out from the shell.
-        .env_remove("PIE_STRIP_ENV")
-        .output()
-        .expect("failed to run the pie binary")
+        .env_remove("PIE_STRIP_ENV");
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    command.output().expect("failed to run the pie binary")
 }
 
 /// Rows in the session log written under `home`.
@@ -242,13 +256,30 @@ fn codex_turn_succeeds_and_is_recorded() {
     assert_eq!(row["model"], "gpt-6-luna");
 }
 
+/// `pie usage codex` still reaches the endpoint **when the user opts in**.
+///
+/// This test is the opt-in half of a pair, and the pair exists because the default
+/// was reversed on 2026-10-12: `codex.quota_probe` now ships as `off`, so the private
+/// `wham/usage` endpoint is never called unless it is asked for. This test originally
+/// asserted buckets with no environment set and therefore started failing the moment
+/// the default changed — a live test is still an artefact derived from a decision, and
+/// changing the decision did not change it until the failure forced the issue.
+///
+/// The other half — that the **default** reports `disabled by config` and spends
+/// nothing — is asserted offline in `tests/acceptance.rs`, because it needs no model
+/// tokens and no network, and a property that CAN be checked for free should not be
+/// checked only by a gate that costs money.
 #[test]
 #[ignore = "spends real subscription quota; requires PIE_LIVE=1 and a logged-in codex"]
-fn codex_usage_probe_reports_buckets() {
-    require_live("codex_usage_probe_reports_buckets");
+fn codex_usage_probe_reports_buckets_when_it_is_opted_in() {
+    require_live("codex_usage_probe_reports_buckets_when_it_is_opted_in");
     let home = tempfile::tempdir().unwrap();
 
-    let output = run_pie(home.path(), &["usage", "codex"]);
+    let output = run_pie_with_env(
+        home.path(),
+        &["usage", "codex"],
+        &[("PIE_CODEX_QUOTA_PROBE", "http")],
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     assert!(
@@ -262,7 +293,7 @@ fn codex_usage_probe_reports_buckets() {
     );
     assert!(
         !stdout.contains("no buckets reported"),
-        "the probe returned no buckets at all:\n{stdout}"
+        "the opted-in probe returned no buckets at all:\n{stdout}"
     );
     assert!(
         stdout.contains('%'),
@@ -303,4 +334,168 @@ fn a_live_turn_does_not_leak_key_material() {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// M6 — the TUI renders a real turn
+// ---------------------------------------------------------------------------
+
+/// The token the model is asked to echo, so the assertion is about the *answer*
+/// and not about the word "ok".
+///
+/// Same technique M3's persona gate uses: a payload-level test proves the bytes
+/// were sent, and only a live turn proves the answer came back. Keystrokes cannot
+/// be automated, but "the TUI renders a real vendor turn" is the substance of
+/// M6's Done condition and *is* checkable (`ACCEPTANCE.md` §9, DESIGN §12).
+const TUI_MARKER: &str = "PIE-TUI-7Q";
+
+/// A prompt that cannot be satisfied by a model replying conversationally.
+fn marker_prompt() -> String {
+    format!("Reply with exactly this token and nothing else: {TUI_MARKER}")
+}
+
+/// Draw the app and return the screen as one whitespace-free string.
+///
+/// Whitespace-bearing comparison would be wrong here: a wrapped row break and a
+/// real space are indistinguishable once the buffer is read back, and the marker
+/// could land across a wrap on a narrow terminal. Stripping whitespace from both
+/// sides makes the assertion independent of the layout.
+fn rendered_flat(app: &pie::tui::App) -> String {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let backend = TestBackend::new(140, 40);
+    let mut terminal = Terminal::new(backend).expect("in-memory terminal");
+    terminal
+        .draw(|frame| pie::tui::render(frame, app))
+        .expect("draw");
+
+    let buffer = terminal.backend().buffer();
+    let area = buffer.area;
+    let mut out = String::new();
+    for y in 0..area.height {
+        for x in 0..area.width {
+            out.push_str(buffer[(x, y)].symbol());
+        }
+    }
+    out.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+/// Fold a `pie -p --json` run's stdout into an `App`, the way the TUI's channel
+/// would, and return it.
+///
+/// `--json` emits one `StreamEvent` per line on stdout, which is exactly the
+/// normalised shape `apply_event` consumes — so a real turn can be driven through
+/// the reducer without a terminal, without a channel, and without a second
+/// code path that could disagree with the one the TUI actually uses.
+fn app_from_json_session(model: &str, stdout: &str) -> pie::tui::App {
+    let mut app = pie::tui::App::new(
+        model.split('/').next().unwrap_or("agy"),
+        Some(model.split('/').nth(1).unwrap_or("").to_string()),
+        "live-g5",
+    );
+
+    let mut events = 0usize;
+    for line in stdout.lines().filter(|l| !l.trim().is_empty()) {
+        match serde_json::from_str::<pie::provider::StreamEvent>(line) {
+            Ok(event) => {
+                events += 1;
+                pie::tui::apply_event(&mut app, &event);
+            }
+            // A non-JSON line on stdout would be a protocol fault, not a fixture
+            // problem, so it is reported rather than skipped.
+            Err(error) => panic!("stdout line is not a StreamEvent: {error}\nline: {line}"),
+        }
+    }
+    assert!(
+        events > 0,
+        "a live turn must emit at least one event on stdout"
+    );
+    app
+}
+
+/// Assert a live turn reached the reducer, produced an answer, and that the
+/// answer is visible in the rendered buffer.
+fn assert_live_turn_renders(model: &str) {
+    ready(model);
+    let home = tempfile::tempdir().unwrap();
+    let prompt = marker_prompt();
+
+    let output = run_pie(
+        home.path(),
+        &[
+            "--json",
+            "-p",
+            &prompt,
+            "--model",
+            model,
+            "--timeout",
+            TURN_TIMEOUT_SECS,
+        ],
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        output.status.success(),
+        "live turn on `{model}` failed: {stderr}\nstdout: {stdout}"
+    );
+
+    // The turn is recorded once, with the frozen schema — the same parity claim
+    // the TUI's own recording path makes (`ACCEPTANCE.md` §8, stage A).
+    assert_turn_recorded(home.path(), model.split('/').next().unwrap_or(""), &output);
+
+    let app = app_from_json_session(model, &stdout);
+
+    let assistant: String = app
+        .transcript
+        .iter()
+        .filter_map(|entry| match entry {
+            pie::tui::Entry::Assistant(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        !assistant.trim().is_empty(),
+        "the reducer must hold the answer text; transcript: {:?}",
+        app.transcript
+    );
+    assert!(
+        assistant.contains(TUI_MARKER),
+        "the model was asked to echo `{TUI_MARKER}`; reducer holds: {assistant:?}"
+    );
+
+    // The substance of M6's Done condition: the answer is *on the screen*, not
+    // merely in the state. A reducer-only assertion would pass for a `render`
+    // that dropped the transcript entirely.
+    let screen = rendered_flat(&app);
+    assert!(
+        screen.contains(TUI_MARKER),
+        "the rendered buffer must contain the answer; screen: {screen:?}"
+    );
+
+    // And it is a screen, not a debugging dump: no raw protocol or escape bytes.
+    assert!(
+        !screen.contains('\u{1b}'),
+        "escape sequences must not be in the buffer"
+    );
+    assert!(
+        !screen.contains("\"event\""),
+        "raw JSON must not reach the screen: {screen:?}"
+    );
+}
+
+#[test]
+#[ignore = "spends real subscription quota; requires PIE_LIVE=1 and a logged-in agy"]
+fn a_real_agy_turn_renders_through_the_tui_reducer() {
+    // M6's Done condition is parity across BOTH live backends, so both are
+    // asserted rather than one standing in for the other.
+    assert_live_turn_renders("agy/gemini-3.8-flash");
+}
+
+#[test]
+#[ignore = "spends real subscription quota; requires PIE_LIVE=1 and a logged-in codex"]
+fn a_real_codex_turn_renders_through_the_tui_reducer() {
+    assert_live_turn_renders("codex/gpt-6-luna");
 }

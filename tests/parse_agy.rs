@@ -3,8 +3,10 @@
 //! Every fixture in `tests/fixtures/` is a recorded sample — see
 //! `tests/fixtures/README.md` for the provenance of each one. No test here
 //! spawns the real CLI: `AgyRouter` needs no process (which is the whole point
-//! of `EventRouter` being a trait), and the three tests that do spawn use a
-//! stand-in script, so the suite spends no subscription quota.
+//! of `EventRouter` being a trait), and every test that does spawn one drives a
+//! stand-in script instead — `stand_in_agy` prints a fixture and ignores its
+//! argv, and the hanging variant makes the timeout test's child overstay its
+//! deadline — so the suite spends no subscription quota.
 //!
 //! Covered, per `planning/ACCEPTANCE.md` §4: every event shape, the usage field
 //! mapping, an `ERROR` status, garbage + unknown events around a valid `result`
@@ -18,7 +20,7 @@ use pie::config::Config;
 use pie::error::PieError;
 use pie::provider::agy::{parse_models, parse_usage, AgyRouter, UNTERMINATED_STATUS};
 use pie::provider::driver::EventRouter;
-use pie::provider::{Bucket, Model, Provider, StreamEvent, ToolState};
+use pie::provider::{Bucket, Model, Provider, StreamEvent, ToolState, Usage};
 
 /// The single agy backend, as `pie` would resolve it.
 fn agy() -> Box<dyn Provider> {
@@ -626,29 +628,62 @@ fn a_usage_envelope_without_command_data_is_a_missing_bucket_note() {
     );
 }
 
-// ------------------------------------------- the three tests that spawn ----
+// --------------- the stateful tests: a scratch home, stand-in children ----
 
-/// Serialises tests that mutate `PIE_HOME` (process-global, parallel threads).
+/// Serialises tests that mutate the home environment (`PIE_HOME`, `HOME`,
+/// `USERPROFILE` — process-global, parallel threads).
 static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// Points `PIE_HOME` at a scratch directory, restoring it on drop.
+/// Points pie's state directory *and* the user's home at a scratch directory,
+/// restoring every variable it moved on drop.
+///
+/// `HOME` and `USERPROFILE` move with `PIE_HOME` on purpose. pie's own state
+/// follows `PIE_HOME`, but the vendor state `auth::*` inspects follows
+/// `paths::home_dir()`, which reads `HOME` (then `USERPROFILE`) and knows
+/// nothing about `PIE_HOME`. A CI runner has no `~/.gemini`, so a test that
+/// inherits the real home reads a *logged-in developer's* machine and fails the
+/// moment it runs anywhere else.
 struct PinHome {
-    previous: Option<String>,
+    /// Each variable this guard moved, with the value it had before, in the
+    /// order it was set.
+    previous: Vec<(&'static str, Option<String>)>,
 }
 
 impl PinHome {
+    /// A vendor home and pie's state home, which is all the two readers of these
+    /// variables look at (`paths::pie_home`, `paths::home_dir`).
+    const VARS: [&'static str; 3] = ["PIE_HOME", "HOME", "USERPROFILE"];
+
     fn set(path: &Path) -> Self {
-        let previous = std::env::var("PIE_HOME").ok();
-        std::env::set_var("PIE_HOME", path);
+        let previous = Self::VARS
+            .iter()
+            .map(|name| (*name, std::env::var(name).ok()))
+            .collect();
+
+        for name in Self::VARS {
+            std::env::set_var(name, path);
+        }
+
+        // agy's login is a presence heuristic over its own state directory with
+        // no token file to fake (`auth::agy_credential`, `knowledge/agy.md`), so
+        // the scratch home has to *be* a logged-in home, not merely point at
+        // one. `require_subscription()` then classifies `Subscription` and the
+        // turn tests exercise the wiring they name instead of the gate.
+        let agy_config = path.join(".gemini").join("config");
+        std::fs::create_dir_all(&agy_config).expect("create the scratch agy state dir");
+        std::fs::write(agy_config.join("config.json"), "{}").expect("write the scratch agy config");
+
         Self { previous }
     }
 }
 
 impl Drop for PinHome {
     fn drop(&mut self) {
-        match self.previous.take() {
-            Some(value) => std::env::set_var("PIE_HOME", value),
-            None => std::env::remove_var("PIE_HOME"),
+        for (name, value) in self.previous.drain(..) {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
         }
     }
 }
@@ -834,7 +869,9 @@ async fn an_effort_the_model_does_not_offer_never_reaches_the_child() {
 
 #[tokio::test]
 async fn stream_normalises_a_recorded_turn_end_to_end() {
+    let _guard = ENV_LOCK.lock().await;
     let scratch = tempfile::tempdir().expect("tempdir");
+    let _home = PinHome::set(scratch.path());
 
     let mut cfg = Config::default();
     cfg.agy.bin = stand_in_agy(scratch.path(), "agy_turn.jsonl")
@@ -854,16 +891,128 @@ async fn stream_normalises_a_recorded_turn_end_to_end() {
             .expect("the recorded turn streams")
     };
 
-    assert_eq!(kinds(&events), vec!["init", "tool", "tool", "text", "done"]);
+    // `usage` trails `done`: the terminal event is what makes the answer final
+    // and is emitted while parsing, while the finished token accounting only
+    // exists once the driver has built the outcome (see
+    // `a_finished_agy_turn_streams_usage_after_done`).
+    assert_eq!(
+        kinds(&events),
+        vec!["init", "tool", "tool", "text", "done", "usage"]
+    );
     assert_eq!(outcome.text, "OK\n");
     assert_eq!(outcome.status, "SUCCESS");
     assert_eq!(outcome.usage.input_tokens, 20704);
     assert_eq!(outcome.usage.thinking_tokens, 19);
 }
 
+/// `planning/ACCEPTANCE.md` §5 freezes `turn.completed ⇒ Usage + Done`: a turn
+/// that finished must put its token accounting **on the stream**, not only in
+/// the outcome the provider returns.
+///
+/// The stream is what `pie -p --json` writes, one object per line (`DESIGN.md`
+/// §13), so a `--json` consumer that never sees `Usage` cannot learn what a turn
+/// cost. This is the assertion that catches the defect (B28): no backend
+/// constructed `StreamEvent::Usage` at all, and every earlier test asserted the
+/// router's *outcome* structure, so nothing in the suite could contradict the
+/// criterion.
+///
+/// `Usage` follows `Done` on purpose, and the ordering is asserted rather than
+/// left to chance. `Done` is emitted by the router *during* parsing, because it
+/// is what makes the answer final; the complete usage figure only exists once
+/// the process has exited and `outcome()` has merged every partial report, so
+/// only the shared driver has it whole. Deferring `Done` so that `usage` could
+/// come first was considered and rejected: it buys a cosmetic ordering at the
+/// price of letting an error path swallow an already-produced `Done`.
+#[tokio::test]
+async fn a_finished_agy_turn_streams_usage_after_done() {
+    let _guard = ENV_LOCK.lock().await;
+    let scratch = tempfile::tempdir().expect("tempdir");
+    // `PinHome` now moves the vendor home too, so the subscription gate reads
+    // this scratch home rather than the developer's (see `PinHome`). The
+    // stand-in is what keeps the turn free: `cfg.agy.bin` points at a script
+    // that prints `agy_turn.jsonl` and ignores its argv, so the vendor CLI is
+    // never spawned and no quota is spent.
+    let _home = PinHome::set(scratch.path());
+
+    let mut cfg = Config::default();
+    cfg.agy.bin = stand_in_agy(scratch.path(), "agy_turn.jsonl")
+        .display()
+        .to_string();
+
+    let mut request = pie::provider::ChatRequest::new("hi");
+    request.model = Some("gemini-3.8-flash".to_string());
+    request.cwd = scratch.path().to_path_buf();
+
+    let mut events: Vec<StreamEvent> = Vec::new();
+    let outcome = {
+        let mut sink = |event: StreamEvent| events.push(event);
+        agy()
+            .stream(&cfg, &request, &mut sink)
+            .await
+            .expect("the recorded turn streams")
+    };
+
+    assert_eq!(outcome.status, "SUCCESS");
+    assert_ne!(
+        outcome.usage,
+        Usage::default(),
+        "the fixture reports tokens, so this turn must not have a zero usage"
+    );
+
+    let usage_events: Vec<&Usage> = events
+        .iter()
+        .filter_map(|event| match event {
+            StreamEvent::Usage(usage) => Some(usage),
+            _ => None,
+        })
+        .collect();
+
+    // The assertion that would have caught the defect, and the one that names
+    // the criterion it defends.
+    assert!(
+        !usage_events.is_empty(),
+        "planning/ACCEPTANCE.md §5 (a finished turn ⇒ Usage + Done): the stream carried \
+         no usage event, so `--json` cannot report what the turn cost — saw {:?}",
+        kinds(&events)
+    );
+    assert_eq!(
+        usage_events.len(),
+        1,
+        "accounting is emitted once per turn; a duplicate is its own defect — saw {:?}",
+        kinds(&events)
+    );
+
+    // Both events, and `done` still terminal for the answer.
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::Done { .. })),
+        "`done` must still be streamed: {:?}",
+        kinds(&events)
+    );
+    assert_eq!(
+        kinds(&events),
+        vec!["init", "tool", "tool", "text", "done", "usage"],
+        "the stream reads `…, done, usage`"
+    );
+
+    assert_eq!(
+        usage_events[0], &outcome.usage,
+        "the event must carry the turn's real figures, not a zero-filled placeholder"
+    );
+}
+
 #[tokio::test]
 async fn usage_parses_a_recorded_slash_expansion() {
+    let _guard = ENV_LOCK.lock().await;
     let scratch = tempfile::tempdir().expect("tempdir");
+    // `Agy::usage` reads *and writes* pie's usage cache, so a free-floating home
+    // would make this test both order-dependent and destructive: it would serve
+    // whatever the developer's `~/.pie/cache/agy-usage.json` happened to hold (a
+    // different bucket count fails the assertion below) and then overwrite that
+    // real cache with its own fixture-derived report on every run. Pinning the
+    // home keeps the read deterministic and the write inside the scratch dir.
+    let _home = PinHome::set(scratch.path());
 
     let mut cfg = Config::default();
     cfg.agy.bin = stand_in_agy(scratch.path(), "agy_usage.json")
@@ -919,7 +1068,9 @@ fn stand_in_agy_that_hangs(dir: &Path) -> PathBuf {
 /// stand-in child, so it costs no quota.
 #[tokio::test]
 async fn a_turn_that_exceeds_its_deadline_is_a_timeout_with_exit_code_five() {
+    let _guard = ENV_LOCK.lock().await;
     let scratch = tempfile::tempdir().expect("tempdir");
+    let _home = PinHome::set(scratch.path());
 
     let mut cfg = Config::default();
     cfg.agy.bin = stand_in_agy_that_hangs(scratch.path())
@@ -947,7 +1098,9 @@ async fn a_turn_that_exceeds_its_deadline_is_a_timeout_with_exit_code_five() {
 
 #[tokio::test]
 async fn a_missing_binary_is_reported_before_anything_is_spawned() {
+    let _guard = ENV_LOCK.lock().await;
     let scratch = tempfile::tempdir().expect("tempdir");
+    let _home = PinHome::set(scratch.path());
 
     let mut cfg = Config::default();
     cfg.agy.bin = scratch

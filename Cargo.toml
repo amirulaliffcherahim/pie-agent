@@ -53,13 +53,20 @@ reqwest = { version = "0.12", optional = true, default-features = false, feature
     "stream",
 ] }
 ratatui = "0.29.0"
-# `event-stream` is NOT a default crossterm feature, and it is required: the
-# interactive loop selects over the terminal's event stream and the turn channel
-# together (`src/tui/mod.rs`), which is what keeps the UI responsive while a turn
-# runs. The alternative — polling `event::poll` on a timer — works without the
-# feature but wakes the process ~33 times a second to discover nothing happened.
-# It pulls in `futures-core` only.
-crossterm = { version = "0.29.0", features = ["event-stream"] }
+# `crossterm`'s `event-stream` feature is deliberately NOT enabled.
+#
+# The interactive loop reads keys with `event::read()` on a detached thread and
+# feeds an mpsc channel (`src/tui.rs`), which needs no extra dependency at all.
+# `EventStream` does implement `futures_core::Stream`, but `futures-core` is only a
+# *transitive* dep here: calling `.next()` on it needs `futures-util` (or
+# `tokio-stream`), which is a heavyweight crate to add for a single `.next()`.
+#
+# This feature WAS enabled first, on the assumption that it was what a
+# `select!`-based loop needed. The assumption was never checked against the code
+# that would consume it, and the result was a feature nothing used, documented as
+# required - worse than no feature, because the next reader treats it as load
+# bearing. Recorded as a bug rather than quietly dropped.
+crossterm = "0.29.0"
 
 [features]
 default = ["http"]

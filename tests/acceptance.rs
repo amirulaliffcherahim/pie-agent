@@ -178,3 +178,61 @@ fn auth_and_usage_write_no_session_row() {
         "neither command may log a turn, but the log holds:\n{contents}"
     );
 }
+
+/// `pie usage codex` must **not** reach the private `wham/usage` endpoint unless the
+/// user opts in.
+///
+/// User decision, 2026-10-12: the endpoint class is marked by its own vendor's
+/// ecosystem as "Account may be restricted or banned", and an account risk nobody
+/// opted into is not a reasonable thing for a default to spend. The capability is
+/// kept — one config line or environment variable away — but the *default* is `off`.
+///
+/// Asserted here, offline and for free, rather than only in the live gate: a property
+/// that needs no network and no model tokens should not be checked only by a gate that
+/// costs real subscription quota. The live half — that opting in still returns real
+/// buckets — stays in `tests/live_smoke.rs`, because only a live run can show that.
+///
+/// Deliberately does **not** need a codex credential: the disabled path returns before
+/// the credential is read, which is the point of checking it before anything else.
+#[test]
+fn the_default_codex_usage_probe_is_disabled_and_says_so() {
+    let home = tempfile::tempdir().unwrap();
+    let stdout = run(home.path(), &["usage", "codex"]);
+
+    assert!(
+        stdout.contains("disabled by config"),
+        "the default probe must be off and must say so, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("no buckets reported"),
+        "with the probe off there are no buckets, and the table must not pretend otherwise:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("quota_probe"),
+        "the note must name the setting that turns it back on, or the user cannot find it:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains('%'),
+        "no remaining-fraction may be rendered when no bucket was fetched:\n{stdout}"
+    );
+
+    // The session-log totals half of the same command is unaffected by the switch: the
+    // criterion in ACCEPTANCE section 5 requires totals either way, so a probe that is
+    // off must not cost the user the half of `pie usage codex` that is always free.
+    assert!(
+        stdout.contains("all time"),
+        "session-log totals must still render with the probe off:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("last 7 days") && stdout.contains("last 30 days"),
+        "all three windows must still render:\n{stdout}"
+    );
+
+    // …and it is a probe, so it must not have recorded a turn.
+    let log = home.path().join("usage.jsonl");
+    let contents = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        contents.trim().is_empty(),
+        "a probe may not log a turn, but the log holds:\n{contents}"
+    );
+}
