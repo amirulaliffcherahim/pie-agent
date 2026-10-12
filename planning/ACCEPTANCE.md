@@ -277,7 +277,56 @@ initialisation. A cached reading is labelled with its age.
 - [ ] neither command writes a session-log row, and neither spends model quota (I7)
 - [ ] `tests/acceptance.rs` asserts the rendered output, not only the exit status
 
-## 7. Bug protocol
+## 7. M3 — profile projection and routing
+
+Contract: `DESIGN.md` §10. Listed after M4 because M4 was closed out of sequence;
+**M3 is the active milestone**. From `ROADMAP.md` M3: *"`~/.pie/profile.toml` +
+`AGENTS.md` + `memory/*.md`; projection per backend"*, with the Done condition
+*"same persona on agy and codex; no per-CLI config"*.
+
+**Acceptance**
+
+```
+cargo test --test profile
+cargo run -- profile
+```
+
+**Checks**
+
+- [ ] **The Done condition at payload level**: the persona agy receives and the
+      persona codex receives are the *identical text*. Asserted without spending
+      quota, because a test needing two live turns would be run rarely
+- [ ] the projection is byte-identical when built from a different working directory
+      and at a different time — no timestamp, session id, cwd, model id or quota
+      figure anywhere in it
+- [ ] `memory/*.md` concatenate in filename order, independent of filesystem
+      enumeration order
+- [ ] a missing `profile.toml`/`AGENTS.md`/`memory/` is an empty projection, not an
+      error: a fresh install works with no configuration
+- [ ] claude is given the persona via `--append-system-prompt`, not folded into the
+      prompt, and that path is labelled unverified (no subscription on this machine)
+- [ ] a projection that pushes agy's argv past the 20 000-char cap is
+      `PromptTooLong` naming the projection, **never** a truncated persona
+- [ ] no backend receives a persona the user did not configure
+- [ ] nothing reads or writes vendor config: a static check over `src/` for
+      `~/.codex/config.toml`, `~/.claude/settings.json` and `.gemini/config`
+- [ ] `pie profile` spends no quota and writes no session row
+- [ ] routing: `general.default_backend` selects codex by default; an unrecognised
+      value is a config error; an explicit `--model` always wins
+
+**Live (G5)**
+
+```
+# profile.toml sets a distinctive marker the model must echo
+cargo run -- -p --model agy/gemini-3.8-flash "<marker probe>"
+cargo run -- -p --model codex/gpt-6-luna "<marker probe>"
+```
+
+The marker must appear in **both** replies. This is the real proof of `ROADMAP`'s
+Done condition: payload equality proves the same bytes were sent, a live turn proves
+the persona was actually honoured. Two turns, both on approved models.
+
+## 8. Bug protocol
 
 A "bug" is any behavior that contradicts `ROADMAP.md`, `DESIGN.md`, or a
 knowledge file. Process, in order:
@@ -309,7 +358,7 @@ Bug categories to actively hunt before marking a milestone done:
 - **Env leak** — API key reaching a child, flipping it to pay-as-you-go (RISKS §10)
 - **Panic** — `unwrap`/`expect`/index-out-of-bounds on external input
 
-## 8. Independent verification
+## 9. Independent verification
 
 Each milestone, after G1–G3 are green and before it is called done, dispatch an
 independent reviewer subagent with **no shared context** and give it: the design
@@ -319,7 +368,7 @@ is either fixed (with a test) or logged as accepted with a written reason.
 
 The reviewer must not be the same agent that wrote the code.
 
-## 9. Run log
+## 10. Run log
 
 Appended as gates pass. Evidence = command + observed result, not a claim.
 
@@ -334,12 +383,13 @@ here. A row is a record of what was verified, not a substitute for verifying.
 | M0 | ✅ | ✅ | ✅ | ✅ | n/a | ✅ | **done** | Snapshot at the M0 commit (`1ee7c18`). 113 tests passed then (100 lib + 6 `no_secrets` + 7 `process`), 5 live-smoke tests correctly ignored; `--list-backends` printed agy/codex/claude with agy `1.3.3`, codex `codex-cli 0.162.0`, claude `2.1.296` + `no-subscription`; `cargo check --target x86_64-unknown-linux-gnu --all-targets --no-default-features` clean. **Not the current total** — see the M1/M2 rows for HEAD, and re-run `scripts/qc.ps1` rather than trusting any number here |
 | M1 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | **done** | G4 `cargo test --test parse_agy` → 31 passed. G5 live: a real `agy/gemini-3.8-flash` turn printed `ok` (exit 0) and logged `{input_tokens:20661, cached_input_tokens:0, output_tokens:23, reasoning_tokens:22, ok:true, stop_reason:"SUCCESS"}`; no key material in stdout or stderr; a second live turn passed `agy_turn_succeeds_and_is_recorded` and the free probe passed `agy_usage_probe_reports_buckets`. `pie usage agy` rendered all 4 real buckets across 2 groups with group **and** window visible, and logged no session row. G6 clean |
 | M2 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | **done** | G4 `cargo test --test parse_codex` → 34 passed. G5 live: a real `codex/gpt-6-luna` turn printed `ok` (exit 0) and logged `{input_tokens:13424, cached_input_tokens:1792, output_tokens:5, reasoning_tokens:0, ok:true, stop_reason:"completed"}` — the full frozen schema, and the first live evidence that the vendor prefix cache actually operates (13.3% on a trivial turn). `pie usage codex` printed `30d 88.0% 2026-11-08T01:52:52Z` and logged **no** session row, proving a probe is not a turn. G6 clean |
+| M3 | — | — | — | — | — | — | **not started** | Contract frozen in `DESIGN.md` §10 and section 7 below; implementation not yet begun. Note the deliberate deferral of the "backend switch mid-session" clause to M5, which owns the transcript it needs |
 | M4 | ✅ | ✅ | ✅ | ✅ | n/a | ✅ | **done** | Closed out of sequence: its work was built during M0–M2 and had no verdict until now. G4 `cargo run -- auth` and `cargo run -- usage` both exit 0 **with no `--model`**, which is the roadmap's Done condition. `tests/acceptance.rs` asserts the rendered rows, all three usage windows and the totals block, plus that neither command writes a session row. Two deviations recorded in section 6. G5 is `n/a`: neither command spends model tokens |
 
 Verdict values: `done` (all applicable gates) · `offline-verified` (G5 skipped by
 user decision) · `blocked` (a gate fails) · `not started`.
 
-## 10. Bug log
+## 11. Bug log
 
 Every bug found, the gate that caught it, and the regression test that now
 prevents it. This is the record the milestone verdicts above rest on.
@@ -379,7 +429,7 @@ prevents it. This is the record the milestone verdicts above rest on.
 | F2 | codex resolves to `node.exe` + `codex.js` on this machine (no native `codex.exe`, and the `codex.cmd` shim cannot be spawned directly). The BINARY column therefore shows node | Documented in `codex.rs` and `PLATFORMS.md`; the launch path is the verified one |
 | F3 | WSL2 is installed but cannot boot (`HCS_E_SERVICE_NOT_AVAILABLE`) | Linux is verified by G6 locally and by the CI matrix; see `PLATFORMS.md` |
 
-## 11. Open suggestions from the QC sweep
+## 12. Open suggestions from the QC sweep
 
 Accepted as real, deliberately not done yet. Recorded here so they are decisions
 rather than oversights. None affects a milestone verdict.

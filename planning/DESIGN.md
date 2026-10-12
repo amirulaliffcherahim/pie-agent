@@ -388,7 +388,76 @@ the `~/.claude/.credentials.json` + `~/.claude.json` facts from
 `knowledge/claude.md`. `list_models()` returns a static catalog. `stream()`
 returns `PieError::Unsupported`-style config error. `enabled = false` by default.
 
-## 10. CLI surface for M0–M2
+## 10. Profile projection and routing (M3)
+
+`PLAN.md` §8: one config, one memory, one persona across all three CLIs. The
+vendor's own configuration (`~/.codex/config.toml`, `~/.claude/settings.json`, agy's
+agents) is **ignored** — pie never reads it and never writes it.
+
+### Sources, under `$PIE_HOME`
+
+| Path | Role |
+|---|---|
+| `profile.toml` | structured persona: name, tone, rules, output conventions |
+| `AGENTS.md` | freeform rules, appended after the structured part |
+| `memory/*.md` | durable notes, concatenated in **filename order** for determinism |
+
+All three are optional. A missing file is an empty projection, never an error — a
+fresh install must work with no configuration at all.
+
+### Ordering: static first, volatile last
+
+The projection is assembled in a fixed order, and this is a correctness rule rather
+than tidiness (`TOKEN-ECONOMICS.md` §4):
+
+1. the structured persona from `profile.toml`
+2. `AGENTS.md`
+3. `memory/*.md`, sorted by filename
+4. *(the caller's job, after this)* the user's task text
+
+**No volatile value may appear anywhere in the projection**: no timestamp, no session
+id, no cwd, no model id, no quota figure. A volatile head invalidates whatever stable
+prefix the vendor caches, on every single invocation — and the vendor prefix cache is
+real and measured (`knowledge/agy.md`), so this is the one prompt-side cost pie
+actually controls. A test asserts the projection is byte-identical when built from
+different working directories and at different times.
+
+### Projection per backend
+
+`Capabilities` gains `system_prompt: bool` to say which mechanism a backend supports:
+
+| Backend | Mechanism | Why this one |
+|---|---|---|
+| agy | folded **before** the prompt text in `--print <prompt>` | agy has no system role (`PLAN.md` §8) |
+| codex | folded **before** the prompt text | `exec` has no verified system-prompt or instructions flag, and writing `AGENTS.md` into the user's own workspace is rejected as invasive |
+| claude | `--append-system-prompt <text>` | documented in `knowledge/claude.md`; unverified live because this machine has no subscription, so it is implemented to spec and labelled |
+
+The roadmap's M3 Done condition is *"same persona on agy and codex"*. Folding the
+identical block into both prompts satisfies that literally, and it is verifiable at
+the payload level **without spending quota** — which matters, because a persona test
+that required two live turns would be run rarely.
+
+The folded prefix spends argv budget on agy, whose prompt is capped at 20 000
+characters (§9). A projection that pushes the argv past the cap must be a
+`PromptTooLong` naming the projection as the cause, never a silently truncated
+prompt — truncating a persona is a correctness failure, not a degradation.
+
+### Routing
+
+`general.default_backend`, plus a `route` command, choose a backend without changing
+the persona. The first rule is measured rather than guessed: **codex answers a turn in
+~3.6 s and agy in ~40 s**, so codex is the default unless agy is named explicitly or
+the task class asks for it. Routing must never silently spend a premium sub's quota to
+answer a trivial question.
+
+### Deferred to M5, deliberately
+
+Roadmap M3 also lists *"backend switch mid-session re-bootstraps from pie's
+transcript"*. That clause needs a stored transcript, which is M5's session work, so it
+is deferred rather than faked — recorded here because the two milestones depend on
+each other in the opposite order to the one they are listed in.
+
+## 11. CLI surface for M0–M3
 
 ```
 pie --list-backends                 # M0 gate
@@ -405,7 +474,7 @@ parser is tested by the CLI itself, not only by unit tests. Human mode prints
 deltas as they arrive. Zero-token guarantee: `models`/`auth`/`doctor`/`--list-backends`
 must never spend model quota (catalogs come from disk/help, not a model turn).
 
-## 11. Test strategy
+## 12. Test strategy
 
 | Layer | What | Runs |
 |---|---|---|
@@ -418,7 +487,7 @@ Rules: no test spawns a real CLI unless `PIE_LIVE=1`. Fixtures live in
 `knowledge/agy.md` / `knowledge/codex.md` — not invented. Every milestone gate
 runs `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`.
 
-## 12. Explicitly deferred
+## 13. Explicitly deferred
 
 M3 profile/memory projection · M4 unified auth/usage tables · M5 agent loop +
 sessions + OCR MCP · M6 ratatui TUI · M7 learn · M8 watchtower · M9 claude +
