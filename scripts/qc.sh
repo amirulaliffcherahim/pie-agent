@@ -267,6 +267,11 @@ run_gate 'G4 acceptance (M8 command)' cargo test --test watch_cmd
 run_gate 'G4 acceptance (M9 claude stream)' cargo test --test parse_claude
 run_gate 'G4 acceptance (M9 tool loop)' cargo test --test tool_loop
 
+# M10's two layers. Its G5 is `n/a - needs the user's key`: a live turn spends real credit
+# in a currency nobody opted into, so it is stated rather than skipped.
+run_gate 'G4 acceptance (M10 sse)' cargo test --test sse
+run_gate 'G4 acceptance (M10 http transport)' cargo test --test http_transport
+
 # --- G4 (M6 tui non-TTY) ----------------------------------------------------
 # ACCEPTANCE section 9: `pie tui` on a non-TTY stdin must fail with a clear message
 # rather than emitting escape codes into a pipe.

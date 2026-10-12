@@ -105,6 +105,21 @@ pub struct LoopOutcome {
     pub capped: bool,
     /// The answer text accumulated across the turns.
     pub text: String,
+    /// Token accounting merged across the turns.
+    ///
+    /// Accumulated here rather than by the caller because the loop is where the `Usage`
+    /// events pass through, and M10 needs the figure to reach the session log with its
+    /// `cost_usd_micros` intact — a caller that had to re-derive it would be a second place
+    /// for the merge rule to live.
+    pub usage: crate::provider::Usage,
+    /// Wall clock for the whole loop.
+    ///
+    /// Measured here rather than passed in, unlike `driver::drive`'s `started`: that one
+    /// receives an instant because its caller already had one, while this is the only place
+    /// that knows when the loop began. It is a measurement, not a decision — the
+    /// clock-as-a-parameter rule is about decisions (`due`, decay, the report's month),
+    /// which must be testable at an arbitrary instant.
+    pub duration: std::time::Duration,
 }
 
 /// Refuse the loop on a backend that cannot accept an injected result.
@@ -154,16 +169,26 @@ pub fn run_loop(
     max_iterations: usize,
     sink: &mut dyn FnMut(StreamEvent),
 ) -> Result<LoopOutcome> {
+    let started = std::time::Instant::now();
     let mut outcome = LoopOutcome {
         iterations: 0,
         capped: false,
         text: String::new(),
+        usage: crate::provider::Usage::default(),
+        duration: std::time::Duration::ZERO,
     };
 
     while let Some(event) = transport.recv()? {
         let call = match &event {
             StreamEvent::TextDelta(chunk) => {
                 outcome.text.push_str(chunk);
+                None
+            }
+            // Merged with `Usage::merge`'s rule (a zero field means "not reported"), so a
+            // later partial report cannot blank a figure an earlier one already gave — and
+            // so `cost_usd_micros` survives a frame that omits it.
+            StreamEvent::Usage(usage) => {
+                outcome.usage.merge(usage.clone());
                 None
             }
             StreamEvent::ToolUse { id, name, input } => Some(ToolCall {
@@ -219,6 +244,7 @@ pub fn run_loop(
         outcome.iterations += 1;
     }
 
+    outcome.duration = started.elapsed();
     Ok(outcome)
 }
 

@@ -540,6 +540,7 @@ mod tests {
                 cache_read_tokens: 0,
                 cache_write_tokens: 0,
                 total_tokens: 20_724,
+                cost_usd_micros: 0,
             },
             status: status.to_string(),
             conversation_id: conversation_id.map(str::to_string),

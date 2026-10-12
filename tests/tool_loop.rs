@@ -292,13 +292,15 @@ fn a_stream_that_ends_without_asking_for_anything_is_a_finished_loop() {
     let outcome = run_loop(&mut transport, &EchoRunner, 4, &mut |_| {}).expect("the loop finishes");
 
     assert_eq!(
-        outcome,
-        LoopOutcome {
-            iterations: 0,
-            capped: false,
-            text: "a short answer".to_string()
-        }
+        outcome.iterations, 0,
+        "a stream that asks for nothing costs no iteration"
     );
+    assert!(!outcome.capped);
+    assert_eq!(outcome.text, "a short answer");
+    // `usage` and `duration` are asserted separately rather than through a struct literal:
+    // the duration is measured, so an equality assertion on the whole struct would have to
+    // pin a value that varies by microseconds.
+    assert_eq!(outcome.usage, pie::provider::Usage::default());
     assert!(transport.sent().is_empty());
 }
 

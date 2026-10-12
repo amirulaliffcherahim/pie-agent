@@ -93,7 +93,15 @@ async fn table(cfg: &Config, refresh: bool) -> Result<Vec<(String, String)>> {
 
         let binary = match p.binary(cfg) {
             Some(path) => short_path(&path.display().to_string(), BIN_WIDTH),
-            None => format!("(not found: {})", configured_bin(cfg, id)),
+            // A backend with no binary is **not a missing one** (M10). OpenRouter and
+            // DeepSeek are not subprocesses at all, and "(not found: openrouter)" told the
+            // reader the wrong story twice over: that a binary was expected, and that this
+            // machine failed to have it. The distinction the cell has to carry is
+            // "there is nothing to look for".
+            None if is_subprocess_backend(id) => {
+                format!("(not found: {})", configured_bin(cfg, id))
+            }
+            None => "(no binary: API endpoint)".to_string(),
         };
 
         // Redacted before it is printed or written into the version snapshot: a
@@ -261,6 +269,15 @@ fn write_version_snapshot(versions: &[(String, String)]) -> Result<PathBuf> {
 }
 
 /// The configured binary for a backend, for the "not found" message.
+/// Whether a backend is expected to have a binary on this machine.
+///
+/// `provider::BACKEND_IDS` is exactly the subprocess backends — it was defined that way at
+/// M0 and kept that meaning when M10 added two endpoint backends — so asking it is asking
+/// the question the table actually has, rather than testing for a hardcoded id here.
+fn is_subprocess_backend(id: &str) -> bool {
+    provider::BACKEND_IDS.contains(&id)
+}
+
 fn configured_bin(cfg: &Config, id: &str) -> String {
     match id {
         "agy" => cfg.agy.bin.clone(),

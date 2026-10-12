@@ -16,19 +16,41 @@ use crate::config::Config;
 use crate::error::{PieError, Result};
 
 pub mod agy;
+pub mod api;
 pub mod claude;
 pub mod codex;
 pub mod driver;
+// M10's API-key transports. Declared **unconditionally** even though `http.rs` needs
+// `reqwest`: it gates that dependency internally (`#[cfg(feature = "http")]`), so the
+// module tree is the same on every target and G6's `--no-default-features` check stays
+// green without a `cfg` here. Gating the *modules* would move the feature boundary into
+// this file, where a mis-edit shows up as a cross-target compile failure rather than as a
+// missing feature.
+pub mod http;
+pub mod sse;
 
-// The OpenRouter and DeepSeek API-key backends are deferred to M10. Their
-// design is kept as a document rather than as commented-out source, so nothing
-// uncompilable sits in the module tree: see `planning/DEFERRED-BACKENDS.md`.
-// Re-adding one means writing `provider/<name>.rs` and adding it to the
-// registry below.
+// The OpenRouter and DeepSeek API-key backends were deferred to M10 and now ship:
+// see `provider/api.rs` and `planning/DEFERRED-BACKENDS.md`. The design was kept as a
+// document rather than as commented-out source, and re-enabling it was an explicit,
+// reviewable act — which is what that document was for.
 
 /// Provider ids, in display and registry order.
+/// Provider ids of the **CLI** backends, in display and registry order.
+///
+/// Deliberately not the whole registry: these three are the subprocess backends with a
+/// vendor login and a binary to resolve, and code that means "the CLI backends" must keep
+/// meaning that now that [`registry`] also holds two API-key backends. For "everything
+/// selectable", ask [`backend_ids`].
 pub const BACKEND_IDS: [&str; 3] = ["agy", "codex", "claude"];
 
+/// Every selectable backend id, in registry order (M10).
+///
+/// Derived from [`registry`] rather than written out, so adding a backend cannot leave the
+/// error message that lists the known ones out of date — which is exactly the drift a
+/// hand-maintained second list would produce.
+pub fn backend_ids() -> Vec<&'static str> {
+    registry().iter().map(|p| p.id()).collect()
+}
 /// Backend pie uses when the caller names neither a model nor a backend.
 ///
 /// Measured, not guessed (`DESIGN.md` §10): codex answers a turn in ~3.6 s and
@@ -164,6 +186,19 @@ pub struct Usage {
     pub cache_write_tokens: u64,
     /// Backend-reported total, when it differs from the sum.
     pub total_tokens: u64,
+    /// Cost in millionths of a US dollar, when the backend reports one (M10).
+    ///
+    /// **Zero means "not reported", never "free"** — the same convention as every other
+    /// field here, and the reason it matters is `ACCEPTANCE.md` §18: the session log's
+    /// `cost_usd_micros` column was hardcoded to `0` for ten milestones because every
+    /// backend is subscription-locked, and a permanent `$0.00` implies cost is measured
+    /// when it is not (`TOKEN-ECONOMICS.md` §10c). The API-key backends are the first that
+    /// can answer it for real, so the field exists and the log reads it.
+    ///
+    /// Additive with `#[serde(default)]`, so every frozen row and fixture written without
+    /// it still deserialises.
+    #[serde(default)]
+    pub cost_usd_micros: u64,
 }
 
 impl Usage {
@@ -200,6 +235,7 @@ impl Usage {
             cache_read_tokens,
             cache_write_tokens,
             total_tokens,
+            cost_usd_micros,
         );
     }
 }
@@ -477,9 +513,13 @@ pub fn registry() -> Vec<Box<dyn Provider>> {
         Box::new(agy::Agy),
         Box::new(codex::Codex),
         Box::new(claude::Claude),
-        // M10, once `planning/DEFERRED-BACKENDS.md` is implemented:
-        // Box::new(openrouter::OpenRouter),
-        // Box::new(deepseek::DeepSeek),
+        // M10. Registered **unconditionally**, including in a build without the `http`
+        // feature: `http::live_client` has a `not(feature = "http")` arm returning a client
+        // that answers with a stated error naming the missing feature, so the backend is
+        // present and tells the truth rather than vanishing from `--list-backends` on a
+        // build where the user cannot tell why.
+        Box::new(api::ApiBackend(api::OPENROUTER)),
+        Box::new(api::ApiBackend(api::DEEPSEEK)),
     ]
 }
 
@@ -553,7 +593,7 @@ fn require_known(backend: &str) -> Result<()> {
     }
     Err(PieError::UnknownBackend {
         backend: backend.to_string(),
-        known: BACKEND_IDS.iter().map(|s| (*s).to_string()).collect(),
+        known: backend_ids().iter().map(|s| (*s).to_string()).collect(),
     })
 }
 
@@ -563,23 +603,55 @@ mod tests {
     use super::*;
 
     #[test]
-    fn registry_lists_exactly_the_three_cli_backends() {
+    fn registry_lists_the_cli_backends_then_the_api_key_backends() {
         let ids: Vec<&str> = registry().iter().map(|p| p.id()).collect();
-        assert_eq!(ids, vec!["agy", "codex", "claude"]);
-        // No HTTP backend may leak in while M10 is deferred.
-        assert!(!ids.contains(&"openrouter"));
-        assert!(!ids.contains(&"deepseek"));
+        // Order is part of it: the three subprocess backends come first because that is the
+        // order `--list-backends` has printed since M0, and M10 appends rather than inserts
+        // so a reader's existing expectations do not silently shift.
+        assert_eq!(
+            ids,
+            vec!["agy", "codex", "claude", "openrouter", "deepseek"]
+        );
+
+        // `BACKEND_IDS` still means the *CLI* backends, which is what code that resolves a
+        // binary or checks a vendor login needs. A test that only compared lengths would
+        // pass while those two things silently meant something new.
+        assert_eq!(BACKEND_IDS.to_vec(), ids[..3].to_vec());
+        assert_eq!(backend_ids(), ids);
     }
 
     #[test]
-    fn cli_backends_are_delegate_mode_not_tool_loop() {
+    fn the_cli_backends_are_delegate_mode_and_the_api_key_ones_are_not() {
+        // This assertion was written at M0 over the *whole* registry, when the registry was
+        // only CLI backends. M10 gave it two entries for which `tool_loop: true` is correct
+        // (`DEFERRED-BACKENDS.md`: this is the one place it is legitimate), so the loop is
+        // scoped to the subprocess backends and the contrast is asserted rather than lost.
         for p in registry() {
             let caps = p.capabilities();
-            assert!(
-                !caps.tool_loop,
-                "{} must be delegate-mode in M0-M2 (RISKS §1)",
-                p.id()
-            );
+            let is_cli = BACKEND_IDS.contains(&p.id());
+            if is_cli {
+                assert!(
+                    !caps.tool_loop,
+                    "`{}` is a subprocess CLI backend and must stay delegate-mode \
+                     (RISKS section 1)",
+                    p.id()
+                );
+                assert!(
+                    p.binary(&Config::default()).is_some() || p.id() == "claude",
+                    "a CLI backend resolves a binary, or reports one as missing"
+                );
+            } else {
+                assert!(
+                    caps.tool_loop,
+                    "`{}` carries OpenAI-compatible `tool_calls`, so the loop is available",
+                    p.id()
+                );
+                assert!(
+                    p.binary(&Config::default()).is_none(),
+                    "an API-key backend is not a subprocess and must report no binary, or \
+                     `--list-backends` reports one as missing"
+                );
+            }
         }
     }
 

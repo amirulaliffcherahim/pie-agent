@@ -753,6 +753,9 @@ pub fn usage_from_event(event: &Value) -> Usage {
         cache_write_tokens: jsonl::u(event, "usage.cache_write_input_tokens").unwrap_or(0),
         // codex reports no total; `Usage::computed_total` derives it.
         total_tokens: jsonl::u(event, "usage.total_tokens").unwrap_or(0),
+        // Subscription-locked: codex reports tokens, never a price. "Not reported" is a
+        // zero, which is why the row's cost column stays absent for it (M10).
+        cost_usd_micros: 0,
     }
 }
 

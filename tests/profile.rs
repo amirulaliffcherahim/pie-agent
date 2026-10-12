@@ -189,15 +189,40 @@ fn claude_receives_the_persona_through_append_system_prompt_and_agy_and_codex_do
         );
     }
 
+    // Capabilities route the projection, so they must be exact. M10 appended two backends
+    // that **do** have a real system role — the OpenAI-compatible shape has a `system`
+    // message, so the projection goes in whole and unmodified, exactly as claude's does.
+    // That is why this is a labelled list rather than a "is it claude" check: the property
+    // is "the persona arrives verbatim by a mechanism the backend actually has", and a
+    // length assertion would stop being evidence the moment a backend was added.
     let mechanisms: Vec<(&str, bool)> = pie::provider::registry()
         .iter()
         .map(|provider| (provider.id(), provider.capabilities().system_prompt))
         .collect();
     assert_eq!(
         mechanisms,
-        vec![("agy", false), ("codex", false), ("claude", true)],
+        vec![
+            ("agy", false),
+            ("codex", false),
+            ("claude", true),
+            ("openrouter", true),
+            ("deepseek", true),
+        ],
         "capabilities are what route the projection, so they must be exact"
     );
+
+    // The CLI backends specifically: `agy` and `codex` have no system role at all, which is
+    // why they fold, and that is the pair `DESIGN.md` §10 describes. Asserted separately so
+    // adding a backend never weakens the claim about *these* two.
+    for provider in pie::provider::registry() {
+        if matches!(provider.id(), "agy" | "codex") {
+            assert!(
+                !provider.capabilities().system_prompt,
+                "`{}` folds because it has no system role (DESIGN section 10)",
+                provider.id()
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -710,6 +710,9 @@ fn usage_from(value: Option<&Value>) -> Option<Usage> {
             .or_else(|| jsonl::u(value, "cache_write_tokens"))
             .unwrap_or(0),
         total_tokens: 0,
+        // claude is subscription-locked (and there is no subscription on this machine), so
+        // it reports no cost. "Not reported" is a zero, per `Usage`.
+        cost_usd_micros: 0,
     };
     // `Some` only when at least one recognised field is present, so a stray
     // `usage` key cannot wipe out usage already accumulated.

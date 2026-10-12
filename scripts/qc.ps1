@@ -289,6 +289,11 @@ Invoke-Gate -Label 'G4 acceptance (M8 command)' -Argv @('test', '--test', 'watch
 Invoke-Gate -Label 'G4 acceptance (M9 claude stream)' -Argv @('test', '--test', 'parse_claude')
 Invoke-Gate -Label 'G4 acceptance (M9 tool loop)' -Argv @('test', '--test', 'tool_loop')
 
+# M10's two layers. Its G5 is `n/a - needs the user's key`: a live turn spends real credit
+# in a currency nobody opted into, so it is stated rather than skipped.
+Invoke-Gate -Label 'G4 acceptance (M10 sse)' -Argv @('test', '--test', 'sse')
+Invoke-Gate -Label 'G4 acceptance (M10 http transport)' -Argv @('test', '--test', 'http_transport')
+
 # --- G4 (M6 tui non-TTY) ----------------------------------------------------
 # ACCEPTANCE section 9: `pie tui` on a non-TTY stdin must fail with a clear message
 # rather than emitting escape codes into a pipe.

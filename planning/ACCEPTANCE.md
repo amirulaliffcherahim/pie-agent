@@ -116,7 +116,12 @@ claude    Roaming\npm\claude.cmd             2.1.296 (Clau…[truncated]  no-sub
 Exact column widths vary; the assertions are:
 
 - `claude` must appear even though it is disabled — it is future-proofing.
-- No API/HTTP backend may appear (neither is in the registry).
+- No API/HTTP backend was in the registry **until M10 built two**. This bullet required
+  their absence, because a table row for a backend that cannot answer is a promise the
+  binary does not keep; M10 implemented both, so the requirement inverts and
+  `tests/acceptance.rs` now asserts that they **appear**, report `needs-login`, name their
+  key variable, and are not shown as a *missing binary*. The old assertion was replaced with
+  its inverse rather than deleted, so the pair records the reversal.
 - Every backend resolves to a path and reports an auth state, or reports
   `binary-missing` — never a panic, never a hang, never an empty table. This is
   what makes the CI run meaningful: a CI runner has **no** vendor CLI installed,
@@ -519,6 +524,7 @@ here. A row is a record of what was verified, not a substitute for verifying.
 | M7 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | **done** | Four stages, each with its own gate binary: **A** extract (`learn` 15), **B** consolidate (`consolidate` 14), **C** schedule + budget (`schedule` 7), **D** commands (`memory_cmd` 20). 574 tests, 7 live correctly ignored. **G5, run on real data and quota-free:** three real `agy/gemini-3.8-flash` turns produced four real transcripts; `pie learn --report` mined 3 turns into 4 candidates with correct kinds and counts — `uses cargo` hits 3, the repeated preference hits 2, and `never write unwrap...` classified as `Preference` and **not** `Habit` — each carrying session-id + turn provenance. `pie memory` printed them; `pie profile` showed the learned section **appended** to the projection at 637 bytes with `profile.toml`/`AGENTS.md` never created, so the head was not reordered; `pie memory revert <id>` restored the pre-apply state and `pie memory` then reported "nothing learned yet". The deliberate breaks were caught by **named** tests, and two by a **count** rather than an error path: making the default config spend fired `left: 1, right: 0` on the spawn counter, and making the job spawn-then-report-`NotDue` fired `left: 4, right: 0`. **28/29 offline gates green.** **G5 for M1-M6 was not re-run, and did not need to be**: M7 changed no payload those tests prove (`learn`/`memory`/`schedule`/`commands`/`tui`/`cli`/`config` only), and the rule is to re-run *after* a payload changes. **Not verifiable here**: whether the learned preferences are *good* — extraction is rule-based and inspectable, but "does this reflect how I actually work" is the user's judgement. The vendor-store importers are fixture-tested only: `~/.claude` has no history on this machine (checked), and reading any vendor store is opt-in and off by default |
 | M8 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | **done** | Four stages, each with its own gate binary: **A** drift (`drift` 25), **B** news (`news` 22), **C** report (`watchtower` 10), **D** command (`watch_cmd` 17). **658 tests**, 27 binaries, 7 live correctly ignored. **G5 on the real CLIs, and quota-free** (a `--help` is not a turn, which is the whole reason drift is safe to schedule): `pie watch --month 2026-11` probed **agy 1.3.3, codex-cli 0.162.0 and claude 2.1.296**, wrote **exactly one** report and three snapshots, and reported "first snapshot taken, nothing to diff"; a second run reported **"no drift found — every probe matched the previous snapshot"** and still wrote one file. **32/33 offline gates green.** Three findings came from running the thing rather than from its tests: **B35** (`agy --help` prints usage to **stderr** — 2905 bytes there, 0 on stdout — so every real run failed, and the empty-capture rule added earlier in this same milestone is what made it loud instead of silent; had an empty help been written as a snapshot it would have reported "no drift" forever); **B34** (`CliSnapshot::strings` has no producer, and the obvious one would read *node's* binary for codex, so the report now says the third REA leg is inert instead of pretending); and the `REA_MODE_DETAIL` header, which claimed "selected binary strings" while nothing produced them. Stage D's process died mid-run on a transport error **after** its work was durable, so the deliverable was verified and the missing gate-failure evidence was produced by the maintainer instead (two deliberate breaks, each caught by a named test, each restored byte-identical). **Not verifiable here**: the structural REA check — no disassembler is installed, so `strings` comparison is unimplemented and the report labels the mode accordingly; and whether the impact ranking is *useful*, which depends on terms the user configures |
 | M9 | ✅ | ✅ | ✅ | ✅ | n/a | ✅ | **offline-verified** | Three stages: **A** claude `stream-json` (`parse_claude` 29), **B** the tool loop (`tool_loop` 17), **C** capability + wiring. **711 tests**, 29 binaries, **35/35 gates green including `-Live`**. **The verdict is `offline-verified`, not `done`, and the reason is stated rather than glossed**: `~/.claude/` holds no credential and no history, so no claude turn is possible and every claude fixture is **constructed from `knowledge/claude.md`** — a document that says its own envelope is *expected* rather than captured. A fixture written from a specification is not evidence the specification is right, so these tests are evidence about pie's protocol handling only. G5 is `n/a` for the milestone and the live test runs anyway: without a credential it asserts the refusal (naming claude, logging the attempt as `ok: false` with zero tokens), and with one it would assert the recorded envelope — so the first live run becomes the evidence that document never had. **Two defects, both found at seams no stage's own gate could see:** **B36** — `drive` dropped every event a router owed beyond the first, and the dropped one was a `tool_use`, i.e. a conversation that never finishes; found by a *driver-level* test written after stage A flagged the seam, failing on its first run with `left: ["text"]` while the router's own 28 tests passed. **B37** — the frozen rule "flip `tool_loop` once the loop exists" was unsatisfiable against a backend whose `stream` returns `Unsupported`, so the flag stays `false` and §17 was corrected. The deadlock is covered three ways, including a **permanent control** asserting the stand-in *can* deadlock a single-threaded transport — without it the deadlock test would assert nothing. I2 is asserted behaviourally on the loop's second spawn path, because a mirrored invariant stops holding silently |
+| M10 | ✅ | ✅ | ✅ | ✅ | n/a | ✅ | **offline-verified** | Two layers, one gate binary each: **A** the SSE wire (`sse` 30) and **B** the HTTP transport (`http_transport` 13); **C** wires the two backends over **one** parameterised core — a deliberate departure from `DEFERRED-BACKENDS.md`'s `openrouter.rs` + `deepseek.rs` sketch, because that document also says DeepSeek is "identical apart from the two constants", and two near-duplicate files describing one wire protocol are two places for the wire to drift. **755 tests, 37/37 gates green including `-Live`.** **`cost_usd_micros` is real end-to-end**: `Usage` gained the field (additive, `serde(default)`, so every frozen row and fixture still reads), `sse` maps the endpoint's own figure, and `session_log`'s row writer reads it instead of the `0` it was hardcoded to for ten milestones — asserted by a test that a reported cost **reaches the row** while a subscription backend's stays zero. **The registry grew to five and M0's rule was inverted rather than deleted**: `--list-backends` now asserts the two API-key backends *appear*, report `needs-login`, name their key variable, and are **not** shown as a missing binary (they have no binary to miss). Two halves are **stated as incomplete rather than implied done**: `list_models` and `usage` return `Unsupported` naming their reason — the shared `HttpClient` is POST-only by construction, so `GET /models` has no route through it, and a pay-as-you-go account exposes no quota window. Neither is on the turn path. **G5 is `n/a — needs the user's key`**, stated rather than skipped: a live turn spends real credit in a currency nobody opted into, so the transport is tested against a scripted client and the wire against constructed frames — and a constructed frame is not evidence that a provider's real stream matches it. **Not verifiable here**: any live turn, for that reason |
 
 Verdict values: `done` (all applicable gates) · `offline-verified` (G5 skipped by
 user decision) · `blocked` (a gate fails) · `not started`.
@@ -848,3 +854,72 @@ call means to it. The TUI renders it as a tool row (the vendor's call, per
 tested against a fixture derived from that document — not from a real session. Say so in
 the verdict; a fixture written from a specification is not evidence that the specification
 is right, and M9's row must not read as though claude had been exercised.
+
+---
+
+## 18. M10 — the API-key backends
+
+Contract: `planning/DEFERRED-BACKENDS.md` (the design, written when the milestone was
+deferred) and `DESIGN.md` §19 (the three decisions this milestone owes). Done condition
+from `ROADMAP.md`: *"Uncomment the two HTTP backends (SSE + tool_calls + models + usage)"*,
+constrained to *only backends where `cost_usd_micros` is real*.
+
+> Appended as §18 rather than inserted after §9, to avoid renumbering cross-references.
+> `DEFERRED-BACKENDS.md` asks for this section to exist **before** the code, which is what
+> this is.
+
+**The verdict here is `offline-verified` unless the user supplies keys.** A live turn spends
+real API credit in a currency nobody opted into, so no stage makes one; the transport is
+tested against a scripted client and the wire against recorded frames. G5 is therefore
+`n/a — needs the user's key`, stated rather than skipped, with the live test written and
+`#[ignore]`d.
+
+### The three decisions, and the invariant they sit next to
+
+These are the first backends that **legitimately** read an API key, and the first that are
+**not** subprocesses. Both facts cut against invariants the other nine milestones hold:
+
+| Decision | The rule |
+|---|---|
+| **A key is expected here, and only here** | I9 ("subscription-only auth, never an API key") is an invariant about the *CLI* backends. These need the key in the request and must never be handed a vendor CLI's credential. A **missing** key is a stated error naming the environment variable — never a fallback to another backend, because "answered with a different subscription than the one asked for" is the failure `resolve_target` was written to prevent |
+| **`cost_usd_micros` is real again, so the column returns** | M4 removed the cost column because every subscription backend reports zero, and a permanent `$0.00` implies cost is measured when it is not (`TOKEN-ECONOMICS.md` §10c). That reasoning cuts the other way here: a real figure renders, and **an absent one stays absent** rather than being rendered as zero |
+| **The tool loop comes from M9, not a second copy** | `RISKS.md` §8: this is the path delegate-mode CLIs never exercise, and it is why M9 built it. A backend that needs `tool_calls` and finds no loop is an error, not a degraded path |
+
+**The feature boundary is part of the contract.** `reqwest` sits behind the default-on `http`
+feature, and G6 runs `cargo check --no-default-features`. So the two backends — module,
+registry entry, and id — are gated on that feature, and everything asserting the backend
+list is feature-aware. Without this, G6 breaks the moment they are registered, and the
+break would look like a cross-target problem rather than a feature-gating one.
+
+**Acceptance, per stage.** Three stages, one test binary each.
+
+| Stage | Command | Shape |
+|---|---|---|
+| A the wire | `cargo test --test sse` | SSE frames ⇒ `StreamEvent`s, **incrementally** (a frame boundary lands wherever the network puts it): `data:` payloads, `[DONE]`, comments and event names ignored; `delta.content` ⇒ `TextDelta`; `delta.tool_calls` ⇒ `ToolUse`, whose arguments arrive as a **string accumulated across frames** and must be parsed once complete; usage and `cost_usd_micros` mapped when reported; a mid-JSON cut-off, a non-JSON payload and a stream with no `[DONE]` each decided explicitly (I5) |
+| B the transport | `cargo test --test http_transport` | M9's `Transport` over HTTP: `send` is a stateless POST carrying the conversation so far (the real difference from a child process); a non-2xx is a stated error naming the status and a **redacted** body; a failed request is an error, never an empty stream; **the key appears in no output, error, or formatted value** |
+| C the backends | `cargo test --test acceptance` and `cargo test --lib provider::` | two `Provider` impls over **one** parameterised core (DEFERRED-BACKENDS calls DeepSeek "identical apart from the two constants", so two near-duplicate files would be two places to drift); **registered unconditionally**, because `http::live_client` has a `not(feature = "http")` arm that answers with a stated error naming the missing feature — so the backend is present and tells the truth rather than vanishing from a build where the user cannot tell why; `auth_status` reports `NeedsLogin` naming the variable |
+| G5 | **`n/a — needs the user's key`** | stated, not skipped. The live test is written and `#[ignore]`d with that reason |
+
+**Checks**
+
+- [ ] **the key is read from the environment at call time**, never from `config.toml`, never written under `~/.pie`, and never in an error, log line, or `Debug` output — asserted by running a request with a recognisable key and grepping every string the code produces for it
+- [ ] `tests/no_secrets.rs` still passes, which it does automatically for a new backend because it scans the whole tree
+- [ ] a **missing** key is a stated error naming the environment variable, and **not** a fallback to another backend
+- [ ] a non-2xx response names the status and a redacted body — never a header, never the key
+- [ ] `cost_usd_micros` is non-zero when the endpoint reports a cost, and **absent rather than zero** when it does not
+- [ ] the tool loop is M9's: assert the backend's turn path goes through `tool_loop`, not through a second implementation
+- [ ] G6 still passes: the modules are declared unconditionally and `http.rs` gates `reqwest` internally, so `--no-default-features` compiles and a turn on a no-TLS build is a **stated error naming the missing feature** rather than a backend that answers nothing
+- [ ] the backend table is honest about what each row is: an endpoint backend has **no binary**, and showing one as "not found" tells the reader two wrong things at once — that a binary was expected and that this machine lacks it
+- [ ] no test reaches the network, and the whole suite is green with `HOME`/`USERPROFILE` pointed at an empty directory (gate G3d)
+
+**Not verifiable here**: any live turn, because no key is configured on this machine and a
+live one spends real credit. The transport is tested against a scripted client and the wire
+against constructed frames, so the verdict says which half ran — and a constructed frame is
+not evidence that a provider's real stream matches it.
+
+**Two halves are stated as incomplete rather than implied done.** `list_models` and `usage`
+return `Unsupported` naming their reason: the shared `HttpClient` is **POST-only** by
+construction (its one caller streams a completion), so `GET /models` has no route through
+it, and neither vendor exposes a quota window for a pay-as-you-go account. Both are honest
+stubs with a documented follow-up, not silent gaps — and neither is on the turn path, so
+the milestone's substance is unaffected.

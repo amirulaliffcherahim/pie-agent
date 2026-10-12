@@ -288,6 +288,7 @@ fn the_status_line_names_the_target_the_session_the_status_and_the_last_usage() 
         cache_read_tokens: 900,
         cache_write_tokens: 0,
         total_tokens: 0,
+        cost_usd_micros: 0,
     });
 
     let rows = screen(&app, 100, 10);

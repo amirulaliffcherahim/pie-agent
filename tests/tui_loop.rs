@@ -188,6 +188,7 @@ fn turn_outcome(text: &str) -> TurnOutcome {
             cache_read_tokens: 0,
             cache_write_tokens: 0,
             total_tokens: 20_724,
+            cost_usd_micros: 0,
         },
         status: "SUCCESS".to_string(),
         conversation_id: Some("conv-1".to_string()),

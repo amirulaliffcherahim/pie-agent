@@ -48,6 +48,9 @@ fn row(index: usize) -> TurnRow {
             cache_read_tokens: 0,
             cache_write_tokens: 0,
             total_tokens: INPUT_TOKENS + index as u64 + 14,
+            // A subscription backend reports no cost; the field exists for M10's
+            // API-key backends, and zero is how the schema says "not reported".
+            cost_usd_micros: 0,
         },
         ok: true,
         stop_reason: "SUCCESS".to_string(),

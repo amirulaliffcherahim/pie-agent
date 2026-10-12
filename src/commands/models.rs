@@ -112,8 +112,13 @@ fn select(_cfg: &Config, backend: Option<&str>) -> Result<Vec<Box<dyn Provider>>
 }
 
 /// Known backend ids, for error messages.
+///
+/// [`provider::backend_ids`] rather than `BACKEND_IDS`: an error that lists the known
+/// backends must list the ones a user can actually name, and since M10 that includes the
+/// two API-key backends. The CLI-only constant is for code that means "the subprocess
+/// backends", which this is not.
 pub(crate) fn known_backends() -> Vec<String> {
-    provider::BACKEND_IDS
+    provider::backend_ids()
         .iter()
         .map(|id| (*id).to_string())
         .collect()
@@ -127,7 +132,14 @@ mod tests {
     #[test]
     fn no_backend_means_all_of_them() {
         let cfg = Config::default();
-        assert_eq!(select(&cfg, None).unwrap().len(), 3);
+        // Five since M10: the three CLI backends plus OpenRouter and DeepSeek. Derived from
+        // the registry rather than hardcoded, so a sixth backend does not have to be
+        // remembered here as well.
+        assert_eq!(
+            select(&cfg, None).unwrap().len(),
+            crate::provider::backend_ids().len()
+        );
+        assert_eq!(select(&cfg, None).unwrap().len(), 5);
     }
 
     #[test]

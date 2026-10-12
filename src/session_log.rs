@@ -67,7 +67,14 @@ impl SessionLogRow {
             cached_input_tokens: usage.cache_read_tokens,
             output_tokens: usage.output_tokens,
             reasoning_tokens: usage.thinking_tokens,
-            cost_usd_micros: 0,
+            // **Finally real for the API-key backends (M10).** This was hardcoded to `0` for
+            // ten milestones, and correctly so: every backend was subscription-locked, and a
+            // permanent `$0.00` implies cost is measured when it is not
+            // (`TOKEN-ECONOMICS.md` §10c). M4 removed the cost *column* on that reasoning,
+            // which cuts the other way here — a backend that reports a cost must be able to
+            // record it, and "not reported" is a zero on the row, exactly as the token
+            // fields already mean.
+            cost_usd_micros: usage.cost_usd_micros,
             credits_consumed: 0,
             credits_remaining: 0,
             duration_ms,
@@ -182,7 +189,31 @@ mod tests {
             cache_read_tokens: 0,
             cache_write_tokens: 0,
             total_tokens: 20_724,
+            cost_usd_micros: 0,
         }
+    }
+
+    /// **The cost column is real for a backend that reports one (M10).**
+    ///
+    /// It was hardcoded to zero for ten milestones, and the row schema has always had the
+    /// key — so the thing that could go wrong silently is the *writer* still zeroing it
+    /// while the schema check passes. This asserts the value travels, and the pair below it
+    /// asserts a zero stays zero rather than being invented into something.
+    #[test]
+    fn a_reported_cost_reaches_the_row_and_an_unreported_one_stays_zero() {
+        let mut priced = usage();
+        priced.cost_usd_micros = 12_345;
+        let row = SessionLogRow::from_turn("openrouter", "some/model", &priced, 10, "stop");
+        assert_eq!(
+            row.cost_usd_micros, 12_345,
+            "a provider-reported cost must reach the frozen row"
+        );
+
+        let row = SessionLogRow::from_turn("agy", "gemini-3.8-flash", &usage(), 10, "SUCCESS");
+        assert_eq!(
+            row.cost_usd_micros, 0,
+            "a subscription backend reports no cost, and zero is how the schema says so"
+        );
     }
 
     #[test]

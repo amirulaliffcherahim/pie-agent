@@ -429,6 +429,10 @@ fn usage_from(value: Option<&Value>) -> Option<Usage> {
         cache_read_tokens: jsonl::u(value, "cache_read_tokens").unwrap_or(0),
         cache_write_tokens: jsonl::u(value, "cache_write_tokens").unwrap_or(0),
         total_tokens: jsonl::u(value, "total_tokens").unwrap_or(0),
+        // agy is subscription-locked and reports no cost. Zero here is `Usage`'s documented
+        // "not reported", which is why the row's cost column can stay absent for it while
+        // being real for the API-key backends (M10).
+        cost_usd_micros: 0,
     };
     (usage != Usage::default()).then_some(usage)
 }

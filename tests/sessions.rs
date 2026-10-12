@@ -401,6 +401,7 @@ fn outcome(text: &str, conversation_id: Option<&str>) -> TurnOutcome {
             cache_read_tokens: 0,
             cache_write_tokens: 0,
             total_tokens: 20_724,
+            cost_usd_micros: 0,
         },
         status: "SUCCESS".to_string(),
         conversation_id: conversation_id.map(str::to_string),

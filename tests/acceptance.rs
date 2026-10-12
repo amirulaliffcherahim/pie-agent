@@ -14,7 +14,11 @@
 use std::process::Command;
 
 /// The backend order ACCEPTANCE section 3 fixes.
-const EXPECTED_ORDER: [&str; 3] = ["agy", "codex", "claude"];
+///
+/// Five since M10: the three subprocess backends, then the two API-key ones. The first
+/// three keep their positions because M10 appends — a reader's existing expectations about
+/// the table should not shift because a backend was added at the end.
+const EXPECTED_ORDER: [&str; 5] = ["agy", "codex", "claude", "openrouter", "deepseek"];
 
 fn run(home: &std::path::Path, args: &[&str]) -> String {
     let output = Command::new(env!("CARGO_BIN_EXE_pie"))
@@ -34,7 +38,7 @@ fn run(home: &std::path::Path, args: &[&str]) -> String {
 }
 
 #[test]
-fn list_backends_prints_exactly_three_rows_in_order() {
+fn list_backends_prints_one_row_per_backend_in_order() {
     let home = tempfile::tempdir().unwrap();
     let stdout = run(home.path(), &["--list-backends"]);
 
@@ -95,15 +99,39 @@ fn every_backend_row_reports_a_binary_and_an_auth_state() {
     }
 }
 
+/// M10 **reversed** M0's rule here, and the reversal is asserted rather than the old
+/// rule deleted.
+///
+/// M0 required that no API-key backend appear, because neither was implemented and a
+/// table row for a backend that cannot answer is a promise the binary does not keep. M10
+/// implements both, so the requirement flips: they must appear, must report `needs-login`,
+/// must **name the environment variable** that would fix it, and — the part a row for a
+/// non-subprocess backend can get wrong — must not be shown as a *missing binary*.
 #[test]
-fn no_api_key_backend_leaks_into_the_table() {
+fn the_api_key_backends_appear_and_name_their_key_variable() {
     let home = tempfile::tempdir().unwrap();
     let stdout = run(home.path(), &["--list-backends"]);
 
-    for absent in ["openrouter", "deepseek"] {
+    for (backend, variable) in [
+        ("openrouter", "OPENROUTER_API_KEY"),
+        ("deepseek", "DEEPSEEK_API_KEY"),
+    ] {
+        let row = stdout
+            .lines()
+            .find(|line| line.starts_with(backend))
+            .unwrap_or_else(|| panic!("`{backend}` must have a row:\n{stdout}"));
         assert!(
-            !stdout.contains(absent),
-            "`{absent}` is deferred to M10 and must not be registered:\n{stdout}"
+            row.contains("needs-login"),
+            "with no key set, the row must say so rather than claim readiness: {row}"
+        );
+        assert!(
+            row.contains(variable),
+            "the row must name the variable that fixes it, or it is not actionable: {row}"
+        );
+        assert!(
+            !row.contains("not found"),
+            "an endpoint backend has no binary to be missing, and saying it is missing tells \
+             the reader two wrong things at once: {row}"
         );
     }
 }
@@ -130,10 +158,13 @@ fn auth_and_usage_render_without_a_selected_model() {
     for id in EXPECTED_ORDER {
         assert!(auth.contains(id), "`pie auth` omitted {id}:\n{auth}");
     }
-    for absent in ["openrouter", "deepseek"] {
+    // M0 asserted here that the API-key backends must NOT appear. M10 implements them, so
+    // the assertion inverts — and `pie auth` must agree with `--list-backends`, which is the
+    // property worth keeping: two tables describing one registry is two places to drift.
+    for backend in ["openrouter", "deepseek"] {
         assert!(
-            !auth.contains(absent),
-            "`{absent}` is deferred to M10 and must not be registered:\n{auth}"
+            auth.contains(backend),
+            "`{backend}` is registered since M10, so `pie auth` must list it:\n{auth}"
         );
     }
     assert!(
