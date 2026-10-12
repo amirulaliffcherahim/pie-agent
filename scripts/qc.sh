@@ -122,8 +122,15 @@ run_gate 'G2 lint'    cargo clippy --all-targets -- -D warnings
 # `cargo test` never touches the network or spends quota.
 run_gate 'G3 tests'   cargo test
 
-# --- G4 (M0 offline acceptance) ---------------------------------------------
+# --- G4 (offline acceptance, one gate per milestone) ------------------------
+# The per-milestone acceptance commands from planning/ACCEPTANCE.md sections 3-5.
+# G3 already runs every test binary, so these are partly redundant on purpose:
+# the point is that a milestone's own acceptance command is named and fails
+# individually, so a red gate says *which* milestone regressed rather than just
+# "tests failed". Add the next milestone's command here as it lands.
 run_gate 'G4 acceptance (M0)' cargo run -- --list-backends
+run_gate 'G4 acceptance (M1)' cargo test --test parse_agy
+run_gate 'G4 acceptance (M2)' cargo test --test parse_codex
 
 # --- G5 (live acceptance) ---------------------------------------------------
 if [ "$LIVE" -eq 1 ]; then

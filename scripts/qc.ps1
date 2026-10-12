@@ -14,10 +14,10 @@
       G4  offline acceptance - M0: cargo run -- --list-backends
       G5  live acceptance                                 ONLY with -Live
 
-    G4 is the milestone's offline acceptance command. Only the M0 command is
-    wired in here; as M1/M2 land, their acceptance commands (`cargo test --test
-    parse_agy`, `cargo test --test parse_codex`) are added next to it. CI runs
-    the same command (.github/workflows/ci.yml) so local and CI agree.
+    G4 is the milestone's offline acceptance command, one gate per milestone
+    (M0: `cargo run -- --list-backends`, M1: `cargo test --test parse_agy`,
+    M2: `cargo test --test parse_codex`). CI runs the same commands
+    (.github/workflows/ci.yml) so local and CI agree.
 
     FAIL-FAST: the first failing gate writes `FAIL: <gate>` to stderr and exits
     immediately with that gate's exit code. Later gates do not run - a red G2
@@ -133,8 +133,15 @@ Invoke-Gate -Label 'G2 lint' -Argv @('clippy', '--all-targets', '--', '-D', 'war
 # `cargo test` never touches the network or spends quota.
 Invoke-Gate -Label 'G3 tests' -Argv @('test')
 
-# --- G4 (M0 offline acceptance) ---------------------------------------------
+# --- G4 (offline acceptance, one gate per milestone) ------------------------
+# The per-milestone acceptance commands from planning/ACCEPTANCE.md sections 3-5.
+# G3 already runs every test binary, so these are partly redundant on purpose:
+# the point is that a milestone's own acceptance command is named and fails
+# individually, so a red gate says *which* milestone regressed rather than just
+# "tests failed". Add the next milestone's command here as it lands.
 Invoke-Gate -Label 'G4 acceptance (M0)' -Argv @('run', '--', '--list-backends')
+Invoke-Gate -Label 'G4 acceptance (M1)' -Argv @('test', '--test', 'parse_agy')
+Invoke-Gate -Label 'G4 acceptance (M2)' -Argv @('test', '--test', 'parse_codex')
 
 # --- G5 (live acceptance) ---------------------------------------------------
 if ($Live) {
