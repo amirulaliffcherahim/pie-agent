@@ -14,7 +14,13 @@
 | Tests | see the run log (§12) — do not trust a number here, run `scripts/qc.ps1` |
 | Gates | **all green with `-Live`** — 6 standing checks (G1, G2, G3, G3b, G3c, G3d) + 27 G4 + G6, then G5 |
 | Milestones | **M0–M10 done.** M9 is `offline-verified` (no Claude credential) and M10 is `offline-verified` (no API key); every other milestone is `done`. Each has a run-log row in `ACCEPTANCE.md` §12 |
-| Next | nothing on the roadmap. `ACCEPTANCE.md` §14's S1–S16 are the open suggestions, and `DEFERRED-BACKENDS.md` names the two halves M10 left stubbed |
+| Next | **M11** — the tool suite. Its contract is **frozen** in `DESIGN.md` §20, `ACCEPTANCE.md` §19 and `ROADMAP.md`; no code written. Then `ACCEPTANCE.md` §14's S1–S17, and the release (item 4 below) |
+
+**Note for whoever picks this up: subagent delegation was unavailable at the end of this session**
+(the account returned `402 Insufficient Balance`), so the last items were done by hand. The M11
+contract is written precisely so the stages can be dispatched one at a time without re-deriving
+anything — and its **first** decision (no user in the loop, so a tool is enabled in config or not
+offered) is recorded there rather than waiting to be rediscovered.
 
 **Gate count changed three times across M6–M10, and every change was a defect being closed rather
 than a feature being added.** G6 was a required gate with *no runner at all* and a command that
@@ -153,18 +159,18 @@ the reason is a missing credential rather than unfinished work:
 
 ### The open work, in the order I would pick it up
 
-1. **`list_models` and `usage` for M10's backends** are honest stubs: the shared `HttpClient`
-is POST-only by construction, so `GET /models` has no route through it. Adding a `get` to that
-trait unlocks `GET /models` and `GET /key` (OpenRouter reports remaining credit there). Neither
-is on the turn path, so nothing is waiting on it.
-2. **A concrete tool suite.** M9 built the loop and ships no tools; every call is answered with
-a stated error. `PLAN.md` §2's `agent/tools.rs` is the follow-up, and the question to settle
-first is what a `bash` tool may do unattended.
-3. **The `strings` leg of the REA-lite drift check.** `DESIGN` §17 documents the shape: a
-`strings_command` beside `version_command`/`help_command`, extracting from the vendor's own
-artefact, because the naive version reads *node's* binary for codex.
-4. **`ACCEPTANCE.md` §14's S1–S16.** Several are one-line tidyings; S15 (three signature
-widenings in `render_report`) is the one worth doing as a single pass.
+1. **M11 — the tool suite**, whose contract is frozen (`DESIGN.md` §20, `ACCEPTANCE.md` §19,
+   `ROADMAP.md`). Three stages, one test binary each. The decision that shapes all of it: M9's
+   loop has **no user in it**, so a tool is enabled in config with a declared scope or it is not
+   offered — no per-call approval. And `bash` must not become a *third* copy of the spawn policy;
+   M11 unifies `ChildTransport` into `process.rs` rather than adding one.
+2. **`ACCEPTANCE.md` §14's S1–S17.** S15 and S17 are the ones worth batching: S15 is three
+   signature widenings in one function (`render_report`), and S17 is the fused-flag-table
+   duplication the strings leg's two selection paths create.
+3. **A concrete tool suite's prerequisite is settled; the tools themselves are M11's work.**
+4. **The release** (§15 of this handoff): promote the changelog and tag. `Cargo.toml` is still
+   `0.1.0` after eleven milestones, so the bump is a deliberate decision, not an automatic one.
+5. **Nothing else.** `DEFERRED-BACKENDS.md`'s two halves were closed by the M10 follow-up.
 
 ### Testing it hands-on
 
