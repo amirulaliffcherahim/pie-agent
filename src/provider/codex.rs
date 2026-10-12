@@ -13,8 +13,8 @@ use async_trait::async_trait;
 use crate::auth::{self, Credential};
 use crate::config::Config;
 use crate::error::{PieError, Result};
-use crate::proc;
-use crate::provider::cli::{self, TurnPlan};
+use crate::process;
+use crate::provider::driver::{cap_for, enforce_argv_cap, TurnPlan};
 use crate::provider::{
     AuthState, Capabilities, ChatRequest, Model, Provider, StreamEvent, TurnOutcome, UsageReport,
 };
@@ -120,7 +120,7 @@ pub fn program_and_prefix(cfg: &Config) -> Option<(PathBuf, Vec<OsString>)> {
     // 1. Explicit / path-like configuration.
     if configured.is_file() {
         if is_javascript(&configured) {
-            let node = proc::resolve_binary("node")?;
+            let node = process::resolve_binary("node")?;
             return Some((node, vec![configured.into_os_string()]));
         }
         return Some((configured, Vec::new()));
@@ -133,7 +133,8 @@ pub fn program_and_prefix(cfg: &Config) -> Option<(PathBuf, Vec<OsString>)> {
 
     // 3. node + the npm launcher, which is what the shim would have run.
     if cfg.codex.use_node_shim {
-        if let (Some(script), Some(node)) = (find_node_script(cfg), proc::resolve_binary("node")) {
+        if let (Some(script), Some(node)) = (find_node_script(cfg), process::resolve_binary("node"))
+        {
             return Some((node, vec![script.into_os_string()]));
         }
     }
@@ -153,7 +154,7 @@ fn is_javascript(path: &Path) -> bool {
 
 /// Resolve a binary on `PATH`, skipping Windows shell shims.
 fn resolve_executable(spec: &str) -> Option<PathBuf> {
-    let found = proc::resolve_binary(spec)?;
+    let found = process::resolve_binary(spec)?;
     if is_shell_shim(&found) {
         return None;
     }
@@ -187,7 +188,7 @@ fn npm_root_candidates(cfg: &Config) -> Vec<PathBuf> {
     let mut roots: Vec<PathBuf> = Vec::new();
 
     // Next to the configured binary, if that resolves to a shim.
-    if let Some(shim) = proc::resolve_binary(&cfg.codex.bin) {
+    if let Some(shim) = process::resolve_binary(&cfg.codex.bin) {
         if let Some(dir) = shim.parent() {
             roots.push(dir.to_path_buf());
             // `%APPDATA%\npm\codex.cmd` → `%APPDATA%\npm\node_modules\...`
@@ -273,8 +274,8 @@ pub fn build_plan(cfg: &Config, req: &ChatRequest) -> Result<TurnPlan> {
 
     // M0 passes the prompt on argv, so the config argv cap applies even though
     // codex can read stdin. M2 lifts this by piping oversized prompts.
-    let cap = cli::cap_for(&Codex.capabilities(), cfg);
-    cli::enforce_argv_cap(
+    let cap = cap_for(&Codex.capabilities(), cfg);
+    enforce_argv_cap(
         "codex",
         &program,
         &args,

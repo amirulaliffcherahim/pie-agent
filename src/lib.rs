@@ -18,18 +18,22 @@
 #![warn(missing_debug_implementations)]
 
 pub mod auth;
+pub mod cache;
 pub mod cli;
+pub mod commands;
 pub mod config;
 pub mod error;
 pub mod jsonl;
 pub mod logging;
 pub mod paths;
-pub mod proc;
+pub mod process;
 pub mod provider;
-pub mod sessionlog;
+pub mod report;
+pub mod session_log;
+
+/// Test-only helpers. Compiled out of every non-test build.
 #[cfg(test)]
-pub(crate) mod testenv;
-pub mod usage;
+pub(crate) mod testing;
 
 /// Crate version, recorded for CLI-drift detection (`RISKS.md` §3).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

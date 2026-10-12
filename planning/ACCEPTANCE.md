@@ -41,15 +41,17 @@ These are cross-cutting gates from `ROADMAP.md`. Each has an assertion somewhere
 
 | # | Invariant | Where proven |
 |---|---|---|
-| I1 | No console window ever appears from a child process | `proc.rs` sets `CREATE_NO_WINDOW` on Windows (`creation_flags`); on unix the child leads its own process group instead. Unit test asserts the flag constant |
+| I1 | No console window ever appears from a child process | `process.rs` sets `CREATE_NO_WINDOW` on Windows (`creation_flags`); on unix the child leads its own process group instead. Unit test asserts the flag constant |
 | I2 | API-key env vars never reach a child | `env_hygiene` test: deny-list removed, `GOOGLE_APPLICATION_CREDENTIALS` and `CLOUD_CODE` preserved |
-| I3 | No secret is ever logged or echoed | `proc::redact` + `redact` regression tests (long opaque runs, `Bearer <token>`); codex token redaction test; a `token=<blob>` leak was a real M0 bug (see §9) |
+| I3 | No secret is ever logged or echoed | `process::redact` + `redact` regression tests (long opaque runs, `Bearer <token>`); codex token redaction test; a `token=<blob>` leak was a real M0 bug (see §9) |
 | I4 | Prompt argv is bounded | `prompt_cap` test: >20 000 chars for agy ⇒ `PromptTooLong`, exit 2 |
 | I5 | A bad stdout line never aborts a run | tolerant-parse test: padding garbage + unknown events around a valid `result` still succeeds |
 | I6 | No panic on external input | `#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic))]` in `lib.rs` |
 | I7 | `models`/`auth`/`doctor`/`--list-backends` spend zero model quota | `auth` runs no subprocess; `models`/`usage` never call `stream()`; verified by inspection of those paths |
 | I8 | Backend version is recorded for drift detection | `doctor` prints each CLI's own version and writes `~/.pie/cache/versions.json`; codex's row must name codex, not node (real M0 bug, see §9) |
 | I9 | Subscription-only auth, never an API key | codex `auth_mode` gate + no key injection; `NoSubscription` error path exists |
+| I10 | No credential is hardcoded, printed, or persisted by pie | `tests/no_secrets.rs`: a static scan for credential-shaped literals plus a behavioural run of the real binary with API keys in the environment, asserting they appear in no output and in no file under `PIE_HOME` |
+| I11 | The legacy `~/.pie/auth.json` (extracted OAuth tokens) is never read, written, or recreated | `tests/no_secrets.rs::the_legacy_auth_file_is_left_untouched` and a `session_log` unit test |
 
 ## 3. M0 — Scaffold + provider trait
 
@@ -77,7 +79,14 @@ claude  claude   unknown    no-subscription
 - [ ] `~/.pie/config.toml` missing ⇒ defaults, no error; malformed ⇒ `PieError::Config`, exit 2
 - [ ] precedence test: flag beats `PIE_*` env beats `config.toml` beats default
 - [ ] no `unwrap`/`expect` outside tests (I6)
-- [ ] `openrouter.rs`/`deepseek.rs` present but fully commented out, not in the registry
+- [ ] no commented-out source files anywhere under `src/` — deferred designs live
+      in `planning/DEFERRED-BACKENDS.md`, and the M10 backends are absent from the
+      module tree and from `provider::registry()`
+- [ ] no `mod.rs` files; `provider.rs` sits beside `provider/`
+- [ ] `main.rs` is under ~60 lines and holds no business logic
+- [ ] no credential-shaped literal anywhere: `cargo test --test no_secrets`
+- [ ] running the binary with API keys in the environment writes none of them to
+      `~/.pie` and prints none of them (`tests/no_secrets.rs`, behavioural half)
 
 **Live:** none. M0 makes no model calls.
 
@@ -217,11 +226,11 @@ prevents it. This is the record the milestone verdicts above rest on.
 
 | # | Sev | Symptom | Caught by | Fix | Regression test |
 |---|---|---|---|---|---|
-| B1 | major | `redact` failed to redact `token=<80-char blob>`. The `=` broke the token split, so a credential could reach an error message or log line (`RISKS.md` §10) | `proc::tests::redacts_long_opaque_blobs` | Rewrote redaction as two passes: collapse any unbroken 60+ char `[A-Za-z0-9._-]` run, then apply known prefixes. Also redacts the token *after* `Bearer` | `redacts_long_opaque_blobs`, `redacts_the_token_after_bearer`, `short_ordinary_text_is_untouched` |
+| B1 | major | `redact` failed to redact `token=<80-char blob>`. The `=` broke the token split, so a credential could reach an error message or log line (`RISKS.md` §10) | `process::tests::redacts_long_opaque_blobs` | Rewrote redaction as two passes: collapse any unbroken 60+ char `[A-Za-z0-9._-]` run, then apply known prefixes. Also redacts the token *after* `Bearer` | `redacts_long_opaque_blobs`, `redacts_the_token_after_bearer`, `short_ordinary_text_is_untouched` |
 | B2 | major | `StreamEvent` used serde internal tagging, which **cannot** represent a newtype variant holding a string — `pie -p --json` would have failed at runtime with `cannot serialize tagged newtype variant` | `provider::tests::events_serialise_with_a_kind_tag` | Switched to adjacent tagging (`{"event":"text","data":…}`), pinned each tag with an explicit `rename`, and asserted the tag equals `StreamEvent::kind()` | `events_serialise_with_a_kind_tag` (round-trips all 7 variants) |
 | B3 | major | codex's version probe reported **node's** version (`v25.9.0`) instead of codex's, because the probe ignored the `node <codex.js>` launcher prefix. Drift detection (I8) would have compared the wrong binary | `--list-backends` acceptance run | Added `Provider::version_command()`, defaulting to `(binary, version_args)`; codex overrides it to carry the script prefix | `version_probe_carries_the_node_script_prefix` |
 | B4 | major | `#[async_trait]` missing on the three `impl Provider` blocks — the crate did not compile at all (E0195) | `cargo check` | Added the attribute to each impl | compile gate |
-| B5 | minor | Env-mutating tests raced on `HOME`/`PIE_HOME` (process-global, parallel threads), producing a nonsense failure in `paths::tests::empty_override_is_ignored` | `cargo test` | Added `src/testenv.rs` with a shared `EnvGuard` that serialises env mutation and restores prior values on drop | whole `paths`/`auth`/`config` env suite |
+| B5 | minor | Env-mutating tests raced on `HOME`/`PIE_HOME` (process-global, parallel threads), producing a nonsense failure in `paths::tests::empty_override_is_ignored` | `cargo test` | Added `src/testing.rs` with a shared `EnvGuard` that serialises env mutation and restores prior values on drop | whole `paths`/`auth`/`config` env suite |
 | B6 | minor | Table truncated paths with `…[truncated]`, hiding which binary was meant. `agy\bin\agy.exe` was unreadable | `--list-backends` acceptance run | Added `short_path`: keep the last three components, clip to the column width | `long_paths_keep_the_identifying_tail`, `short_path_never_exceeds_the_column_width`, `unix_style_paths_are_shortened_too` |
 
 ### Findings that are not code bugs

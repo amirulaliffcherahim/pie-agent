@@ -1,0 +1,105 @@
+# pie — line-ending + diff normalisation
+#
+# Why this file exists: pie is developed on Windows (x86_64-pc-windows-msvc)
+# with `core.autocrlf=true`, but it must build and run on Linux, WSL and macOS.
+# Without explicit attributes, a checkout done on one OS differs byte-for-byte
+# from a checkout done on another, which makes CI failures unreproducible
+# locally (planning/PLATFORMS.md, planning/DESIGN.md §1).
+#
+# Rules of thumb applied here:
+#   * every text file is normalised to LF in the repository (already the
+#     convention for the existing tree), and
+#   * text files that are consumed by unix tooling are ALSO checked out as LF
+#     on every OS, so a Windows checkout matches a Linux checkout exactly.
+#
+# Attribute precedence: a path-specific rule below always beats
+# `core.autocrlf` / `core.eol` from the local or global git config, so pinning
+# `eol=lf` here is what makes WSL/Linux behaviour identical to Windows.
+
+# Default: normalise line endings on commit, let git decide on checkout.
+* text=auto
+
+# ---------------------------------------------------------------------------
+# Source, config and script text -> LF on every platform
+# ---------------------------------------------------------------------------
+
+# Rust sources, manifests and lockfile. LF everywhere: rustc accepts CRLF, but
+# a CRLF file trips `cargo fmt --check` (G1) and pollutes diffs, so pin it.
+*.rs            text eol=lf
+*.toml          text eol=lf
+Cargo.lock      text eol=lf
+
+# Shell scripts must be LF or bash/sh refuse to run them or report
+# `bad interpreter: /usr/bin/env bash^M` on Linux/WSL/macOS.
+*.sh            text eol=lf
+.bashrc         text eol=lf
+*.bash          text eol=lf
+*.zsh           text eol=lf
+*.fish          text eol=lf
+
+# CI + other YAML: read by GitHub Actions runners (Linux) as well as by the
+# developer on Windows. LF keeps the rendered workflow identical everywhere.
+*.yml           text eol=lf
+*.yaml          text eol=lf
+
+# Data files. `tests/fixtures/*.jsonl` are recorded vendor CLI samples that the
+# tolerant line parser (DESIGN §6.4, invariant I5) is tested against; pinning
+# LF means the parser sees the same bytes on every OS and the fixtures cannot
+# silently change shape between a Windows and a Linux run.
+*.json          text eol=lf
+*.jsonl         text eol=lf
+*.ndjson        text eol=lf
+
+# Documentation + prose.
+*.md            text eol=lf
+*.txt           text eol=lf
+
+# ---------------------------------------------------------------------------
+# Windows-native script text -> CRLF on every platform
+# ---------------------------------------------------------------------------
+# PowerShell and cmd.exe do not require CRLF, but some tooling that shells out
+# to them (and interactive editing) is markedly less confusing with it. These
+# files never run on Linux/WSL/macOS, so CRLF costs nothing there.
+*.ps1           text eol=crlf
+*.psm1          text eol=crlf
+*.cmd           text eol=crlf
+*.bat           text eol=crlf
+
+# ---------------------------------------------------------------------------
+# Binary — never normalise, never diff as text
+# ---------------------------------------------------------------------------
+*.exe           binary
+*.dll           binary
+*.pdb           binary
+*.so            binary
+*.dylib         binary
+*.a             binary
+*.lib           binary
+*.rlib          binary
+*.zip           binary
+*.tar           binary
+*.gz            binary
+*.png           binary
+*.jpg           binary
+*.jpeg          binary
+*.gif           binary
+*.ico           binary
+*.icns          binary
+*.woff          binary
+*.woff2         binary
+*.ttf           binary
+
+# ---------------------------------------------------------------------------
+# Linguist / GitHub rendering
+# ---------------------------------------------------------------------------
+# `planning/` is the frozen design + acceptance contract and `knowledge/` is
+# reverse-engineered CLI reference, both prose-only Markdown. Marking them as
+# documentation keeps them out of the repo's language statistics, which is the
+# only classification that is actually true for them.
+planning/**     linguist-documentation
+knowledge/**    linguist-documentation
+
+# Deliberately NOT marked `linguist-generated`:
+# `tests/fixtures/**` are recorded vendor output, but they are byte-exact
+# security-relevant samples (secret leakage, I3/I5) that must stay visible in
+# pull-request diffs.

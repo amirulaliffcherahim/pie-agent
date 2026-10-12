@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::error::{PieError, Result};
-use crate::proc::{self, RunSpec};
+use crate::process::{self, RunSpec};
 use crate::provider::{Capabilities, StreamEvent, TurnOutcome};
 
 /// Everything needed to execute one turn of a CLI backend.
@@ -84,7 +84,7 @@ pub async fn drive(
                 sink(event);
             }
         };
-        proc::run_streaming(&spec, &mut on_line).await?
+        process::run_streaming(&spec, &mut on_line).await?
     };
 
     let mut outcome = router.outcome(
@@ -140,6 +140,39 @@ pub fn cap_for(caps: &Capabilities, cfg: &crate::config::Config) -> usize {
     cfg.effective_argv_cap(caps)
 }
 
+/// Run a plan and collect every stdout line.
+///
+/// For **non-turn** commands only — listing models, probing quota. Turn output
+/// must go through [`drive`] so events stream as they arrive rather than being
+/// buffered.
+///
+/// A non-zero exit is only an error when nothing was printed: some CLIs exit
+/// non-zero after emitting a perfectly good payload.
+pub async fn collect_lines(backend: &str, plan: &TurnPlan) -> Result<Vec<String>> {
+    let spec = RunSpec {
+        backend: backend.to_string(),
+        program: plan.program.clone(),
+        args: plan.args.clone(),
+        cwd: plan.cwd.clone(),
+        scrub: plan.scrub.clone(),
+        timeout: plan.timeout,
+    };
+
+    let mut lines: Vec<String> = Vec::new();
+    let mut push = |line: &str| lines.push(line.to_string());
+    let summary = process::run_streaming(&spec, &mut push).await?;
+
+    if lines.is_empty() && !summary.success() {
+        return Err(PieError::Backend {
+            backend: backend.to_string(),
+            status: summary.exit_status.clone(),
+            detail: process::diagnostic(&summary.stderr_tail),
+        });
+    }
+
+    Ok(lines)
+}
+
 /// Ask a backend for its version string, with a short deadline.
 ///
 /// Used by `--list-backends` and `doctor` for drift detection (`RISKS.md` §3).
@@ -171,7 +204,7 @@ pub async fn probe_version(
         }
     };
 
-    match proc::run_streaming(&spec, &mut capture).await {
+    match process::run_streaming(&spec, &mut capture).await {
         Ok(_) => first,
         Err(e) => {
             tracing::debug!(backend = provider.id(), error = %e, "version probe failed");

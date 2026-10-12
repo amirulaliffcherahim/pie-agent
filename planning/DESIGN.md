@@ -29,42 +29,68 @@ compiles/tests on Linux (the roadmap only requires Windows to work).
 
 ## 2. Crate layout (locked)
 
+The tree follows plain Rust conventions: `snake_case` file names, no
+abbreviations, one concern per file, and a `commands/` directory holding one
+file per subcommand so each is reviewable in isolation. There are deliberately
+**no `mod.rs` files** — the modern form is a sibling `foo.rs` next to a `foo/`
+directory. There are also no commented-out source files: deferred designs live
+in documents (`DEFERRED-BACKENDS.md`), because a file of comments is not
+compiled, not linted, and not tested.
+
 ```
 pie/
-├── Cargo.toml
-├── .gitignore · CHANGELOG.md · README.md
-├── planning/            # PLAN, ROADMAP, RISKS, VERSIONING, DESIGN, ACCEPTANCE
-├── knowledge/           # agy.md, codex.md, claude.md, internals.md, README.md
+├── Cargo.toml · Cargo.lock · CHANGELOG.md · README.md · .gitignore
+├── planning/            # PLAN, ROADMAP, RISKS, VERSIONING, DESIGN, ACCEPTANCE,
+│                        # PLATFORMS, DEFERRED-BACKENDS
+├── knowledge/           # agy.md, codex.md, claude.md, internals.md,
+│                        # token_optimization_and_agent_engineering.md
+├── scripts/             # qc.sh (unix/WSL) · qc.ps1 (Windows) — run gates G1–G3
 ├── src/
-│   ├── main.rs          # arg parse → dispatch → exit code
-│   ├── cli.rs           # clap definitions only (no logic)
-│   ├── config.rs        # ~/.pie/config.toml + env + CLI overrides
-│   ├── error.rs         # PieError + exit-code mapping
-│   ├── paths.rs         # PIE_HOME, ~/.pie layout, cache dirs
-│   ├── logging.rs       # tracing init (stderr only — stdout is protocol)
-│   ├── auth.rs          # per-backend AuthState + hints   (thin in M0–M2)
-│   ├── usage.rs         # unified UsageReport + session-log totals
-│   ├── sessionlog.rs    # append/read ~/.pie/usage.jsonl (frozen schema §7)
-│   ├── proc.rs          # hidden spawn, bounded stderr, timeout, kill-tree
-│   ├── jsonl.rs         # tolerant line→Value reader + event routing helpers
+│   ├── main.rs          # ~45 lines: parse → resolve config → dispatch → exit code
+│   ├── lib.rs           # module list + VERSION/NAME
+│   ├── cli.rs           # clap definitions only, no behaviour
+│   ├── commands.rs      # dispatch table; declares the command modules
+│   ├── commands/
+│   │   ├── backends.rs  # `--list-backends` and `doctor`
+│   │   ├── auth.rs      # `auth`
+│   │   ├── models.rs    # `models`
+│   │   ├── usage.rs     # `usage`
+│   │   └── print.rs     # `-p/--print` delegate turn
+│   ├── config.rs        # ~/.pie/config.toml + env + flag overrides, env scrub list
+│   ├── error.rs         # PieError + exit-code mapping + `kind()`
+│   ├── paths.rs         # PIE_HOME, ~/.pie layout, cache paths
+│   ├── logging.rs       # tracing init (stderr only — stdout is the protocol)
+│   ├── process.rs       # hidden spawn, bounded stderr, deadline, kill-tree, redaction
+│   ├── jsonl.rs         # tolerant line → Value reader + dotted-path helpers
+│   ├── cache.rs         # TTL'd JSON caches under ~/.pie/cache
+│   ├── auth.rs          # credential classification per backend
+│   ├── session_log.rs   # append/read ~/.pie/usage.jsonl (frozen schema §7)
+│   ├── report.rs        # quota/Bucket rendering + session-log Totals
 │   └── provider/
-│       ├── mod.rs       # Provider trait, Capabilities, registry, shared types
-│       ├── cli.rs       # NDJSON/JSONL streaming driver shared by all CLIs
-│       ├── agy.rs       # M1 (live)
-│       ├── codex.rs     # M2 (live)
-│       ├── claude.rs    # M0 stub, M9 real (future-proof, disabled)
-│       ├── openrouter.rs# COMMENTED OUT (M10)
-│       └── deepseek.rs  # COMMENTED OUT (M10)
+│       ├── (provider.rs)      # Provider trait, Capabilities, registry, types
+│       ├── driver.rs          # shared turn driver: EventRouter + process run
+│       ├── agy.rs             # M1 (live)
+│       ├── codex.rs           # M2 (live)
+│       └── claude.rs          # stub now, real in M9 (future-proof, disabled)
 └── tests/
-    ├── fixtures/        # recorded NDJSON/JSONL samples
-    ├── parse_agy.rs · parse_codex.rs
-    ├── registry.rs · config_precedence.rs · env_hygiene.rs · prompt_cap.rs
+    ├── process.rs       # real child-process tests: lines, timeout, kill, scrub
+    ├── no_secrets.rs    # static + behavioural no-hardcoded-key guards
+    ├── fixtures/        # recorded NDJSON/JSONL samples (M1/M2)
+    ├── parse_agy.rs · parse_codex.rs          (M1/M2)
     └── live_smoke.rs    # #[ignore] by default, requires PIE_LIVE=1
 ```
 
+Note the two deliberately distinct names: `cli.rs` is *argument parsing*,
+`provider/driver.rs` is *running a provider subprocess*. `provider.rs` sits
+beside `provider/` rather than inside it as `mod.rs`.
+
+`PLAN.md` §2 sketches the **full target tree**, including modules for later
+milestones (`agent/`, `watch/`, `tui/`). Where it and this file disagree about
+M0–M2, this file wins.
+
 Rule: `main.rs` contains no business logic; each module owns one concern.
 
-## 3. Core types (`provider/mod.rs`)
+## 3. Core types (`provider.rs`)
 
 ```rust
 pub struct Model {
@@ -131,7 +157,7 @@ pub struct Bucket { pub label: String, pub remaining_fraction: Option<f64>,
 pub struct UsageReport { pub backend: String, pub buckets: Vec<Bucket>, pub source: String, pub notes: Vec<String> }
 ```
 
-## 4. Provider trait (`provider/mod.rs`)
+## 4. Provider trait (`provider.rs`)
 
 Object-safe via `#[async_trait]` (per `PLAN.md` §3). Note: native `async fn` in
 traits is **not** dyn-compatible, so `async-trait` is required for `Box<dyn Provider>`.
@@ -192,7 +218,7 @@ Exit codes: `0` ok · `1` generic/backend · `2` usage+config · `3` auth ·
 **Never panic on external input.** No `unwrap()`/`expect()` outside tests;
 parsing external JSON returns `Result` or degrades to `StreamEvent::Unparsed`/`Other`.
 
-## 6. Process + streaming contract (`proc.rs`, `provider/cli.rs`)
+## 6. Process + streaming contract (`process.rs`, `provider/driver.rs`)
 
 Non-negotiable for all three CLIs:
 
@@ -215,7 +241,7 @@ Non-negotiable for all three CLIs:
 7. **Exit status is not the answer.** Success is decided by the terminal event.
    Non-zero exit + no terminal event ⇒ `Backend { status, detail: last stderr }`.
 
-## 7. On-disk state (`paths.rs`, `sessionlog.rs`)
+## 7. On-disk state (`paths.rs`, `session_log.rs`)
 
 `PIE_HOME` overrides the root; default `~/.pie`.
 

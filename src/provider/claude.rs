@@ -19,7 +19,7 @@ use async_trait::async_trait;
 use crate::auth::{self, Credential};
 use crate::config::Config;
 use crate::error::{PieError, Result};
-use crate::proc;
+use crate::process;
 use crate::provider::{
     AuthState, Capabilities, ChatRequest, Model, Provider, StreamEvent, TurnOutcome, UsageReport,
 };
@@ -55,7 +55,7 @@ impl Provider for Claude {
     }
 
     fn binary(&self, cfg: &Config) -> Option<PathBuf> {
-        proc::resolve_binary(&cfg.claude.bin)
+        process::resolve_binary(&cfg.claude.bin)
     }
 
     async fn auth_status(&self, cfg: &Config) -> AuthState {

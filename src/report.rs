@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::provider::UsageReport;
-use crate::sessionlog::SessionLogRow;
+use crate::session_log::SessionLogRow;
 
 /// Aggregated session-log totals.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

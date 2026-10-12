@@ -14,8 +14,8 @@ use async_trait::async_trait;
 use crate::auth::{self, Credential};
 use crate::config::Config;
 use crate::error::{PieError, Result};
-use crate::proc;
-use crate::provider::cli::{self, TurnPlan};
+use crate::process;
+use crate::provider::driver::{cap_for, enforce_argv_cap, TurnPlan};
 use crate::provider::{
     AuthState, Capabilities, ChatRequest, Model, Provider, StreamEvent, TurnOutcome, UsageReport,
 };
@@ -52,7 +52,7 @@ impl Provider for Agy {
     }
 
     fn binary(&self, cfg: &Config) -> Option<PathBuf> {
-        proc::resolve_binary(&cfg.agy.bin)
+        process::resolve_binary(&cfg.agy.bin)
     }
 
     async fn auth_status(&self, cfg: &Config) -> AuthState {
@@ -180,8 +180,8 @@ pub fn build_plan(cfg: &Config, req: &ChatRequest) -> Result<TurnPlan> {
     let program_path = PathBuf::from(&program);
     let args = build_args(cfg, req)?;
 
-    let cap = cli::cap_for(&self_caps(), cfg);
-    cli::enforce_argv_cap("agy", &program_path, &args, cap, PROMPT_CAP_HINT)?;
+    let cap = cap_for(&self_caps(), cfg);
+    enforce_argv_cap("agy", &program_path, &args, cap, PROMPT_CAP_HINT)?;
 
     Ok(TurnPlan {
         program: program_path,

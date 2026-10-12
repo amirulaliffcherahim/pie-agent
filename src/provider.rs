@@ -17,12 +17,14 @@ use crate::error::{PieError, Result};
 
 pub mod agy;
 pub mod claude;
-pub mod cli;
 pub mod codex;
+pub mod driver;
 
-// M10 — re-enable by uncommenting both the module and its registry entry.
-// pub mod openrouter;
-// pub mod deepseek;
+// The OpenRouter and DeepSeek API-key backends are deferred to M10. Their
+// design is kept as a document rather than as commented-out source, so nothing
+// uncompilable sits in the module tree: see `planning/DEFERRED-BACKENDS.md`.
+// Re-adding one means writing `provider/<name>.rs` and adding it to the
+// registry below.
 
 /// Provider ids, in display and registry order.
 pub const BACKEND_IDS: [&str; 3] = ["agy", "codex", "claude"];
@@ -353,8 +355,9 @@ pub fn registry() -> Vec<Box<dyn Provider>> {
         Box::new(agy::Agy),
         Box::new(codex::Codex),
         Box::new(claude::Claude),
-        // M10: Box::new(openrouter::OpenRouter),
-        // M10: Box::new(deepseek::DeepSeek),
+        // M10, once `planning/DEFERRED-BACKENDS.md` is implemented:
+        // Box::new(openrouter::OpenRouter),
+        // Box::new(deepseek::DeepSeek),
     ]
 }
 

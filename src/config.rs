@@ -291,7 +291,7 @@ mod tests {
 
     /// Serialises the env-mutating tests in this module.
     /// (Rust runs tests in threads; `PIE_*` vars are process-global.)
-    use crate::testenv::EnvGuard;
+    use crate::testing::EnvGuard;
 
     #[test]
     fn defaults_are_documented_values() {

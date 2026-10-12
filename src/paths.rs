@@ -80,7 +80,7 @@ fn non_empty_env(key: &str) -> Option<String> {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
-    use crate::testenv::EnvGuard;
+    use crate::testing::EnvGuard;
 
     #[test]
     fn pie_home_honours_override() {

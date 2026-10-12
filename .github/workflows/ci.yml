@@ -1,0 +1,126 @@
+# =============================================================================
+# pie — cross-platform CI
+# =============================================================================
+#
+# WHY THIS FILE MATTERS MORE THAN USUAL
+#
+# pie is developed on Windows (x86_64-pc-windows-msvc) and must be usable and
+# buildable on Windows, WSL and Linux (planning/PLATFORMS.md).
+#
+# WSL2 IS INSTALLED ON THE DEVELOPMENT MACHINE BUT CANNOT BOOT
+# (`HCS_E_SERVICE_NOT_AVAILABLE` — the Hyper-V container service is not
+# available to the host). Linux therefore CANNOT be verified locally at all.
+# This workflow is the *only* real Linux/WSL verification channel in the
+# project: every claim that "pie works on Linux" traces back to a green run of
+# this file. Treat a workflow edit as a change to the project's verification
+# story, not as boilerplate.
+#
+# WHAT IT PROVES
+#
+# The five gates of planning/ACCEPTANCE.md §1, as separate steps so a failure
+# names the gate:
+#   G1  cargo fmt --check                            (no diff)
+#   G2  cargo clippy --all-targets -- -D warnings     (zero warnings)
+#   G3  cargo test                                    (all pass)
+#   G4  offline acceptance — M0: `cargo run -- --list-backends`
+#   G5  live acceptance — NEVER RUN IN CI (spends real subscription quota)
+#
+# G5 is deliberately absent: it needs real vendor credentials, real
+# subscription quota, and the approved models only (`agy/gemini-3.8-flash`,
+# `codex/gpt-6-luna`). It is a developer-run gate (`scripts/qc.sh --live`,
+# `scripts/qc.ps1 -Live`). `cargo test` stays quota-free because the live smoke
+# tests in `tests/live_smoke.rs` are `#[ignore]`d and require `PIE_LIVE=1`; the
+# workflow pins `PIE_LIVE=0` below so an operator-set repository variable can
+# never cause CI to spend quota by accident.
+#
+# NOTE ON THE CURRENT STATE OF THE TREE
+#
+# `src/` is being written concurrently. This workflow is written for the
+# INTENDED final state and intentionally contains no `continue-on-error`, no
+# feature-gated skips, and no `|| true`. If a gate is red, that is the answer.
+
+name: ci
+
+on:
+  push:
+  pull_request:
+
+# Least privilege: the workflow only reads the repository.
+permissions:
+  contents: read
+
+# Cancel superseded runs on the same ref so a stale push cannot report a status
+# for code nobody is looking at any more.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Full backtraces on panic — the "no panic on external input" invariant (I6)
+  # is only debuggable from CI logs if the backtrace is captured.
+  RUST_BACKTRACE: "1"
+  # Quota guard: see the header note. Live smoke requires the literal value "1".
+  PIE_LIVE: "0"
+
+jobs:
+  gates:
+    name: gates (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      # A red Windows job must never hide a red Linux job, and vice versa:
+      # the entire point of the matrix is the comparison.
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest   # the real Linux check (WSL is unbootable locally)
+          - windows-latest  # the primary development target
+          - macos-latest    # regression tripwire only — NOT a support target
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # `stable` also installs the components; the crate declares
+      # `rust-version = "1.75"` (MSRV) but CI runs current stable, matching
+      # design facts (planning/DESIGN.md §1: rustc 1.95.x).
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # Caches the cargo registry plus `target/`. `key` is an extra
+      # discriminator: rust-cache already separates by OS and rustc version,
+      # but naming the OS makes the cache layout self-documenting and keeps a
+      # Windows `target/` from ever being restored into a Linux job.
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ci-${{ matrix.os }}
+
+      # --- G1 -----------------------------------------------------------------
+      - name: "G1 format: cargo fmt --check"
+        run: cargo fmt --check
+
+      # --- G2 -----------------------------------------------------------------
+      # `--all-targets` covers lib, bin, tests and benches; `-D warnings` makes
+      # warnings fatal, which is what the acceptance table requires.
+      - name: "G2 lint: cargo clippy --all-targets -- -D warnings"
+        run: cargo clippy --all-targets -- -D warnings
+
+      # --- G3 -----------------------------------------------------------------
+      # `#[ignore]`d live smoke tests are skipped here by design (no quota in
+      # CI). Every ignored test must carry a reason — see ACCEPTANCE.md §1.
+      - name: "G3 tests: cargo test"
+        run: cargo test
+
+      # --- G4 (M0 offline acceptance) ----------------------------------------
+      # planning/ACCEPTANCE.md §3: exactly three backends, in order
+      # agy, codex, claude. This step asserts the command *succeeds*; the
+      # printed rows are the reviewer's evidence in the run log.
+      #
+      # `--locked` is deliberately not used yet: Cargo.lock is not committed at
+      # the time this workflow was written. Once it is committed, add
+      # `cargo run --locked -- --list-backends` here to make CI reproducible.
+      - name: "G4 acceptance (M0): cargo run -- --list-backends"
+        run: cargo run -- --list-backends

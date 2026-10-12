@@ -183,7 +183,7 @@ pub fn agy_credential() -> Credential {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
-    use crate::testenv::EnvGuard;
+    use crate::testing::EnvGuard;
 
     #[test]
     fn codex_modes_are_classified_by_meaning_not_spelling() {
