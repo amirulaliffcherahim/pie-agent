@@ -35,6 +35,7 @@ pub mod provider;
 pub mod report;
 pub mod session;
 pub mod session_log;
+pub mod tui;
 
 /// Test-only helpers. Compiled out of every non-test build.
 #[cfg(test)]

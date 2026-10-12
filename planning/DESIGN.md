@@ -581,6 +581,19 @@ testable at all; a `KeyEvent` parameter would drag the terminal into every test.
 
 ### Frozen interfaces (so the layers can be built in parallel)
 
+**These are frozen as compiling code, not as prose.** `src/tui/{app,render,mod}.rs`
+landed first as a scaffold: the types, the field lists and the signatures below are
+committed, and the three stage bodies are `SCAFFOLD` stubs that compile and return
+truthfully (`reduce` → `Action::None`, `render` → nothing drawn, `run_session` →
+an explicit `Unsupported` error, never `Ok(())`).
+
+That ordering is deliberate and is `ACCEPTANCE.md` §1's first rule applied properly:
+with only the *prose* frozen, stage B's gate cannot compile until stage A's file
+exists, so "three parallel stages" would in fact be one stage followed by two — and
+the tempting workaround, letting each agent write its own copy of `App`, is how
+types drift and one stage's rewrite deletes another's work. Freezing the contract as
+code removes the race rather than writing a rule against it.
+
 ```rust
 pub enum Input { Char(char), Enter, Esc, Backspace, Up, Down, Left, Right, Tab, Ctrl(char) }
 pub enum Action { None, Quit, Submit, Cancel, ScrollUp, ScrollDown, OpenPicker,
@@ -588,8 +601,20 @@ pub enum Action { None, Quit, Submit, Cancel, ScrollUp, ScrollDown, OpenPicker,
 pub enum Status { Idle, Running, Done, Failed(String) }
 pub enum Entry { User(String), Assistant(String), Tool { name: String, state: ToolState }, Notice(String) }
 
-pub struct App { /* prompt, backend, model, session, status, transcript, tool_events,
-                    scroll, picker, should_quit */ }
+pub struct PickerItem { pub backend: String, pub model: String, pub label: String }
+pub struct Picker { pub items: Vec<PickerItem>, pub selected: usize }
+
+pub struct App {
+    pub prompt: String,    pub cursor: usize,
+    pub backend: String,   pub model: Option<String>,
+    pub session: String,   pub vendor_id: Option<String>,
+    pub status: Status,    pub transcript: Vec<Entry>,
+    pub tool_events: Vec<(String, ToolState)>,
+    pub scroll: u16,       pub last_usage: Option<Usage>,
+    pub picker: Option<Picker>, pub should_quit: bool,
+}
+
+pub const VENDOR_TOOL_NOTE: &str;   // the sentence that says the tools are the vendor's
 
 pub fn reduce(app: &mut App, input: Input) -> Action;
 pub fn apply_event(app: &mut App, event: &StreamEvent);
@@ -598,7 +623,76 @@ pub async fn run_session(app: &mut App, cfg: &Config) -> Result<()>;   // the th
 ```
 
 `reduce` and `apply_event` take and return only pie's own types. `Frame` is ratatui's
-and appears in exactly one signature.
+and appears in exactly one signature. `render` takes `&App`, never `&mut App`, so
+drawing cannot change state.
+
+Four fields are named here that an earlier draft left to prose, and each is load
+bearing: `cursor`, because `Char`/`Backspace`/`Left`/`Right` are defined by the
+position they edit; `vendor_id`, because the terminal event carries the vendor's
+conversation id and a TUI that discarded it would lose the id `--resume` needs;
+`last_usage`, because render must show what a turn cost and a partial terminal event
+must not blank it; and `Picker`/`PickerItem`, because picking a model has to produce a
+*backend and a model*, so a `Vec<String>` of labels would be unable to set `App::model`.
+
+### The keybinding table is the specification
+
+The frozen `Input → Action` mapping. Stage D asserts it row by row, and the help text
+is generated from it, so the table cannot drift from the behaviour:
+
+| Input | Action | State change |
+|---|---|---|
+| `Char(c)` | `None` | insert `c` at the cursor |
+| `Backspace` | `None` | delete the character before the cursor |
+| `Left` / `Right` | `None` | move the cursor, clamped to the prompt |
+| `Enter`, picker open | `PickerAccept` | highlight taken as the model; picker closed |
+| `Enter`, prompt submittable, `Idle` | `Submit` | prompt cleared, `Status::Running` |
+| `Enter`, otherwise | `None` | nothing |
+| `Tab` | `OpenPicker` | picker opened **empty**, for the caller to fill |
+| `Up` / `Down`, picker open | `PickerPrev` / `PickerNext` | highlight moved, clamped |
+| `Up` / `Down`, otherwise | `ScrollUp` / `ScrollDown` | scroll moved, never below zero |
+| `Esc`, a turn is running or a picker is open | `Cancel` | picker closed; status back to `Idle` |
+| `Esc`, nothing to cancel | `Quit` | `should_quit` |
+| `Ctrl('c')` | `Quit` | `should_quit` |
+| any other `Ctrl(..)` | `None` | nothing |
+
+Two deliberate choices. **`Enter` is refused unless the prompt has non-whitespace
+text**, so a turn is never spent on an empty prompt — the one keystroke a user can hit
+by accident that costs real subscription quota. And **`Up`/`Down` mean different
+things depending on the picker**, because the picker is modal; overloading them is what
+keeps the keymap small enough to document in full.
+
+### `apply_event`'s frozen behaviour
+
+| Event | Effect |
+|---|---|
+| `Init` | `conversation_id` → `App::vendor_id`; a `Notice` naming the conversation and its tool count |
+| `TextDelta` | appended to the last entry when it is already `Entry::Assistant`, else to a new one |
+| `ToolStep` | pushed to `App::tool_events` **and** the transcript, where the row carries `VENDOR_TOOL_NOTE` |
+| `Usage` | merged into `App::last_usage` via `Usage::merge` |
+| `Done` | `Status::Done`; pushes `text` as an assistant entry **only when nothing was streamed** |
+| `Other`, `Unparsed` | **ignored**: protocol noise, already recorded under `PIE_LOG`, and a `Notice` per line would fill the transcript with vendor chatter |
+
+Appending deltas rather than replacing is what makes streaming visible; one entry per
+delta would grow the transcript without bound on a long answer. The `Done` rule is the
+twin of `B21`'s fix on the backend side — a terminal event must not duplicate what has
+already been delivered.
+
+### Stages, and who owns which file
+
+| Stage | Owns | Gate |
+|---|---|---|
+| A state + reducer | `src/tui/app.rs`, `tests/tui_app.rs` | `cargo test --test tui_app` |
+| B render | `src/tui/render.rs`, `tests/tui_render.rs` | `cargo test --test tui_render` |
+| C loop + wiring | `src/tui/mod.rs`, `src/commands/tui.rs`, `tests/tui_loop.rs` | `cargo test --test tui_loop` |
+| D picker + keys | `src/tui/app.rs`, `tests/tui_app.rs` | `cargo test --test tui_app` |
+| G5 | a **real turn's** events through `apply_event`, asserting the rendered buffer | live, by hand |
+
+Each stage gate names the stage's **own** test binary. That is not boilerplate: in M5
+two of three stages shipped with a gate that could not fail them, because the gate ran
+a different stage's tests (`ACCEPTANCE.md` §8).
+
+`cli.rs`, `commands.rs` and `lib.rs` stay with the maintainer; stage C adds
+`src/commands/tui.rs` and the maintainer wires it, so no agent edits a shared file.
 
 ### Two constraints that shape the behaviour
 
