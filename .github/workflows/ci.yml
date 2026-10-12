@@ -98,6 +98,42 @@ jobs:
         with:
           key: ci-${{ matrix.os }}
 
+      # --- Gate-runner self-check (Windows only) -----------------------------
+      # The gate runner must itself be runnable. This is not paranoia: a UTF-8
+      # em-dash with no BOM made PowerShell 5.1 read scripts/qc.ps1 as
+      # Windows-1252 and fail to PARSE, so the Windows gate runner was broken
+      # on the primary platform while looking fine in an editor. Both checks
+      # below would have caught it before it was committed.
+      - name: "Gate runner self-check (parse + ASCII-only)"
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $failed = $false
+
+          # 1. It must parse under the Windows PowerShell that actually ships.
+          $errors = $null
+          $null = [System.Management.Automation.Language.Parser]::ParseFile(
+            'scripts/qc.ps1', [ref]$null, [ref]$errors)
+          if ($errors -and $errors.Count -gt 0) {
+            Write-Host 'scripts/qc.ps1 failed to parse:'
+            $errors | ForEach-Object { Write-Host "  $($_.Message)" }
+            $failed = $true
+          } else {
+            Write-Host 'scripts/qc.ps1 parses'
+          }
+
+          # 2. Pure ASCII, so the encoding above can never mangle it again.
+          $nonAscii = [System.IO.File]::ReadAllBytes('scripts/qc.ps1') |
+            Where-Object { $_ -gt 127 }
+          if ($nonAscii) {
+            Write-Host 'scripts/qc.ps1 contains non-ASCII bytes (keep it ASCII-only)'
+            $failed = $true
+          } else {
+            Write-Host 'scripts/qc.ps1 is ASCII-only'
+          }
+
+          if ($failed) { exit 1 }
+
       # --- G1 -----------------------------------------------------------------
       - name: "G1 format: cargo fmt --check"
         run: cargo fmt --check

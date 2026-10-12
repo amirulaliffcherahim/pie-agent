@@ -148,7 +148,7 @@ The gates are `planning/ACCEPTANCE.md` §1. Run them after every change:
 
 ```sh
 bash scripts/qc.sh          # Linux / WSL / macOS — G1 fmt, G2 clippy, G3 test, G4 acceptance
-pwsh scripts/qc.ps1         # Windows
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/qc.ps1   # Windows
 bash scripts/qc.sh --live   # adds G5, which SPENDS REAL SUBSCRIPTION QUOTA
 ```
 
