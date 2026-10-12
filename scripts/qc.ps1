@@ -17,7 +17,8 @@
     G4 is the milestone's offline acceptance command, one gate per milestone
     (M0: `cargo run -- --list-backends`, M1: `cargo test --test parse_agy`,
     M2: `cargo test --test parse_codex`, M3: `cargo test --test profile` and
-    `cargo run -- profile`). CI runs the same commands
+    `cargo run -- profile`, M4: `cargo run -- auth` and `cargo run -- usage`,
+    M5 stage A: `cargo test --test sessions`). CI runs the same commands
     (.github/workflows/ci.yml) so local and CI agree.
 
     FAIL-FAST: the first failing gate writes `FAIL: <gate>` to stderr and exits
@@ -149,7 +150,7 @@ $script:GatesRun++
 Write-Host 'PASS: G3b ignore reasons'
 
 # --- G4 (offline acceptance, one gate per milestone) ------------------------
-# The per-milestone acceptance commands from planning/ACCEPTANCE.md sections 3-5.
+# The per-milestone acceptance commands from planning/ACCEPTANCE.md sections 3-8.
 # G3 already runs every test binary, so these are partly redundant on purpose:
 # the point is that a milestone's own acceptance command is named and fails
 # individually, so a red gate says *which* milestone regressed rather than just
@@ -161,6 +162,9 @@ Invoke-Gate -Label 'G4 acceptance (M3 tests)' -Argv @('test', '--test', 'profile
 Invoke-Gate -Label 'G4 acceptance (M3 profile)' -Argv @('run', '--', 'profile')
 Invoke-Gate -Label 'G4 acceptance (M4 auth)' -Argv @('run', '--', 'auth')
 Invoke-Gate -Label 'G4 acceptance (M4 usage)' -Argv @('run', '--', 'usage')
+# M5 lands one gate per stage (ACCEPTANCE.md section 8), so a red gate names the
+# stage that broke: A persistence, then B continue, C compact, F switch.
+Invoke-Gate -Label 'G4 acceptance (M5 stage A)' -Argv @('test', '--test', 'sessions')
 
 # --- G5 (live acceptance) ---------------------------------------------------
 if ($Live) {

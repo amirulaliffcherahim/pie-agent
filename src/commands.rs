@@ -9,6 +9,7 @@ pub mod backends;
 pub mod models;
 pub mod print;
 pub mod profile;
+pub mod sessions;
 pub mod usage;
 
 use crate::cli::{Cli, Command};
@@ -34,6 +35,9 @@ pub async fn dispatch(cli: &Cli, cfg: &Config) -> Result<()> {
         // not part of its input. Deliberate — it keeps the command provably
         // free of any spawn.
         Some(Command::Profile) => profile::run(),
+        // Likewise no `cfg`: `pie sessions` reads pie's own index and nothing
+        // else, so it is quota-free and spawn-free by construction.
+        Some(Command::Sessions) => sessions::run(),
         None => match cli.print.as_deref() {
             Some(prompt) => print::run(cfg, cli, prompt).await,
             None => print_help(),

@@ -344,7 +344,7 @@ names the stage that broke rather than the whole milestone.
 | Stage | Command | Shape |
 |---|---|---|
 | A persist | `cargo test --test sessions` | a turn writes `<id>.jsonl` plus an index row; a write failure never fails the turn |
-| B continue | `cargo test --test sessions` | `--continue` picks the newest session for provider+cwd; `--session <id>` targets one; a vendor id that no longer exists re-bootstraps instead of erroring |
+| B continue | `cargo test --test sessions` | `--continue` picks the newest session for provider+cwd; `--session <id>` targets one; a vendor id that no longer exists re-bootstraps instead of erroring; **the session id is surfaced after a turn**, as `[resume] <vendor-id>` already is, because otherwise there is no way to target `--session <id>` without first running `pie sessions` |
 | C compact | `cargo test --test sessions` | extractive: head + state block + tail; spawns nothing (quota-free); stored rows untouched; the block sits after the persona |
 | D ocr | `cargo test --test ocr` and `cargo run -- ocr <fixture>` | a reachable stub is cached by content hash; an unreachable itsmini is a stated error, never an empty success |
 | E mcp | `cargo test --test mcp` | a stdio handshake: `initialize`, then `tools/list` returns exactly one tool named `ocr` |

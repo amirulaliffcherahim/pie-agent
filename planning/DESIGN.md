@@ -475,6 +475,11 @@ transcripts live beside it rather than inside it:
 
 A turn row: `{ts, provider, model, prompt, response, conversation_id, usage, ok, stop_reason}`. A session is identified by **pie's own id**, not the vendor's, because the vendor id differs per backend and is lost on a switch; the vendor id is recorded per row so a resume can still pass it back.
 
+Two things the fixed key set does *not* say, pinned here after stage A raised them:
+
+- **A failed turn's reason lives in `stop_reason`**, paired with `ok: false`. The nine keys have no separate error field, and inventing a tenth would fork the schema that `usage.jsonl` already froze.
+- **The index is append-only frames, last-wins by id.** A crash mid-write therefore loses at most the newest frame, and the per-session transcript files stay the source of truth — the index is a lookup convenience that can always be rebuilt from them.
+
 **Nothing here spends quota** — a session write is local I/O — and a write failure
 must never fail a turn that otherwise succeeded.
 

@@ -97,6 +97,12 @@ pub enum Command {
     /// Reads pie's own files only: no vendor CLI is spawned and no session row
     /// is written, so this costs nothing to run.
     Profile,
+
+    /// List the recorded sessions, newest first.
+    ///
+    /// Reads pie's own `sessions/index.jsonl` only: nothing is spawned, no quota
+    /// is spent, and the command writes no session row of its own.
+    Sessions,
 }
 
 #[cfg(test)]
@@ -158,6 +164,10 @@ mod tests {
         assert!(matches!(
             Cli::try_parse_from(["pie", "profile"]).unwrap().command,
             Some(Command::Profile)
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["pie", "sessions"]).unwrap().command,
+            Some(Command::Sessions)
         ));
     }
 

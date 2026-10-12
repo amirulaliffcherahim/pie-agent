@@ -14,6 +14,9 @@ pub const AGENTS_FILE: &str = "AGENTS.md";
 /// The durable-memory directory, relative to `PIE_HOME` (M3).
 pub const MEMORY_DIR: &str = "memory";
 
+/// The session-store directory, relative to `PIE_HOME` (M5).
+pub const SESSIONS_DIR: &str = "sessions";
+
 /// Root of pie's state directory. Honours `PIE_HOME`, else `~/.pie`.
 pub fn pie_home() -> PathBuf {
     if let Some(v) = non_empty_env("PIE_HOME") {
@@ -92,6 +95,14 @@ pub fn memory_dir() -> PathBuf {
     pie_home().join(MEMORY_DIR)
 }
 
+/// `$PIE_HOME/sessions/` — transcripts and their index (M5).
+///
+/// Beside `usage.jsonl`, never inside it: that log is frozen and shared with the
+/// earlier JS implementation (`DESIGN.md` §11).
+pub fn sessions_dir() -> PathBuf {
+    pie_home().join(SESSIONS_DIR)
+}
+
 /// The legacy `~/.pie/auth.json` written by the earlier JS implementation.
 ///
 /// pie deliberately never reads or writes this: it holds extracted OAuth
@@ -122,6 +133,10 @@ mod tests {
         assert_eq!(
             usage_log(),
             PathBuf::from("/tmp/pie-test-home").join("usage.jsonl")
+        );
+        assert_eq!(
+            sessions_dir(),
+            PathBuf::from("/tmp/pie-test-home").join("sessions")
         );
     }
 
@@ -159,6 +174,19 @@ mod tests {
         assert_eq!(PROFILE_FILE, "profile.toml");
         assert_eq!(AGENTS_FILE, "AGENTS.md");
         assert_eq!(MEMORY_DIR, "memory");
+    }
+
+    /// M5's store lives beside the frozen log, never inside it.
+    #[test]
+    fn the_session_store_sits_beside_the_frozen_log() {
+        let _env = EnvGuard::set(&[("PIE_HOME", Some("/tmp/pie-home"))]);
+        let home = PathBuf::from("/tmp/pie-home");
+        assert_eq!(sessions_dir(), home.join("sessions"));
+        assert_eq!(SESSIONS_DIR, "sessions");
+        assert!(
+            !usage_log().starts_with(sessions_dir()),
+            "transcripts must not be written into the frozen log's namespace"
+        );
     }
 
     #[test]

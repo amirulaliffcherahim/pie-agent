@@ -16,7 +16,8 @@
 # G4 is the milestone's offline acceptance command, one gate per milestone:
 # M0 `cargo run -- --list-backends`, M1 `cargo test --test parse_agy`,
 # M2 `cargo test --test parse_codex`, M3 `cargo test --test profile` +
-# `cargo run -- profile`. CI runs the same commands, through this
+# `cargo run -- profile`, M4 `cargo run -- auth` + `cargo run -- usage`,
+# M5 stage A `cargo test --test sessions`. CI runs the same commands, through this
 # same script (.github/workflows/ci.yml), so local and CI cannot drift apart.
 # Add the next milestone's command when it lands. `tests/acceptance.rs` asserts
 # what the M0 table actually prints, because this gate only sees the exit status.
@@ -141,7 +142,7 @@ check_ignore_reasons() {
 run_gate 'G3b ignore reasons' check_ignore_reasons
 
 # --- G4 (offline acceptance, one gate per milestone) ------------------------
-# The per-milestone acceptance commands from planning/ACCEPTANCE.md sections 3-5.
+# The per-milestone acceptance commands from planning/ACCEPTANCE.md sections 3-8.
 # G3 already runs every test binary, so these are partly redundant on purpose:
 # the point is that a milestone's own acceptance command is named and fails
 # individually, so a red gate says *which* milestone regressed rather than just
@@ -153,6 +154,9 @@ run_gate 'G4 acceptance (M3 tests)' cargo test --test profile
 run_gate 'G4 acceptance (M3 profile)' cargo run -- profile
 run_gate 'G4 acceptance (M4 auth)' cargo run -- auth
 run_gate 'G4 acceptance (M4 usage)' cargo run -- usage
+# M5 lands one gate per stage (ACCEPTANCE.md section 8), so a red gate names the
+# stage that broke: A persistence, then B continue, C compact, F switch.
+run_gate 'G4 acceptance (M5 stage A)' cargo test --test sessions
 
 # --- G5 (live acceptance) ---------------------------------------------------
 if [ "$LIVE" -eq 1 ]; then

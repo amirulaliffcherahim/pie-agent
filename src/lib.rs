@@ -30,6 +30,7 @@ pub mod process;
 pub mod profile;
 pub mod provider;
 pub mod report;
+pub mod session;
 pub mod session_log;
 
 /// Test-only helpers. Compiled out of every non-test build.

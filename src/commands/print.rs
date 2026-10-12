@@ -6,7 +6,11 @@
 //! progress steps, which we surface on stderr.
 //!
 //! Every turn is recorded in the session log, success or failure, so `pie
-//! usage` and the future "know me" job (M7) have real data to work from.
+//! usage` and the future "know me" job (M7) have real data to work from. The
+//! same turn is also written to the session *store* (`DESIGN.md` §11) so the
+//! conversation — not just its cost — survives the turn; that write is
+//! best-effort, because a turn the user paid quota for must never be reported as
+//! failed because a disk write did not land.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,6 +22,7 @@ use crate::config::Config;
 use crate::error::{PieError, Result};
 use crate::profile::Profile;
 use crate::provider::{self, ChatRequest, StreamEvent};
+use crate::session::{Session, TurnRow};
 use crate::session_log::{self, SessionLogRow};
 
 /// `pie -p <PROMPT> [--model provider/model]`
@@ -38,6 +43,11 @@ pub async fn run(cfg: &Config, cli: &Cli, prompt: &str) -> Result<()> {
     let request = build_request(cli, prompt, model.as_deref(), &profile);
     let started = Instant::now();
     let streamed = Arc::new(AtomicBool::new(false));
+
+    // Minted before the turn, so a turn that fails is recorded in the session it
+    // would have been recorded in had it succeeded. Minting touches no disk: a
+    // run that never reaches a turn leaves nothing behind.
+    let mut session = Session::start(&backend, &request.cwd);
 
     let outcome = {
         let mut sink = make_sink(cli.json, Arc::clone(&streamed));
@@ -75,6 +85,15 @@ pub async fn run(cfg: &Config, cli: &Cli, prompt: &str) -> Result<()> {
                 elapsed_ms,
                 &turn.status,
             ));
+
+            // Then the conversation itself, in its own file: the frozen log
+            // records what the turn cost, the transcript records what was said.
+            session.record_best_effort(&TurnRow::from_turn(
+                &backend,
+                model.as_deref().unwrap_or_default(),
+                prompt,
+                &turn,
+            ));
             Ok(())
         }
         Err(error) => {
@@ -85,6 +104,15 @@ pub async fn run(cfg: &Config, cli: &Cli, prompt: &str) -> Result<()> {
                 model.as_deref().unwrap_or_default(),
                 error.kind(),
                 elapsed_ms,
+            ));
+
+            // …and in the session too: what was asked when nothing came back is
+            // the half of a session that a later resume needs most.
+            session.record_best_effort(&TurnRow::from_error(
+                &backend,
+                model.as_deref().unwrap_or_default(),
+                prompt,
+                error.kind(),
             ));
             Err(error)
         }
