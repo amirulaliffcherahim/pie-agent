@@ -30,6 +30,19 @@ async fn run() -> i32 {
         Err(error) => return fail(&error),
     };
 
+    // Warned here rather than only in `doctor`: an inherited `PIE_STRIP_ENV=0`
+    // (shell profile, parent process) used to leave `pie -p` running with the
+    // credential scrub silently disabled, and the warning was visible only to
+    // someone who happened to run `pie doctor`. stderr, so stdout stays a
+    // protocol channel.
+    if !cfg.scrub_enabled() {
+        eprintln!(
+            "pie: WARNING: PIE_STRIP_ENV is set, so API-key variables are NOT stripped from \
+             child processes. A vendor CLI may switch from your subscription to \
+             pay-as-you-go billing. Unset PIE_STRIP_ENV to restore the scrub."
+        );
+    }
+
     match commands::dispatch(&cli, &cfg).await {
         Ok(()) => 0,
         Err(error) => fail(&error),

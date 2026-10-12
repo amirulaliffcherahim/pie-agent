@@ -50,6 +50,10 @@ pub const PROMPT_CAP_HINT: &str =
 /// Provider id, also the `--model` prefix.
 pub const BACKEND: &str = "agy";
 
+/// Hint shown when agy has no usable subscription credential.
+pub const NO_SUBSCRIPTION_HINT: &str =
+    "agy is subscription-locked; pie drives its own Google login and never an API key";
+
 /// Statuses agy reports for a turn that worked. Anything else is a failure.
 pub const SUCCESS_STATUSES: [&str; 2] = ["SUCCESS", "OK"];
 
@@ -501,6 +505,11 @@ impl Provider for Agy {
         req: &ChatRequest,
         sink: &mut (dyn FnMut(StreamEvent) + Send),
     ) -> Result<TurnOutcome> {
+        // Before anything expensive: refuse to run without a subscription
+        // credential. codex has had this gate since M2; agy did not, so nothing
+        // stopped a turn when agy had no usable login.
+        require_subscription()?;
+
         let mut plan = build_plan(cfg, req)?;
         // `build_plan` carries the configured bin *name*; spawning the resolved
         // path instead keeps the child identical on every platform (and turns a
@@ -539,6 +548,46 @@ impl Agy {
             scrub: cfg.scrub_keys(cfg.scrub_enabled()),
             timeout,
         })
+    }
+}
+
+/// Refuse to run agy without a subscription credential.
+///
+/// agy manages its own OAuth internally and exposes no token file, so the only
+/// signal available is the presence of its state directory (`knowledge/agy.md`).
+/// That makes this gate deliberately **weaker** than codex's, which reads a real
+/// credential file:
+///
+/// * `Absent` -> refuse. No state directory means agy is not logged in, so the
+///   turn would fail anyway; refusing turns an opaque spawn failure into a clear
+///   message.
+/// * `Unreadable` -> **proceed with a warning**. Classification is a heuristic
+///   over a directory layout agy controls, and a heuristic must not authorise a
+///   hard refusal: a layout change in a future agy would break a working install.
+///
+/// The load-bearing control against a billing switch is therefore not this gate
+/// but the environment scrub (`config::BUILTIN_SCRUB`), which is deterministic
+/// and does not depend on guessing where a vendor keeps its state.
+pub fn require_subscription() -> Result<()> {
+    match auth::agy_credential() {
+        Credential::Subscription { .. } => Ok(()),
+        Credential::ApiKeyOnly { evidence } => Err(PieError::NoSubscription {
+            backend: BACKEND.to_string(),
+            hint: format!("{NO_SUBSCRIPTION_HINT} (saw {evidence})"),
+        }),
+        Credential::Absent => Err(PieError::AuthRequired {
+            backend: BACKEND.to_string(),
+            hint: "run `agy` interactively and complete the Google login".to_string(),
+        }),
+        Credential::Unreadable(why) => {
+            tracing::warn!(
+                backend = BACKEND,
+                detail = %why,
+                "agy credential could not be classified; proceeding, because this heuristic is \
+                 not load-bearing - the environment scrub is what prevents a billing switch"
+            );
+            Ok(())
+        }
     }
 }
 

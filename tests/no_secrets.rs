@@ -48,6 +48,9 @@ const ALLOWED_SAMPLES: &[&str] = &[
     "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9",
     // Proves a stored token never reaches debug output (auth.rs).
     "sk-this-must-never-be-echoed-0123456789",
+    // Proves the redactor catches a Google-API-key shape embedded after `=`
+    // (process.rs). Synthetic: the alphabet is sequential, not a real key.
+    "AIzaSyD-1234567890abcdefghijklmnopqrs",
     // This file's own leak probe.
     PROBE,
 ];
@@ -56,6 +59,86 @@ const ALLOWED_SAMPLES: &[&str] = &[
 /// forbidden-prefix table and the probe. The trade-off is that a key could hide
 /// here — so this file stays small, and the behavioural checks below cover it.
 const SELF: &str = "tests/no_secrets.rs";
+
+/// The redactor and this scanner must agree on what a credential looks like.
+///
+/// They had drifted: this file declared `AIza`, `sk-ant-`, `sk-proj-`, `xoxb-`
+/// and `-----BEGIN` forbidden, while `process::SECRET_PREFIXES` recognised none
+/// of them, so the mechanism invariant I3 rests on was weaker than the rule it
+/// exists to uphold. Asserting the property here means a future addition to
+/// either list cannot silently leave the other behind.
+#[test]
+fn every_forbidden_prefix_is_also_redactable() {
+    let mut unredactable = Vec::new();
+
+    for (prefix, what) in FORBIDDEN_PREFIXES {
+        // Both shapes that occur in real diagnostics, not just a bare prefix.
+        for candidate in [
+            format!("{prefix}AAAAbbbb1111CCCC"),
+            format!("key={prefix}AAAAbbbb1111CCCC"),
+        ] {
+            let redacted = pie::process::redact(&candidate);
+            if redacted.contains("AAAAbbbb1111CCCC") {
+                unredactable.push(format!(
+                    "{what} (`{prefix}`) in {candidate:?} -> {redacted:?}"
+                ));
+            }
+        }
+    }
+
+    assert!(
+        unredactable.is_empty(),
+        "these declared-forbidden prefixes are not redacted:\n  {}",
+        unredactable.join("\n  ")
+    );
+}
+
+/// Invariant I11 is about a **path**, not about a command, so a command-based
+/// test is the wrong shape: it only proves that the three commands it happens to
+/// run do not read the file. This asserts that no *production* source outside
+/// `paths.rs` names `legacy_auth_file`, which also covers the turn path (`-p`)
+/// that cannot be exercised without spending real subscription quota.
+///
+/// Note the asymmetry with the credential-literal check above, which deliberately
+/// does scan test code (a real key pasted into a test is still a leak). Here the
+/// concern is a *reader*, and a test that references the path in order to assert
+/// it is left untouched is not a reader, so test modules are skipped.
+#[test]
+fn nothing_outside_paths_rs_names_the_legacy_auth_file() {
+    let mut offenders = Vec::new();
+
+    for path in all_sources() {
+        let rel = relative(&path);
+        // The definition, plus its own doc comment and test.
+        if rel == "src/paths.rs" {
+            continue;
+        }
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        // Convention in this crate: the `#[cfg(test)] mod tests` block is last,
+        // so anything after it is test code.
+        let mut in_tests = false;
+
+        for (index, line) in text.lines().enumerate() {
+            if line.starts_with("mod tests") || line.starts_with("pub mod tests") {
+                in_tests = true;
+            }
+            if in_tests {
+                continue;
+            }
+            // A doc comment that merely links to it is not a reader.
+            let is_comment = line.trim_start().starts_with("//");
+            if line.contains("legacy_auth_file") && !is_comment {
+                offenders.push(format!("{}:{}", rel, index + 1));
+            }
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "production code outside paths.rs reads the legacy auth file (I11): {offenders:?}"
+    );
+}
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -160,8 +243,13 @@ fn no_credential_shaped_literal_exists_in_the_tree() {
 
                 // Case 1: a known credential prefix inside a real literal.
                 // The length guard keeps the redaction prefix table in
-                // `process.rs` (`"sk-"`, `"ghp_"`, `"eyJ"`) from tripping this.
-                if literal.chars().count() > 8 {
+                // `process.rs` (`"sk-"`, `"ghp_"`, `"eyJ"`) from tripping this,
+                // and an exact match on a declared prefix is a *declaration*
+                // rather than a secret: `"-----BEGIN"` alone is the prefix table
+                // entry, whereas a real PEM key continues with the key type and
+                // base64.
+                let is_declared_prefix = FORBIDDEN_PREFIXES.iter().any(|(p, _)| literal == *p);
+                if literal.chars().count() > 8 && !is_declared_prefix {
                     if let Some((needle, what)) =
                         FORBIDDEN_PREFIXES.iter().find(|(n, _)| literal.contains(n))
                     {
@@ -303,7 +391,16 @@ fn the_legacy_auth_file_is_left_untouched() {
     let original = r#"{"providers":{"codex":{"access_token":"legacy-do-not-touch"}}}"#;
     std::fs::write(&legacy, original).unwrap();
 
-    for args in [["auth"], ["usage"], ["doctor"]] {
+    for args in [
+        // Commands that are safe to run here. `models` is deliberately absent: a
+        // cache miss hits the network, and this test is about secret handling,
+        // not model catalogs. The static check covers the `models` and `-p` paths
+        // properly, because it is path-based rather than command-based.
+        ["auth"],
+        ["usage"],
+        ["doctor"],
+        ["--list-backends"],
+    ] {
         let _ = Command::new(env!("CARGO_BIN_EXE_pie"))
             .args(args)
             .env("PIE_HOME", home.path())

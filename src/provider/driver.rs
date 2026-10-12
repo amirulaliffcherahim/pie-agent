@@ -75,9 +75,12 @@ pub async fn drive(
         let mut on_line = |line: &str| {
             if let Some(event) = router.on_line(line) {
                 if let StreamEvent::Unparsed(raw) = &event {
+                    // Redacted: this is a vendor stdout line, and with
+                    // `PIE_LOG=debug` it goes straight to stderr. A line like
+                    // `OPENAI_API_KEY=sk-…` used to be logged verbatim (I10).
                     tracing::debug!(
                         backend = %backend,
-                        line = %crate::error::truncate(raw, 200),
+                        line = %crate::error::truncate(&process::redact(raw), 200),
                         "stdout line was not JSON"
                     );
                 }

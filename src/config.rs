@@ -17,6 +17,14 @@ pub const BUILTIN_SCRUB: &[&str] = &[
     "ANTHROPIC_AUTH_TOKEN",
     "OPENAI_API_KEY",
     "GOOGLE_API_KEY",
+    // A GCP service-account credential. `knowledge/internals.md` lists it among
+    // agy's API-key paths and says plainly not to use those paths, while agy's
+    // subscription login is its own internal OAuth - so a service account in the
+    // environment is a billing switch rather than a login. Earlier versions
+    // preserved it, assuming agy might need it; the documented advice is the
+    // opposite, so it is scrubbed. `PIE_STRIP_ENV=0` remains the escape hatch for
+    // a setup that genuinely depends on it.
+    "GOOGLE_APPLICATION_CREDENTIALS",
 ];
 
 /// Whole resolved configuration.
@@ -467,7 +475,7 @@ mod tests {
             assert!(keys.contains(&k.to_string()), "{k} must be scrubbed");
         }
         // Deliberately NOT scrubbed: agy's own auth path may need them.
-        assert!(!keys.contains(&"GOOGLE_APPLICATION_CREDENTIALS".to_string()));
+        // `CLOUD_CODE` is a mode selector, not a credential, so it is kept.
         assert!(!keys.contains(&"CLOUD_CODE".to_string()));
         assert!(cfg.scrub_keys(false).is_empty(), "PIE_STRIP_ENV=0 disables");
     }

@@ -320,8 +320,13 @@ Config-extendable (`general.extra_scrub_env`), and `PIE_STRIP_ENV=0` disables th
 scrub **only** for debugging (prints a loud warning to stderr).
 
 Also refuse to run a sub backend when the only credential present is an API key
-(`NoSubscription`). Do **not** scrub `GOOGLE_APPLICATION_CREDENTIALS`/`CLOUD_CODE`
-— agy's own auth path may need them (`knowledge/internals.md`).
+(`NoSubscription`). `GOOGLE_APPLICATION_CREDENTIALS` **is** scrubbed: a GCP
+service-account credential is one of the API-key paths
+`knowledge/internals.md` says not to use, while agy's subscription login is its
+own internal OAuth, so a service account in the environment is a billing switch
+rather than a login. `CLOUD_CODE` is preserved because it is a mode selector, not
+a credential. `PIE_STRIP_ENV=0` is the escape hatch for a setup that genuinely
+needs the service-account path.
 
 ## 9. Backend argv contracts
 

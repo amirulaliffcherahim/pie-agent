@@ -12,6 +12,7 @@ use std::time::Duration;
 use crate::config::Config;
 use crate::error::{truncate, Result};
 use crate::paths;
+use crate::process;
 use crate::provider;
 use crate::session_log::now_millis;
 use crate::VERSION;
@@ -66,6 +67,10 @@ async fn table(cfg: &Config) -> Result<Vec<(String, String)>> {
 
         let version = provider::driver::probe_version(&*p, cfg, VERSION_PROBE_TIMEOUT)
             .await
+            // Redacted before it is printed or written into the version snapshot:
+            // a CLI whose `--version` echoed a credential would otherwise be
+            // persisted into ~/.pie/cache/versions.json (I10).
+            .map(|raw| process::redact(&raw))
             .unwrap_or_else(|| "unknown".to_string());
 
         let auth = p.auth_status(cfg).await;

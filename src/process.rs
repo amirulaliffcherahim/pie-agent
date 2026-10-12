@@ -235,14 +235,18 @@ pub async fn kill_tree(pid: Option<u32>) {
 
     #[cfg(windows)]
     {
-        let _ = Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
+        let mut cmd = Command::new("taskkill");
+        cmd.args(["/PID", &pid.to_string(), "/T", "/F"])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .creation_flags(CREATE_NO_WINDOW)
-            .status()
-            .await;
+            .creation_flags(CREATE_NO_WINDOW);
+        // Even a trusted OS helper gets the scrub. The invariant is about what
+        // any child can observe, not about which children we happen to trust.
+        for key in crate::config::BUILTIN_SCRUB {
+            cmd.env_remove(key);
+        }
+        let _ = cmd.status().await;
     }
 
     #[cfg(not(windows))]
@@ -251,13 +255,15 @@ pub async fn kill_tree(pid: Option<u32>) {
         // so a negative pid signals the whole tree, not just the direct child.
         let group = format!("-{pid}");
         for signal in ["-TERM", "-KILL"] {
-            let _ = Command::new("kill")
-                .args([signal, &group])
+            let mut cmd = Command::new("kill");
+            cmd.args([signal, &group])
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .await;
+                .stderr(Stdio::null());
+            for key in crate::config::BUILTIN_SCRUB {
+                cmd.env_remove(key);
+            }
+            let _ = cmd.status().await;
             if signal == "-TERM" {
                 // Give the tree a moment to exit cleanly before escalating.
                 tokio::time::sleep(Duration::from_millis(250)).await;
@@ -347,12 +353,22 @@ pub fn redact(input: &str) -> String {
 }
 
 /// Length at which an unbroken character run is treated as a secret.
-const OPAQUE_RUN_MIN: usize = 60;
+///
+/// 40 rather than 60: Google API keys are 39 characters and GitHub PATs are 40,
+/// so a 60-character threshold missed an entire class of real credentials. The
+/// bias is deliberate — over-redacting a diagnostic costs a little readability,
+/// under-redacting leaks a credential into a log (`RISKS.md` §10).
+const OPAQUE_RUN_MIN: usize = 40;
 
-/// Replace every unbroken 60+ character run of `[A-Za-z0-9._-]`.
+/// Replace every unbroken run of `[A-Za-z0-9._-+/=]` that is long enough to be
+/// a secret.
+///
+/// `+`, `/` and `=` are included because standard base64 uses them; without them
+/// a single base64 credential is split at the first `+` or `/` into fragments
+/// that each fall under the threshold and survive.
 fn collapse_long_runs(input: &str) -> String {
     fn is_run_char(c: char) -> bool {
-        c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.'
+        c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+' | '/' | '=')
     }
 
     fn flush(out: &mut String, run: &mut String) {
@@ -378,12 +394,47 @@ fn collapse_long_runs(input: &str) -> String {
     out
 }
 
+/// Prefixes that identify a credential.
+///
+/// This list must remain a **superset** of the forbidden-prefix set that the
+/// `no_secrets` scanner enforces; `tests/no_secrets.rs` asserts exactly that, so
+/// the redactor can never be weaker than the rule it exists to uphold. It was
+/// weaker: the scanner declared `AIza`, `sk-ant-`, `sk-proj-`, `xoxb-` and
+/// `-----BEGIN` forbidden while the redactor recognised none of them.
+pub const SECRET_PREFIXES: &[&str] = &[
+    "sk-", // OpenAI / Anthropic style
+    "sk-ant-",
+    "sk-proj-",
+    "AIza",       // Google API key
+    "AKIA",       // AWS access key id
+    "ya29.",      // Google OAuth access token
+    "ghp_",       // GitHub personal access token
+    "gho_",       // GitHub OAuth token
+    "xoxb-",      // Slack bot token
+    "hf_",        // Hugging Face token
+    "eyJ",        // JWT header
+    "-----BEGIN", // PEM-encoded private key
+];
+
+/// Whether a whitespace-delimited token looks like it carries a credential.
+///
+/// The prefix may appear **anywhere** in the token, not only at its start:
+/// `key=AIzaSy…` and `"token":"sk-…"` are the shapes that actually occur, and a
+/// start-only check let both through. A prefix must be followed by at least 8
+/// characters so a bare marker (`sk-` in prose, `-----BEGIN` alone) is not
+/// mistaken for a secret.
 fn has_secret_prefix(token: &str) -> bool {
-    const PREFIXES: [&str; 5] = [
-        "sk-", "eyJ", // JWT header
-        "ghp_", "gho_", "ya29.",
-    ];
-    PREFIXES.iter().any(|p| token.starts_with(p)) || token.eq_ignore_ascii_case("bearer")
+    if token.eq_ignore_ascii_case("bearer") {
+        return true;
+    }
+
+    SECRET_PREFIXES.iter().any(|prefix| {
+        token.find(prefix).is_some_and(|at| {
+            // `find` returns a byte offset at a char boundary, and every prefix
+            // is ASCII, so this slice cannot split a character.
+            token[at + prefix.len()..].chars().count() >= 8
+        })
+    })
 }
 
 /// Bounded, redacted rendering of a stderr tail for an error message.
@@ -441,6 +492,69 @@ mod tests {
     fn short_ordinary_text_is_untouched() {
         let s = "codex exec failed with exit 1 in C:/Users/amiru/Local/Code/pie";
         assert_eq!(redact(s), s, "no false positives on paths and prose");
+    }
+
+    /// Every prefix the `no_secrets` scanner declares forbidden must also be
+    /// redactable. The two lists had drifted: the scanner forbade `AIza`,
+    /// `sk-ant-`, `sk-proj-`, `xoxb-` and `-----BEGIN`, and the redactor
+    /// recognised none of them, so the mechanism I3 rests on was weaker than the
+    /// rule it exists to uphold.
+    #[test]
+    fn redacts_every_declared_secret_prefix() {
+        for prefix in SECRET_PREFIXES {
+            // Both shapes that actually occur in diagnostics.
+            for candidate in [
+                format!("{prefix}AAAAbbbb1111CCCC"),
+                format!("key={prefix}AAAAbbbb1111CCCC"),
+                format!("\"token\":\"{prefix}AAAAbbbb1111CCCC\""),
+            ] {
+                let redacted = redact(&candidate);
+                assert!(
+                    !redacted.contains("AAAAbbbb1111CCCC"),
+                    "prefix `{prefix}` survives redaction in {candidate:?} -> {redacted:?}"
+                );
+            }
+        }
+    }
+
+    /// A bare marker is not a secret. Without the `>= 8 chars after the prefix`
+    /// rule, prose mentioning `sk-` would be redacted.
+    #[test]
+    fn a_bare_prefix_without_a_value_is_not_redacted() {
+        let text = "the names all start with sk- and eyJ by convention";
+        assert_eq!(redact(text), text);
+    }
+
+    /// Regression: standard base64 uses `+`, `/` and `=`. They were not run
+    /// characters, so one credential was split at the first `+` or `/` into
+    /// fragments that each fell under the threshold and survived intact.
+    #[test]
+    fn redacts_base64_containing_plus_slash_and_equals() {
+        let blob = format!(
+            "{a}+{b}/{c}=",
+            a = "A".repeat(20),
+            b = "b".repeat(20),
+            c = "C".repeat(20)
+        );
+        assert!(blob.chars().count() > OPAQUE_RUN_MIN);
+
+        let redacted = redact(&format!("payload {blob} end"));
+        assert!(
+            !redacted.contains(&blob),
+            "base64 blob survived: {redacted}"
+        );
+        assert!(redacted.contains("payload") && redacted.contains("end"));
+    }
+
+    /// Regression for the 39-character Google API key: below the old 60-char
+    /// threshold, and unprefixed by anything the redactor knew about.
+    #[test]
+    fn redacts_a_google_api_key_embedded_after_an_equals_sign() {
+        let redacted = redact("GOOGLE_API_KEY key=AIzaSyD-1234567890abcdefghijklmnopqrs");
+        assert!(
+            !redacted.contains("AIzaSyD-1234567890abcdefghijklmnopqrs"),
+            "google key survived: {redacted}"
+        );
     }
 
     #[test]
