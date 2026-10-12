@@ -1,0 +1,200 @@
+# pie — Acceptance & QC gates
+
+How each milestone is judged "done". Criteria are **frozen before implementation**
+and may only change by editing this file in the same commit that changes behavior.
+`ROADMAP.md` says what to build; this file says how we prove it was built.
+
+Scope: **M0–M2**. Milestones M3+ get their own sections when they start.
+
+## 1. The five gates
+
+Every milestone must pass all five before it is committed as complete.
+
+| Gate | Command | Pass condition |
+|---|---|---|
+| G1 Format | `cargo fmt --check` | no diff |
+| G2 Lint | `cargo clippy --all-targets -- -D warnings` | zero warnings (warnings are errors) |
+| G3 Tests | `cargo test` | all pass, 0 ignored-without-reason |
+| G4 Offline acceptance | the milestone's `Acceptance` commands below | exact expected output |
+| G5 Live acceptance | the milestone's `Live` commands below | exact expected shape, real CLI |
+
+G5 spends real subscription quota. Approved models only: **`agy/gemini-3.8-flash`**
+and **`codex/gpt-6-luna`** — do not substitute a pricier model. G5 is skippable
+only by explicit user decision, and a skipped G5 marks the milestone
+`offline-verified` in the run log rather than `done`.
+
+G1–G3 are the standing QC loop: run them after **every** code change, not only at
+the end of a milestone.
+
+## 2. Global invariants (checked at every gate, every milestone)
+
+These are cross-cutting gates from `ROADMAP.md`. Each has an assertion somewhere:
+
+| # | Invariant | Where proven |
+|---|---|---|
+| I1 | No console window ever appears from a child process | `proc.rs` sets `CREATE_NO_WINDOW`; unit test asserts the flag constant is applied |
+| I2 | API-key env vars never reach a child | `env_hygiene` test: deny-list removed, `GOOGLE_APPLICATION_CREDENTIALS` preserved |
+| I3 | No secret is ever logged or echoed | codex token redaction test; grep the tree for `access_token`/`token` in `println!` |
+| I4 | Prompt argv is bounded | `prompt_cap` test: >20 000 chars for agy ⇒ `PromptTooLong`, exit 2 |
+| I5 | A bad stdout line never aborts a run | tolerant-parse test: padding garbage + unknown events around a valid `result` still succeeds |
+| I6 | No panic on external input | `#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]` outside `#[cfg(test)]` |
+| I7 | `models`/`auth`/`doctor`/`--list-backends` spend zero model quota | code review + no `stream()` call on those paths |
+| I8 | Backend version is recorded for drift detection | `doctor` prints each CLI's `--version`; value written to `~/.pie/cache/versions.json` |
+| I9 | Subscription-only auth, never an API key | codex `auth_mode` gate + no key injection; `NoSubscription` error path exists |
+
+## 3. M0 — Scaffold + provider trait
+
+**Acceptance**
+
+```
+cargo run -- --list-backends
+```
+Expected — one line per backend, exactly these three, in this order:
+
+```
+agy     agy      1.3.2      ready          (or needs-login / binary-missing)
+codex   codex    0.162.0    needs-login|ready
+claude  claude   unknown    no-subscription
+```
+
+- `claude` must appear even though disabled (it is future-proofing).
+- No API/HTTP backend may appear (they are commented out).
+
+**Checks**
+
+- [ ] `Provider` is object-safe and the registry returns `Vec<Box<dyn Provider>>`
+- [ ] `Capabilities` reports `tool_loop = false` for agy and codex
+- [ ] `agy` reports `stdin_prompt = false`, `max_prompt_argv = 20000`
+- [ ] `~/.pie/config.toml` missing ⇒ defaults, no error; malformed ⇒ `PieError::Config`, exit 2
+- [ ] precedence test: flag beats `PIE_*` env beats `config.toml` beats default
+- [ ] no `unwrap`/`expect` outside tests (I6)
+- [ ] `openrouter.rs`/`deepseek.rs` present but fully commented out, not in the registry
+
+**Live:** none. M0 makes no model calls.
+
+## 4. M1 — agy backend (delegate) — LIVE
+
+**Acceptance (offline, fixtures from `knowledge/agy.md`)**
+
+```
+cargo test --test parse_agy
+```
+- `init` line ⇒ `StreamEvent::Init` with `conversation_id` + tools
+- `step_update` / `agent_response` ⇒ `TextDelta("OK\n")`
+- `step_update` / `tool` ⇒ `ToolStep { state: Active|Done|Error }`
+- `result` line ⇒ `Done { status: "SUCCESS" }` + `TurnOutcome`
+- usage mapping: `thinking_tokens` → `thinking_tokens`, `cache_read_tokens` → `cache_read_tokens`
+- `status: "ERROR"` ⇒ `PieError::Backend`, exit 1
+- garbage line + unknown event around a valid `result` ⇒ still succeeds (I5)
+
+**Live**
+
+```
+cargo run -- -p --model agy/gemini-3.8-flash "hi"
+cargo run -- usage agy
+```
+
+- the `hi` turn prints a short reply and exits 0
+- one row is appended to `~/.pie/usage.jsonl` with `provider:"agy"`,
+  `model:"gemini-3.8-flash"`, `ok:true`, non-zero `input_tokens` (§7 schema of DESIGN.md)
+- `usage agy` prints quota buckets with remaining fraction + reset time, and the
+  run makes **no** model call (it is a slash expansion)
+- `--model` without `--effort` is auto-filled from config (`medium`), never errors
+
+**Checks**
+
+- [ ] `--disable-slash-commands` present for turns, **absent** for `/usage` (deliberate asymmetry)
+- [ ] `--print-timeout <N>s` always passed; `0` means wait for completion
+- [ ] model catalog read from `agy models` and cached with 24h TTL; a cache hit makes no CLI call
+- [ ] hidden spawn — no console flash on the live run (I1)
+- [ ] timeout ⇒ process tree killed, `PieError::Timeout`, exit 5 (test with a tiny timeout)
+
+## 5. M2 — codex backend (delegate) — LIVE
+
+**Acceptance (offline, fixtures from `knowledge/codex.md`)**
+
+```
+cargo test --test parse_codex
+```
+- `thread.started` ⇒ `Init { conversation_id: Some(thread_id) }`
+- `turn.started` ⇒ no user-visible event (or `Other`)
+- `item.completed` + `agent_message` ⇒ `TextDelta`
+- `turn.completed` ⇒ `Usage` + `Done`
+- `cached_input_tokens` → `cache_read_tokens`; `reasoning_output_tokens` → `thinking_tokens`
+- non-agent item types (reasoning, tool calls) ⇒ `ToolStep`/`Other`, never `TextDelta`
+
+**Live**
+
+```
+cargo run -- -p --model codex/gpt-6-luna "hi"
+cargo run -- usage codex
+```
+
+- `hi` turn prints a reply, exits 0, appends a `provider:"codex"` row to the session log
+- `usage codex` prints 5h + weekly buckets from `wham/usage`
+- the token appears in **no** output, error, or log line (I3 — grep the captured output)
+- refusal path: with an API-key-only credential the backend reports
+  `NoSubscription`, exit 3, instead of silently billing (I9)
+
+**Checks**
+
+- [ ] never spawns `codex.cmd`; resolves `node <…>/codex/bin/codex.js` (or native `codex.exe`) (DESIGN §9)
+- [ ] `--approve-for-me` and `--sandbox` are never both passed (they are mutually exclusive)
+- [ ] `--skip-git-repo-check` always passed (pie runs in non-repo workspaces)
+- [ ] auth gate reads `auth_mode` from `~/.codex/auth.json` and requires subscription
+- [ ] `~/.pie/auth.json` (legacy, holds extracted tokens) is never read — assert with a test that the path is untouched/no reader exists
+
+## 6. Bug protocol
+
+A "bug" is any behavior that contradicts `ROADMAP.md`, `DESIGN.md`, or a
+knowledge file. Process, in order:
+
+1. **Record** — a one-line description + the exact command that reproduces it.
+2. **Severity** — `blocker` (milestone gate fails) · `major` (wrong answer,
+   quota/secret risk) · `minor` (cosmetic, protocol noise).
+3. **Failing test first** — add a test that fails for the stated reason. No fix
+   without a test. This is the regression guard.
+4. **Fix** — smallest change that makes the test pass.
+5. **Re-run G1–G3**, and G5 if the fix touched a backend path.
+6. **Commit** as `fix:` (PATCH per `VERSIONING.md`), message naming the symptom.
+
+Severity handling:
+
+| Severity | Action |
+|---|---|
+| blocker | stop the milestone; do not commit anything else until green |
+| major | fix inside the milestone; it cannot be marked done with an open major |
+| minor | may be deferred, but must be logged in the run log with a reason |
+
+Bug categories to actively hunt before marking a milestone done:
+
+- **Parser fragility** — CLI auto-update changes a field/event (RISKS §3)
+- **Protocol drift** — unknown event treated as fatal instead of forwarded
+- **Secret leak** — token in stdout/stderr/log/error message (RISKS §10)
+- **Quota burn** — a probe that spends model tokens (RISKS §7, §13)
+- **Hang** — no deadline, or a child that outlives its parent (RISKS §6)
+- **Env leak** — API key reaching a child, flipping it to pay-as-you-go (RISKS §10)
+- **Panic** — `unwrap`/`expect`/index-out-of-bounds on external input
+
+## 7. Independent verification
+
+Each milestone, after G1–G3 are green and before it is called done, dispatch an
+independent reviewer subagent with **no shared context** and give it: the design
+contract, the CLI knowledge file, and the diff. It must be told to try to refute
+the milestone, not to confirm it. Findings come back as rows with severity; each
+is either fixed (with a test) or logged as accepted with a written reason.
+
+The reviewer must not be the same agent that wrote the code.
+
+## 8. Run log
+
+Appended as gates pass. Evidence = command + observed result, not a claim.
+
+| Milestone | G1 | G2 | G3 | G4 | G5 | Verdict | Evidence |
+|---|---|---|---|---|---|---|---|
+| M0 | — | — | — | — | n/a | not started | — |
+| M1 | — | — | — | — | — | not started | — |
+| M2 | — | — | — | — | — | not started | — |
+
+Verdict values: `done` (all applicable gates) · `offline-verified` (G5 skipped by
+user decision) · `blocked` (a gate fails) · `not started`.

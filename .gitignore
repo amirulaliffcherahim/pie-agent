@@ -1,0 +1,20 @@
+# Rust build output
+/target/
+**/*.rs.bk
+
+# Cargo.lock IS committed for this binary crate (reproducible builds).
+
+# Editor / OS noise
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+Desktop.ini
+
+# Local scratch (never part of the repo)
+/.scratch/
+/tmp/
+
+# pie runtime state lives OUTSIDE the repo in ~/.pie (or $PIE_HOME).
+# If a developer points PIE_HOME at the workspace, do not commit it.
+/.pie-home/
