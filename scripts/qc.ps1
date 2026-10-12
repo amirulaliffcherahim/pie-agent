@@ -272,6 +272,12 @@ Invoke-Gate -Label 'G4 acceptance (M6 tui_render)' -Argv @('test', '--test', 'tu
 Invoke-Gate -Label 'G4 acceptance (M6 tui_loop)' -Argv @('test', '--test', 'tui_loop')
 Invoke-Gate -Label 'G4 acceptance (M6 tui_keys)' -Argv @('test', '--test', 'tui_keys')
 
+# M7's stages each have their own binary, for the same attribution reason as M6's.
+Invoke-Gate -Label 'G4 acceptance (M7 learn)' -Argv @('test', '--test', 'learn')
+Invoke-Gate -Label 'G4 acceptance (M7 consolidate)' -Argv @('test', '--test', 'consolidate')
+Invoke-Gate -Label 'G4 acceptance (M7 schedule)' -Argv @('test', '--test', 'schedule')
+Invoke-Gate -Label 'G4 acceptance (M7 commands)' -Argv @('test', '--test', 'memory_cmd')
+
 # --- G4 (M6 tui non-TTY) ----------------------------------------------------
 # ACCEPTANCE section 9: `pie tui` on a non-TTY stdin must fail with a clear message
 # rather than emitting escape codes into a pipe.

@@ -220,6 +220,53 @@ pub enum Step {
     Catalog(Vec<PickerItem>),
 }
 
+/// A command pie handles itself, recognised in the text the user submitted
+/// (`DESIGN.md` §16).
+///
+/// Deliberately a property of the *submitted text*, not a new [`Input`]: M6's keymap is
+/// frozen, and a slash command is not a keystroke. This is what [`Action::Submit`] was
+/// specified as "the caller decides what a submission means" for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocalCommand {
+    /// `/memory` — what pie learned, with provenance, and the id that undoes it.
+    Memory,
+    /// A leading-slash word pie does not implement.
+    ///
+    /// Recognised rather than passed through on purpose: a leading `/` in this UI means
+    /// "pie command", and handing `/hlep` to a vendor CLI would spend real subscription
+    /// quota answering a typo.
+    Unknown(String),
+}
+
+/// The pie-local command this text names, if any.
+///
+/// `None` means "not a slash command", which is the ordinary case. Pure: no I/O, no
+/// backend, so what a submission means is asserted without a terminal.
+pub fn local_command(text: &str) -> Option<LocalCommand> {
+    let rest = text.trim_start().strip_prefix('/')?;
+    // Only the first word; `/memory extra` is `/memory`. A command with no name at all
+    // (`/` on its own) is answered as unknown rather than as a prompt.
+    let word = rest.split_whitespace().next().unwrap_or_default();
+    Some(match word {
+        "memory" => LocalCommand::Memory,
+        other => LocalCommand::Unknown(other.to_string()),
+    })
+}
+
+/// Fold a local command's report into the transcript.
+///
+/// The status goes back to [`Status::Idle`] here, and that is not cosmetic: `reduce`
+/// sets [`Status::Running`] when it accepts a submission, and no turn runs for a local
+/// command — so without this the spinner would run for ever and the only way back would
+/// be an `Esc` that cancels a turn that does not exist.
+///
+/// The lines are handed in rather than read here so this stays the pure half: the read
+/// lives in [`crate::commands::memory::local_lines`].
+pub fn apply_local_command(app: &mut App, lines: Vec<String>) {
+    app.status = Status::Idle;
+    app.transcript.extend(lines.into_iter().map(Entry::Notice));
+}
+
 /// What the loop must do that [`act`] cannot.
 ///
 /// The same split as [`Action`], one level up: state changes happen in [`act`]
@@ -236,6 +283,9 @@ pub enum Effect {
     Quit,
     /// Run this prompt as a turn.
     Run(String),
+    /// Handle this pie-local command in-process: no backend is reached and nothing is
+    /// spent (`DESIGN.md` §16).
+    Local(LocalCommand),
     /// Abort the turn in flight.
     Abort,
     /// Read the model catalogs for the picker.
@@ -427,10 +477,19 @@ fn act_on_key(app: &mut App, in_flight: &mut InFlight, input: Input) -> Effect {
 ///
 /// `submitted` is only consulted for [`Action::Submit`]: the reducer has already
 /// cleared the prompt by then, so the caller hands the text over instead.
+///
+/// A submission that names a pie-local command becomes [`Effect::Local`] rather than
+/// [`Effect::Run`], which is the branch that keeps `/memory` from being sent to a
+/// vendor CLI as a prompt: routing it through the ordinary submit path is
+/// `DESIGN.md` §16's rule, and recognising it *here* means both the recognition and the
+/// decision are reachable by a test.
 pub fn effect_for(action: Action, submitted: String) -> Effect {
     match action {
         Action::Quit => Effect::Quit,
-        Action::Submit => Effect::Run(submitted),
+        Action::Submit => match local_command(&submitted) {
+            Some(command) => Effect::Local(command),
+            None => Effect::Run(submitted),
+        },
         Action::Cancel => Effect::Abort,
         Action::OpenPicker => Effect::Catalog,
         // State changes only: these have already happened inside `reduce`.
@@ -838,6 +897,13 @@ pub async fn run_session(app: &mut App, cfg: &Config) -> Result<()> {
                         turn_tx.clone(),
                     )));
                 }
+            }
+            // A pie-local command is answered in-process, in the loop the submission
+            // arrived on: no turn is spawned, no backend is reached and no quota is
+            // spent (`DESIGN.md` §16, `RISKS.md` §13). The read is the only I/O, and it
+            // is the same rendering `pie memory show` prints.
+            Effect::Local(command) => {
+                apply_local_command(app, crate::commands::memory::local_lines(&command));
             }
             Effect::Abort => {
                 if let Some(handle) = running.take() {

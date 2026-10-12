@@ -104,6 +104,32 @@ pub struct Cli {
     pub command: Option<Command>,
 }
 
+/// Sub-actions of `pie memory`.
+#[derive(Debug, Subcommand)]
+pub enum MemoryAction {
+    /// Show what was learned, in projection order, with provenance.
+    Show,
+    /// Undo one learning pass, named by the id `pie learn` printed.
+    Revert {
+        /// The undo id, as printed by `pie learn` or `pie memory show`.
+        #[arg(value_name = "ID")]
+        id: String,
+    },
+}
+
+/// Sub-actions of `pie schedule`.
+#[derive(Debug, Subcommand)]
+pub enum ScheduleAction {
+    /// What is due, what last ran, and the budget state. Spends nothing.
+    Status,
+    /// Run one job now, budget permitting.
+    Run {
+        /// The job to run. `learn` is the only one pie ships.
+        #[arg(value_name = "JOB")]
+        job: String,
+    },
+}
+
 /// Everything that is not a one-shot prompt.
 #[derive(Debug, Subcommand)]
 pub enum Command {
@@ -154,6 +180,46 @@ pub enum Command {
     /// `pie -p`, so a turn taken here costs the same and is learned from the same
     /// way (`DESIGN.md` §12).
     Tui,
+
+    /// Learn from your own history, and update what pie remembers about you.
+    ///
+    /// **Quota-free by default.** Extraction is rule-based (`DESIGN.md` §16): it counts
+    /// recurrences and recognises explicit preference statements, so a plain
+    /// `pie learn` spawns nothing and spends nothing. Reading the vendor CLIs' own
+    /// history is a separate opt-in (`[jobs] read_vendor_history`), and asking a model
+    /// to review the candidates needs both `--model` and a configured token budget.
+    Learn {
+        /// Decide and report, but write nothing and spend nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Print every candidate extracted, not only the decisions taken.
+        #[arg(long)]
+        report: bool,
+        /// Ask a model to review the candidates. Opt-in, and refused without a budget.
+        #[arg(long, value_name = "PROVIDER/MODEL")]
+        model: Option<String>,
+    },
+
+    /// Show what pie learned, or undo one learning pass.
+    ///
+    /// Reads and writes pie's own `$PIE_HOME/memory` only, so it resolves no backend
+    /// and spends nothing by construction rather than by discipline — the same argument
+    /// `pie sessions` makes.
+    Memory {
+        /// What to do; `pie memory` with no subcommand shows what was learned.
+        #[command(subcommand)]
+        action: Option<MemoryAction>,
+    },
+
+    /// What background jobs are due, and what budget is left.
+    ///
+    /// Opt-in on purpose: the default cadence is `never` and the default budget is zero,
+    /// so nothing runs and nothing is spent unless it is asked for (`RISKS.md` §13).
+    Schedule {
+        /// What to do; `pie schedule` with no subcommand reports status.
+        #[command(subcommand)]
+        action: Option<ScheduleAction>,
+    },
 
     /// Convert an image or scanned PDF to text through itsmini.
     ///
@@ -288,6 +354,82 @@ mod tests {
     #[test]
     fn unknown_flags_are_rejected() {
         assert!(Cli::try_parse_from(["pie", "--nope"]).is_err());
+    }
+
+    /// The M7 command surface parses, including the two nested sub-actions and the
+    /// bare forms that mean "show me".
+    #[test]
+    fn the_m7_commands_parse() {
+        let cli = Cli::try_parse_from(["pie", "learn", "--dry-run", "--report"]).unwrap();
+        match cli.command {
+            Some(Command::Learn {
+                dry_run,
+                report,
+                model,
+            }) => {
+                assert!(dry_run && report);
+                assert!(model.is_none());
+            }
+            other => panic!("wrong command: {other:?}"),
+        }
+
+        // A bare `pie learn` must NOT be the same as `--dry-run`: the real run writes.
+        match Cli::try_parse_from(["pie", "learn"]).unwrap().command {
+            Some(Command::Learn { dry_run, .. }) => assert!(!dry_run),
+            other => panic!("wrong command: {other:?}"),
+        }
+
+        // `pie memory` with no sub-command means "show", and naming one still parses.
+        assert!(matches!(
+            Cli::try_parse_from(["pie", "memory"]).unwrap().command,
+            Some(Command::Memory { action: None })
+        ));
+        match Cli::try_parse_from(["pie", "memory", "revert", "abc123"])
+            .unwrap()
+            .command
+        {
+            Some(Command::Memory {
+                action: Some(MemoryAction::Revert { id }),
+            }) => assert_eq!(id, "abc123"),
+            other => panic!("wrong command: {other:?}"),
+        }
+
+        assert!(matches!(
+            Cli::try_parse_from(["pie", "schedule"]).unwrap().command,
+            Some(Command::Schedule { action: None })
+        ));
+        match Cli::try_parse_from(["pie", "schedule", "run", "learn"])
+            .unwrap()
+            .command
+        {
+            Some(Command::Schedule {
+                action: Some(ScheduleAction::Run { job }),
+            }) => assert_eq!(job, "learn"),
+            other => panic!("wrong command: {other:?}"),
+        }
+    }
+
+    /// `pie schedule run` without a job is a parser error rather than a silent status
+    /// report: `run` names something specific, and a command that quietly means something
+    /// else is how a user spends a budget they did not intend to.
+    #[test]
+    fn schedule_run_requires_a_job() {
+        assert!(Cli::try_parse_from(["pie", "schedule", "run"]).is_err());
+    }
+
+    /// `--model` is the opt-in that can spend, so it must be spelled explicitly and must
+    /// not be inferable from a bare flag.
+    #[test]
+    fn learn_only_asks_for_a_model_when_one_is_named() {
+        match Cli::try_parse_from(["pie", "learn", "--model", "agy/gemini-3.8-flash"])
+            .unwrap()
+            .command
+        {
+            Some(Command::Learn { model, .. }) => {
+                assert_eq!(model.as_deref(), Some("agy/gemini-3.8-flash"))
+            }
+            other => panic!("wrong command: {other:?}"),
+        }
     }
 
     /// The two M5 selectors parse. Whether they may be *combined* is decided in

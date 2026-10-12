@@ -250,6 +250,12 @@ run_gate 'G4 acceptance (M6 tui_render)' cargo test --test tui_render
 run_gate 'G4 acceptance (M6 tui_loop)' cargo test --test tui_loop
 run_gate 'G4 acceptance (M6 tui_keys)' cargo test --test tui_keys
 
+# M7's stages each have their own binary, for the same attribution reason as M6's.
+run_gate 'G4 acceptance (M7 learn)' cargo test --test learn
+run_gate 'G4 acceptance (M7 consolidate)' cargo test --test consolidate
+run_gate 'G4 acceptance (M7 schedule)' cargo test --test schedule
+run_gate 'G4 acceptance (M7 commands)' cargo test --test memory_cmd
+
 # --- G4 (M6 tui non-TTY) ----------------------------------------------------
 # ACCEPTANCE section 9: `pie tui` on a non-TTY stdin must fail with a clear message
 # rather than emitting escape codes into a pipe.

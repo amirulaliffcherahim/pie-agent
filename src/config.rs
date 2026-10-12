@@ -39,6 +39,8 @@ pub struct Config {
     pub codex: Codex,
     /// Anthropic Claude Code CLI backend (future-proof, no sub on this machine).
     pub claude: Claude,
+    /// Background-job settings (M7/M8). Opt-in: nothing runs by default.
+    pub jobs: Jobs,
 }
 
 /// Settings that are not backend-specific.
@@ -179,6 +181,72 @@ pub enum CodexQuotaProbe {
     Http,
 }
 
+/// How often a background job may run, as configured.
+///
+/// Deliberately its own enum rather than reusing [`crate::schedule::Cadence`]. The two
+/// answer different questions: this one is a *serialisation* surface (`config.toml`
+/// spells it); that one is a *decision* surface (`due()` takes it). Keeping them apart
+/// means a config-file typo cannot change what `due()` means, and
+/// [`JobCadence::to_schedule`] is an exhaustive match, so a cadence cannot be added to
+/// one enum and forgotten in the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum JobCadence {
+    /// **The default.** Nothing is ever due, so nothing runs and nothing is spent.
+    #[default]
+    Never,
+    /// Once a day.
+    Daily,
+    /// Once a month.
+    Monthly,
+}
+
+impl JobCadence {
+    /// The scheduling decision this configuration means.
+    pub fn to_schedule(self) -> crate::schedule::Cadence {
+        match self {
+            JobCadence::Never => crate::schedule::Cadence::Never,
+            JobCadence::Daily => crate::schedule::Cadence::Daily,
+            JobCadence::Monthly => crate::schedule::Cadence::Monthly,
+        }
+    }
+}
+
+/// Background-job settings (M7/M8).
+///
+/// `ROADMAP.md`'s cross-cutting list requires background jobs to be **budgeted** and
+/// **opt-in**, and `RISKS.md` §13 is the reason: an unbudgeted summarisation job can
+/// silently spend premium subscription quota. Both are properties of these defaults
+/// rather than of a comment, which is what makes them assertable:
+///
+/// * `learn_cadence = "never"` — a job does not run because it was installed.
+/// * `learn_budget_tokens = 0` — **no backend pie drives is cheap.** Every one is
+///   subscription-locked, so PLAN §11b's "default to a cheap/local model" has nothing
+///   to name, and the honest default is to make **no model call at all**. M7's
+///   extraction is rule-based for exactly this reason; a model-based consolidation is
+///   an opt-in extra, and a budget of `0` makes `check_budget` refuse *before* anything
+///   is spawned.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Jobs {
+    /// How often the learn job may run.
+    pub learn_cadence: JobCadence,
+    /// Token budget for one **window** — a single cadence interval, not one run.
+    ///
+    /// Per-window rather than per-run on purpose, and this is the maintainer's ruling on
+    /// an ambiguity stage C reported: the ledger records what a window spent, so a second
+    /// run — including an explicit `pie schedule run` — spends the *remainder*
+    /// (`ACCEPTANCE.md` §15). A per-run budget would make the ceiling a function of how
+    /// many times the user typed a command. `0` means it may not spend at all.
+    pub learn_budget_tokens: u64,
+    /// Whether the learn job may read the vendor CLIs' own history stores.
+    ///
+    /// Off by default, read-only when on (`RISKS.md` §15). pie's own sessions are
+    /// sufficient for M7; reading `~/.gemini`, `~/.codex` or `~/.claude` is a decision
+    /// the user makes deliberately, not a side effect of enabling the job.
+    pub read_vendor_history: bool,
+}
+
 /// Anthropic Claude Code CLI settings. Disabled: no subscription on this machine.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
@@ -273,6 +341,35 @@ impl Config {
                 other => {
                     return Err(PieError::Config(format!(
                         "PIE_CODEX_QUOTA_PROBE must be http|off, got `{other}`"
+                    )))
+                }
+            };
+        }
+        if let Some(v) = env_non_empty("PIE_JOBS_LEARN_CADENCE") {
+            self.jobs.learn_cadence = match v.to_ascii_lowercase().as_str() {
+                "never" => JobCadence::Never,
+                "daily" => JobCadence::Daily,
+                "monthly" => JobCadence::Monthly,
+                other => {
+                    return Err(PieError::Config(format!(
+                        "PIE_JOBS_LEARN_CADENCE must be never|daily|monthly, got `{other}`"
+                    )))
+                }
+            };
+        }
+        if let Some(v) = env_non_empty("PIE_JOBS_LEARN_BUDGET_TOKENS") {
+            self.jobs.learn_budget_tokens = parse_num(&v, "PIE_JOBS_LEARN_BUDGET_TOKENS")?;
+        }
+        // Deliberately accepts only an explicit truthy value rather than anything
+        // non-empty: this switch is what lets a job read the user's private CLI
+        // history, so `PIE_JOBS_READ_VENDOR_HISTORY=0` must mean off, not "set, so on".
+        if let Some(v) = env_non_empty("PIE_JOBS_READ_VENDOR_HISTORY") {
+            self.jobs.read_vendor_history = match v.to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" | "on" => true,
+                "0" | "false" | "no" | "off" => false,
+                other => {
+                    return Err(PieError::Config(format!(
+                        "PIE_JOBS_READ_VENDOR_HISTORY must be a boolean, got `{other}`"
                     )))
                 }
             };
@@ -624,5 +721,109 @@ mod tests {
             5_000,
             "0 means unlimited from the capability side, so config applies"
         );
+    }
+
+    /// The cross-cutting requirement, as a property of the defaults rather than a note.
+    ///
+    /// `ROADMAP.md` requires background jobs to be budgeted and opt-in, and
+    /// `RISKS.md` §13 says why. Asserting the *defaults* is the point: a job that runs
+    /// because it was installed, or that has a budget it can spend, fails these even if
+    /// every option is individually settable.
+    #[test]
+    fn background_jobs_are_off_and_unbudgeted_until_asked_for() {
+        let jobs = Config::default().jobs;
+        assert_eq!(
+            jobs.learn_cadence,
+            JobCadence::Never,
+            "a job must not run because it happens to be installed"
+        );
+        assert_eq!(
+            jobs.learn_budget_tokens, 0,
+            "the default path must make no model call: no backend pie drives is cheap"
+        );
+        assert!(
+            !jobs.read_vendor_history,
+            "reading the user's private CLI history is opt-in (RISKS section 15)"
+        );
+
+        // …and a zero budget really does refuse, which ties the default to the
+        // schedule module's gate rather than leaving "budgeted" as a comment.
+        assert!(
+            crate::schedule::check_budget(&crate::schedule::Budget::new(0), 1).is_err(),
+            "a zero budget must refuse a one-token job, not merely allow none in theory"
+        );
+    }
+
+    /// The two cadence enums must not drift: a cadence added to one and forgotten in
+    /// the other would make `config.toml` spell something `due()` cannot mean. The
+    /// mapping is an exhaustive match, so the compiler enforces totality; this asserts
+    /// the mapping is *meaningful*, which totality alone does not.
+    #[test]
+    fn the_configured_cadence_means_what_the_scheduler_thinks_it_means() {
+        assert_eq!(
+            JobCadence::Never.to_schedule(),
+            crate::schedule::Cadence::Never
+        );
+        assert_eq!(
+            JobCadence::Daily.to_schedule(),
+            crate::schedule::Cadence::Daily
+        );
+        assert_eq!(
+            JobCadence::Monthly.to_schedule(),
+            crate::schedule::Cadence::Monthly
+        );
+
+        // A cadence that mapped to `Never` would silently disable the job it names.
+        assert!(
+            JobCadence::Daily.to_schedule().interval_ms().is_some(),
+            "`daily` must map to something the scheduler can schedule"
+        );
+        assert!(
+            JobCadence::Monthly.to_schedule().interval_ms().is_some(),
+            "`monthly` must map to something the scheduler can schedule"
+        );
+    }
+
+    /// Each job setting can be turned on from the environment, and each is validated
+    /// rather than guessed.
+    #[test]
+    fn the_job_settings_read_from_the_environment() {
+        // Guards are scoped: `EnvGuard` is not re-entrant and panics if taken twice on
+        // one thread (bug B24).
+        {
+            let _env = EnvGuard::set(&[
+                ("PIE_JOBS_LEARN_CADENCE", Some("DAILY")),
+                ("PIE_JOBS_LEARN_BUDGET_TOKENS", Some("42000")),
+                ("PIE_JOBS_READ_VENDOR_HISTORY", Some("true")),
+            ]);
+            let mut cfg = Config::default();
+            cfg.apply_env().unwrap();
+            assert_eq!(cfg.jobs.learn_cadence, JobCadence::Daily);
+            assert_eq!(cfg.jobs.learn_budget_tokens, 42_000);
+            assert!(cfg.jobs.read_vendor_history);
+        }
+
+        // An explicit false must mean off rather than "set, therefore on": this switch
+        // is what exposes the user's private CLI history.
+        {
+            let _env = EnvGuard::set(&[("PIE_JOBS_READ_VENDOR_HISTORY", Some("0"))]);
+            let mut cfg = Config::default();
+            cfg.jobs.read_vendor_history = true;
+            cfg.apply_env().unwrap();
+            assert!(!cfg.jobs.read_vendor_history, "`0` must turn it off");
+        }
+
+        for (value, blamed) in [
+            ("sometimes", "PIE_JOBS_LEARN_CADENCE"),
+            ("maybe", "PIE_JOBS_READ_VENDOR_HISTORY"),
+        ] {
+            let _env = EnvGuard::set(&[(blamed, Some(value))]);
+            let mut cfg = Config::default();
+            let err = cfg.apply_env().unwrap_err();
+            assert!(
+                err.to_string().contains(blamed),
+                "a bad `{blamed}` must name itself, got: {err}"
+            );
+        }
     }
 }

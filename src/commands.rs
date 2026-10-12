@@ -6,16 +6,19 @@
 
 pub mod auth;
 pub mod backends;
+pub mod learn;
 pub mod mcp;
+pub mod memory;
 pub mod models;
 pub mod ocr;
 pub mod print;
 pub mod profile;
+pub mod schedule;
 pub mod sessions;
 pub mod tui;
 pub mod usage;
 
-use crate::cli::{Cli, Command};
+use crate::cli::{Cli, Command, MemoryAction, ScheduleAction};
 use crate::config::Config;
 use crate::error::{PieError, Result};
 
@@ -47,6 +50,37 @@ pub async fn dispatch(cli: &Cli, cfg: &Config) -> Result<()> {
         // It refuses to start without a terminal, so this arm is safe to reach
         // from a pipe.
         Some(Command::Tui) => tui::run(cfg).await,
+        // `pie learn` is the one M7 command that takes `cfg`, because it is the one that
+        // can reach a provider. It is quota-free unless `--model` is given, and `--model`
+        // is refused without a configured budget *before* anything spawns.
+        Some(Command::Learn {
+            dry_run,
+            report,
+            model,
+        }) => {
+            learn::run(
+                cfg,
+                &learn::Options {
+                    dry_run: *dry_run,
+                    report: *report,
+                    model: model.clone(),
+                },
+            )
+            .await
+        }
+        // No `cfg`, and that is the point: `pie memory` reads and writes pie's own memory
+        // directory and resolves no backend, so "spends nothing" is a property of its
+        // inputs rather than a promise about its behaviour.
+        Some(Command::Memory { action }) => match action {
+            Some(MemoryAction::Revert { id }) => memory::revert(id),
+            _ => memory::show(),
+        },
+        // `status` is quota-free; `run` goes through `schedule::run_job`, which consults
+        // the budget *before* spawning and refuses under the shipped zero budget.
+        Some(Command::Schedule { action }) => match action {
+            Some(ScheduleAction::Run { job }) => schedule::run(cfg, Some(job)).await,
+            _ => schedule::run(cfg, None).await,
+        },
         // And no `cfg` here either: `pie ocr` reads the itsmini base URL from the
         // environment at call time, so it needs nothing resolved first.
         Some(Command::Ocr {

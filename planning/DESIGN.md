@@ -924,6 +924,13 @@ pub struct Candidate {
     pub hits: u32, pub last_seen_ms: u64,
 }
 
+pub struct MinedTurn {
+    pub session_id: String, pub turn_index: usize, pub source: Source,
+    pub prompt: String, pub answer: String, pub ok: bool,
+    pub ts: u64,          // epoch millis, read from the stored row
+}
+
+pub fn mine_sessions(sessions_root: &Path) -> Result<Vec<MinedTurn>>;   // pie's own store only
 pub fn extract(turns: &[MinedTurn]) -> Vec<Candidate>;          // pure: no spawn, no clock
 pub fn consolidate(existing: &MemoryDoc, candidates: &[Candidate], now_ms: u64) -> Consolidation;
 pub fn apply(consolidation: &Consolidation, home: &Path) -> Result<Journal>;  // the revert handle
@@ -934,6 +941,29 @@ pub fn due(last_run_ms: Option<u64>, cadence: Cadence, now_ms: u64) -> bool;   /
 pub struct Budget { pub max_tokens: u64, pub spent: u64 }
 pub fn check_budget(budget: &Budget, estimate: u64) -> Result<()>;            // refuses BEFORE spawning
 ```
+
+Three things the first freeze left implicit and stage A had to decide. They are contract
+now, because each changes what a *report* means (`DESIGN.md` §16's own reason for writing
+facts down rather than deciding them silently):
+
+* **`MinedTurn` carries `ts`.** The first version had no timestamp, while requiring
+  `last_seen_ms` to come "from the turn, never from a clock read" — an unsatisfiable
+  pair. The only honest options were a clock read (`extract` must stay pure), a constant
+  (which would make every candidate look ancient to decay), or a timestamp on the turn.
+  Stage A added the field and **reported it rather than quietly reading a clock**, which
+  is the behaviour the "report, never silently deviate" rule exists to produce.
+* **`hits` counts turns, not occurrences.** One mention repeated three times in one turn
+  is one observation. "A habit seen five times" has to mean five separate turns, or a
+  single verbose prompt outranks a real pattern.
+* **`Provenance` names one observation, and it is the newest one** consistent with
+  `last_seen_ms`, ties broken by `(session_id, turn_index)`. A merged candidate has many
+  observations and one provenance field, so which one it names has to be a rule rather
+  than an accident of iteration order — the same reason the output is a total order.
+
+**Ranking is a total order**, so output is independent of input order and two runs are
+byte-identical: `(confirmed desc, hits desc, kind, text)`, where `confirmed` counts the
+`ok` turns. Without the `confirmed` term a candidate seen only in failures would outrank
+one seen in successes, contradicting `MinedTurn::ok`'s own documentation.
 
 Two rules carried over from M6 because they are what made M6 testable: **`extract` and
 `due` take the clock as a parameter and never read it**, and **nothing in `learn.rs` or
@@ -970,6 +1000,63 @@ pie schedule [status|run <JOB>]       # what is due, what last ran, and the budg
 
 All three are quota-free under the default config. `pie learn --model b/m` is the opt-in
 model consolidation, and is refused without a configured budget.
+
+### What stage B had to decide, now contract rather than memory
+
+* **On disk:** `$PIE_HOME/memory/learned.md`, the undo handle at
+  `$PIE_HOME/memory/learned.journal`, and a scratch `learned.md.tmp`. Two choices carry
+  their own justification. The journal is deliberately **not** `.md`, because
+  `profile.rs` includes only files whose extension is `md` (`MEMORY_EXTENSION`, asserted
+  with a `notes.txt` control) — a JSON undo handle named `.md` would be concatenated
+  into the persona and sent to a vendor on every turn. And the write is
+  scratch-then-**rename**, so a crash leaves a stale `.tmp` that the projection ignores
+  rather than a half-written persona.
+* **`Consolidation`'s three vectors hold rendered *lines*, not candidates.** `apply` is
+  handed no document, so only text carries the merged `hits`/confidence. That is a
+  shape consequence, not a preference.
+* **`Journal` has no `existed` flag.** An empty document therefore restores as absent.
+  The two are indistinguishable in the projection, so the ambiguity is harmless — but it
+  is stated rather than left for someone to discover from a `revert` that recreated a
+  file they had deleted.
+* **`MemoryDoc::head` is the learned document's preamble, not the head of the
+  projection.** `apply` may not write `profile.toml` or `AGENTS.md` at all, so prefix
+  stability is a property of the **assembled projection**, and that is where it is
+  asserted — a test comparing only the files on disk would miss a reordering done inside
+  the assembly.
+* **`hits` merges by `max`, never by sum.** The same sessions are re-mined every day, so
+  a sum would inflate without bound and a fact's confidence would be a function of how
+  long the job had been installed rather than how often the user does the thing.
+* **Entry dates are day-granular**, so an entry's `last_seen_ms` re-reads as midnight UTC
+  — up to a day of fuzz against a 90-day window. Acceptable at that ratio; it would not
+  be at a 7-day one.
+* **`Habit` and `Convention` need at least two observations**, and a candidate that
+  matches an existing entry is merged rather than suppressed by the head-dedupe rule.
+
+### Stage C's rulings, and the one seam it confirmed
+
+* **"The same window" now means one cadence interval**, and the budget is **per window
+  rather than per run** (maintainer's ruling: stage C reported the ambiguity rather than
+  choosing silently). The ledger records what the window spent, so a second run inside it
+  — **including an explicit `pie schedule run`** — spends the remainder. A per-run budget
+  would make the ceiling a function of how many times the user typed a command, which is
+  not a budget.
+* **`Cadence::Monthly` is a fixed 30 days**, not a calendar month, and its doc now says
+  so. A 31-day month drifts by a day, which is fine for a monthly digest and is what
+  `interval_ms` actually promises; "calendar month" claimed precision the function does
+  not have. The rolling rule is deliberately narrow: the window only rolls on a
+  **scheduled** run whose stamp is in the past, so neither a manual run nor a backwards
+  clock can hand the budget back early.
+* **`run_job` takes the spawn as a parameter** (`S: FnOnce(&Job) -> Result<Spend>`),
+  rather than calling `provider::stream` itself. That is the only shape in which "zero
+  provider spawns" can be **counted** instead of described — the requirement's whole
+  point. `run_job` also wraps `check_budget`'s error to name the job, because the frozen
+  `check_budget(&Budget, u64)` signature has no room for a job name.
+* **`Job`/`Ledger` read `config::Jobs`.** That dependency is outside this section's frozen
+  list and is intentional: `config.rs` owns the serialisation surface (`JobCadence`,
+  which maps to `schedule::Cadence` by an exhaustive match so the two cannot drift) and a
+  separate test asserts the shipped defaults are `never` / `0` / vendor-history off, with
+  a zero budget really refusing. The property is only meaningful as a claim about the
+  *defaults*, so it is asserted there and `run_job` is asserted to reach no provider.
 
 ---
 

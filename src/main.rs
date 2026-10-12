@@ -4,6 +4,11 @@
 //! an exit code. All behaviour lives in the library, which is what makes the
 //! commands testable and this file reviewable in ten seconds.
 
+#![cfg_attr(
+    not(test),
+    deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
+)]
+
 use clap::Parser;
 
 use pie::cli::Cli;
