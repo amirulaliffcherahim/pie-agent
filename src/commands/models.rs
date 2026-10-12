@@ -158,10 +158,8 @@ mod tests {
     #[test]
     fn refresh_evicts_the_cache_and_tolerates_a_missing_one() {
         let dir = tempfile::tempdir().unwrap();
-        let _env = crate::testing::EnvGuard::set(&[(
-            "PIE_HOME",
-            Some(&dir.path().to_string_lossy().to_string()),
-        )]);
+        let home = dir.path().display().to_string();
+        let _env = crate::testing::EnvGuard::set(&[("PIE_HOME", Some(home.as_str()))]);
 
         let cache = paths::agy_model_cache();
         std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
