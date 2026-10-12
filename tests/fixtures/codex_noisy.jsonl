@@ -1,0 +1,10 @@
+{"type":"thread.started","thread_id":"01a11e67-3c28-7cb0-bb6e-9753954cf6ce"}
+codex: warning: something wrote a non-JSON line to stdout
+{"type":"turn.started"}
+{"type":"item.started","item":{"id":"item_1","type":"command_execution","command":"ls","status":"in_progress"}}
+{"type":"item.updated","item":{"id":"item_1","type":"command_execution","command":"ls","status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"ls","exit_code":0,"status":"completed","aggregated_output":"README.md\n"}}
+{"type":"item.completed","item":{"id":"item_2","type":"reasoning","content":[{"type":"text","text":"weighing the options"}]}}
+{"type":"future.event","payload":{"added_by":"a newer codex"}}
+{"type":"item.completed","item":{"id":"item_3","type":"agent_message","content":[{"type":"text","text":"OK"}]}}
+{"type":"turn.completed","usage":{"input_tokens":13768,"cached_input_tokens":11008,"cache_write_input_tokens":0,"output_tokens":5,"reasoning_output_tokens":0}}

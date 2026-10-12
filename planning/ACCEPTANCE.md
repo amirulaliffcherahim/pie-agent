@@ -287,7 +287,7 @@ Appended as gates pass. Evidence = command + observed result, not a claim.
 |---|---|---|---|---|---|---|---|---|
 | M0 | ✅ | ✅ | ✅ | ✅ | n/a | ✅ | **done** | 113 tests pass (100 lib + 6 `no_secrets` + 7 `process`), 5 live-smoke tests correctly ignored; `--list-backends` prints agy/codex/claude with agy `1.3.3`, codex `codex-cli 0.162.0`, claude `2.1.296` + `no-subscription`; `cargo check --target x86_64-unknown-linux-gnu --all-targets --no-default-features` clean |
 | M1 | — | — | — | — | — | — | not started | — |
-| M2 | — | — | — | — | — | — | not started | — |
+| M2 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | **done** | G4 `cargo test --test parse_codex` → 34 passed. G5 live: a real `codex/gpt-6-luna` turn printed `ok` (exit 0) and logged `{input_tokens:13424, cached_input_tokens:1792, output_tokens:5, reasoning_tokens:0, ok:true, stop_reason:"completed"}` — the full frozen schema, and the first live evidence that the vendor prefix cache actually operates (13.3% on a trivial turn). `pie usage codex` printed `30d 88.0% 2026-11-08T01:52:52Z` and logged **no** session row, proving a probe is not a turn. G6 clean |
 
 Verdict values: `done` (all applicable gates) · `offline-verified` (G5 skipped by
 user decision) · `blocked` (a gate fails) · `not started`.

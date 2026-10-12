@@ -1,22 +1,33 @@
 //! OpenAI Codex (`codex`) backend — delegate mode.
 //!
-//! M0 delivers binary resolution, the argv contract, and the subscription-only
-//! auth gate. The JSONL parser lands in M2.
+//! `codex exec` is one-shot, so pie runs the whole task and returns the final
+//! answer; there is no tool round-trip (`RISKS.md` §1).
 //!
-//! Verified contract: `knowledge/codex.md`.
+//! Verified contract: `knowledge/codex.md`. Everything this module parses was
+//! either recorded from a live `codex exec --json` run or read out of the
+//! shipped binary — never invented. When a shape is unverified the code is
+//! deliberately permissive instead of assuming.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use serde_json::Value;
 
 use crate::auth::{self, Credential};
-use crate::config::Config;
-use crate::error::{PieError, Result};
+use crate::cache;
+use crate::config::{CodexQuotaProbe, Config};
+use crate::error::{truncate, PieError, Result};
+use crate::jsonl::{self, LineRead};
+use crate::paths;
 use crate::process;
-use crate::provider::driver::{cap_for, enforce_argv_cap, TurnPlan};
+use crate::provider::driver::{cap_for, drive, enforce_argv_cap, EventRouter, TurnPlan};
+#[cfg(feature = "http")]
+use crate::provider::Bucket;
 use crate::provider::{
-    AuthState, Capabilities, ChatRequest, Model, Provider, StreamEvent, TurnOutcome, UsageReport,
+    AuthState, Capabilities, ChatRequest, Model, Provider, StreamEvent, ToolState, TurnOutcome,
+    Usage, UsageReport,
 };
 
 /// Path of the npm launcher script, relative to an npm root.
@@ -25,6 +36,53 @@ pub const NODE_SCRIPT_RELATIVE: &str = "node_modules/@openai/codex/bin/codex.js"
 /// Hint shown when no subscription credential is available.
 pub const NO_SUBSCRIPTION_HINT: &str =
     "run `codex login` to use your ChatGPT/Codex plan; pie will not run codex in API-key mode";
+
+/// ChatGPT subscription quota endpoint (`knowledge/codex.md`).
+///
+/// A **private** vendor endpoint, not a documented API: it is read-only and
+/// authenticated with the user's own credential from `~/.codex/auth.json`, and
+/// it never spends model quota. Because it is private it is switchable off —
+/// see [`crate::config::CodexQuotaProbe`].
+pub const USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
+
+/// codex's own model-cache file inside `~/.codex`
+/// (`knowledge/internals.md`: `{fetched_at, models:[{slug, display_name,
+/// default_reasoning_level, supported_reasoning_levels:[{effort}]}]}`).
+pub const MODELS_CACHE_FILE: &str = "models_cache.json";
+
+/// Status string recorded for a healthy terminal event.
+pub const TURN_COMPLETED: &str = "completed";
+
+/// Status string recorded for a failed terminal event.
+pub const TURN_FAILED: &str = "failed";
+
+/// Deadline for the quota probe. It is a metadata call, not a turn.
+#[cfg(feature = "http")]
+const QUOTA_TIMEOUT_SECS: u64 = 30;
+
+/// The reasoning-effort vocabulary codex documents
+/// (`knowledge/internals.md`: `low|medium|high|xhigh|max|ultra`).
+pub const DEFAULT_EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
+
+/// Item types that are tool activity rather than answer text.
+///
+/// Extracted from the shipped binary's own string table (`grep -a` over
+/// `codex.exe`; zero-token probe) — `command_execution`, `file_change`,
+/// `mcp_tool_call`, `web_search`, `local_shell_call`, `function_call`,
+/// `patch_apply`, `todo_list`, `plan_update` all appear there. The suffix rules
+/// catch a type codex adds later without silently treating it as an answer.
+const TOOL_ITEM_TYPES: [&str; 10] = [
+    "command_execution",
+    "local_shell_call",
+    "function_call",
+    "tool_call",
+    "patch_apply",
+    "file_change",
+    "mcp_tool_call",
+    "web_search",
+    "todo_list",
+    "plan_update",
+];
 
 /// The codex backend.
 #[derive(Debug, Default, Clone, Copy)]
@@ -43,8 +101,9 @@ impl Provider for Codex {
             resume: true,
             // No prompt arg reads stdin; `-` also reads stdin.
             stdin_prompt: true,
-            // 0 = no inherent argv limit. M0 still passes the prompt on argv, so
-            // the config cap applies; M2 switches oversized prompts to stdin.
+            // 0 = no inherent argv limit. The prompt still goes on argv, so the
+            // config cap applies; a stdin path for oversized prompts is
+            // deferred (the driver spawns children with `stdin(null)`).
             max_prompt_argv: 0,
         }
     }
@@ -79,30 +138,46 @@ impl Provider for Codex {
         }
     }
 
-    async fn list_models(&self, _cfg: &Config) -> Result<Vec<Model>> {
-        Err(PieError::Unsupported {
-            backend: "codex".into(),
-            feature: "model catalog (M2: `~/.codex/models_cache.json`)".into(),
-        })
+    /// The catalog comes from codex's own `~/.codex/models_cache.json`, so this
+    /// spawns nothing and never spends model quota (I7).
+    async fn list_models(&self, cfg: &Config) -> Result<Vec<Model>> {
+        Ok(model_catalog(cfg))
     }
 
     async fn stream(
         &self,
-        _cfg: &Config,
-        _req: &ChatRequest,
-        _sink: &mut (dyn FnMut(StreamEvent) + Send),
+        cfg: &Config,
+        req: &ChatRequest,
+        sink: &mut (dyn FnMut(StreamEvent) + Send),
     ) -> Result<TurnOutcome> {
-        Err(PieError::Unsupported {
-            backend: "codex".into(),
-            feature: "delegate turn (M2: JSONL parser)".into(),
-        })
+        // Subscription-only gate (I9): refuse before spawning anything, so an
+        // API key can never be billed by accident. Checked before argv is even
+        // built, so the refusal does not depend on resolution succeeding.
+        require_subscription()?;
+
+        // codex has no `--effort` flag (`codex exec --help`, verified): effort
+        // is a `-c` config override, which M2 does not send. Saying so is
+        // better than silently running at a different depth than requested.
+        if req.effort.is_some() {
+            tracing::warn!(
+                "--effort is ignored for codex: it has no `--effort` flag and pie sends the \
+                 model only"
+            );
+        }
+
+        let plan = build_plan(cfg, req)?;
+        let mut router = CodexRouter::new();
+        let started = Instant::now();
+        drive(plan, &mut router, sink, started).await
     }
 
-    async fn usage(&self, _cfg: &Config) -> Result<UsageReport> {
-        Err(PieError::Unsupported {
-            backend: "codex".into(),
-            feature: "quota probe (M2: ChatGPT wham/usage)".into(),
-        })
+    async fn usage(&self, cfg: &Config) -> Result<UsageReport> {
+        // Checked before anything else, so `off` provably touches neither the
+        // credential store nor the network.
+        if cfg.codex.quota_probe == CodexQuotaProbe::Off {
+            return Ok(quota_disabled_report());
+        }
+        probe_quota(cfg).await
     }
 }
 
@@ -236,14 +311,6 @@ pub fn build_args(cfg: &Config, req: &ChatRequest) -> Result<Vec<OsString>> {
 
     args.push(OsString::from("exec"));
 
-    // Resume is a subcommand: `codex exec resume <id>`.
-    // NOTE(M2): confirm the argument order against `codex exec --help` before
-    // relying on it; resume is exercised in M5, not by the M0-M2 gates.
-    if let Some(id) = &req.resume {
-        args.push(OsString::from("resume"));
-        args.push(OsString::from(id));
-    }
-
     args.push(OsString::from("--cd"));
     args.push(req.cwd.clone().into_os_string());
     // Auto-approve within the workspace-write sandbox. Mutually exclusive with
@@ -258,6 +325,19 @@ pub fn build_args(cfg: &Config, req: &ChatRequest) -> Result<Vec<OsString>> {
         args.push(OsString::from(model));
     }
 
+    // `resume <id> <prompt>` is a **subcommand** of `exec`, so every option
+    // above must already be in place: the subcommand's own parser rejects
+    // `--cd` and `--approve-for-me`
+    // (`codex exec resume --help`, and M0's order failed empirically with
+    // `error: unexpected argument '--cd' found`).
+    if let Some(id) = &req.resume {
+        args.push(OsString::from("resume"));
+        args.push(OsString::from(id));
+    }
+
+    // No `--effort`: codex takes reasoning effort through `-c` overrides, not a
+    // dedicated flag. M2 sends only the model; the catalog still reports the
+    // effort axis so a later milestone can wire it up.
     args.push(OsString::from(&req.prompt));
     Ok(args)
 }
@@ -272,15 +352,15 @@ pub fn build_plan(cfg: &Config, req: &ChatRequest) -> Result<TurnPlan> {
     let mut args = prefix;
     args.extend(build_args(cfg, req)?);
 
-    // M0 passes the prompt on argv, so the config argv cap applies even though
-    // codex can read stdin. M2 lifts this by piping oversized prompts.
+    // The prompt goes on argv, so the config cap applies (codex can read stdin,
+    // but the shared driver spawns children with a null stdin).
     let cap = cap_for(&Codex.capabilities(), cfg);
     enforce_argv_cap(
         "codex",
         &program,
         &args,
         cap,
-        "M0 caps argv; M2 adds a stdin path for oversized prompts",
+        "shorten the prompt or split the task",
     )?;
 
     Ok(TurnPlan {
@@ -290,6 +370,710 @@ pub fn build_plan(cfg: &Config, req: &ChatRequest) -> Result<TurnPlan> {
         scrub: cfg.scrub_keys(cfg.scrub_enabled()),
         timeout: req.timeout.unwrap_or_else(|| cfg.timeout()),
     })
+}
+
+// ---------------------------------------------------------------------------
+// Auth gate
+// ---------------------------------------------------------------------------
+
+/// Refuse to run codex without a **subscription** credential (I9).
+///
+/// An API-key-only store must never reach a spawn: `codex exec` with
+/// `OPENAI_API_KEY` present would silently bill pay-as-you-go
+/// (`knowledge/internals.md` "Critical do-nots"). Only the presence of a
+/// credential is reported; no token value is read, kept, or rendered.
+pub fn require_subscription() -> Result<()> {
+    match auth::codex_credential() {
+        Credential::Subscription { .. } => Ok(()),
+        Credential::ApiKeyOnly { evidence } => Err(PieError::NoSubscription {
+            backend: "codex".into(),
+            hint: format!("{NO_SUBSCRIPTION_HINT} (saw {evidence})"),
+        }),
+        Credential::Absent => Err(PieError::AuthRequired {
+            backend: "codex".into(),
+            hint: "run `codex login`".to_string(),
+        }),
+        Credential::Unreadable(why) => Err(PieError::AuthRequired {
+            backend: "codex".into(),
+            hint: format!("cannot classify the codex credential: {why}"),
+        }),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// JSONL → StreamEvent
+// ---------------------------------------------------------------------------
+
+/// A fatal event, stored as plain strings.
+///
+/// Kept separate from [`PieError`] because `PieError::Spawn` holds an
+/// `io::Error` and the router must stay cheap to hold across the turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Failure {
+    status: String,
+    detail: String,
+}
+
+/// Interprets one codex turn's JSONL stream.
+///
+/// ```jsonl
+/// {"type":"thread.started","thread_id":"…"}
+/// {"type":"turn.started"}
+/// {"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"OK"}}
+/// {"type":"turn.completed","usage":{"input_tokens":13768,"cached_input_tokens":11008,
+///   "cache_write_input_tokens":0,"output_tokens":5,"reasoning_output_tokens":0}}
+/// ```
+///
+/// Rules that matter (`DESIGN.md` §6 rule 4, invariant I5): a line we cannot
+/// parse and an event we do not model are both forwarded, never fatal.
+#[derive(Debug, Default)]
+pub struct CodexRouter {
+    /// Thread id from `thread.started`, for a later resume.
+    thread_id: Option<String>,
+    /// Answer text accumulated from agent items.
+    text: String,
+    /// Usage from `turn.completed`.
+    usage: Usage,
+    /// Whether a healthy terminal event was seen.
+    finished: bool,
+    /// Last fatal event, when the stream reported one.
+    failure: Option<Failure>,
+    /// How many lines parsed as JSON — used in the "no terminal event" message.
+    events: usize,
+}
+
+impl CodexRouter {
+    /// A router for one fresh turn.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Answer text accumulated so far.
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// Interpret an `item.*` event.
+    ///
+    /// Only a **completed agent message** becomes [`StreamEvent::TextDelta`].
+    /// Reasoning, tool calls, and anything else become a tool step or a
+    /// forwarded `Other` — a tool's output must never be mistaken for the
+    /// answer.
+    fn on_item(&mut self, event: &Value, is_completion: bool, fallback: ToolState) -> StreamEvent {
+        let item_type = jsonl::s_nonempty(event, "item.type").unwrap_or_else(|| "unknown".into());
+
+        if is_completion && is_answer_item(&item_type) {
+            let text = item_text(event).unwrap_or_default();
+            self.text.push_str(&text);
+            return StreamEvent::TextDelta(text);
+        }
+
+        if is_tool_item(&item_type) {
+            return StreamEvent::ToolStep {
+                name: jsonl::s_nonempty(event, "item.name").unwrap_or_else(|| item_type.clone()),
+                state: tool_state(event, fallback),
+                info: tool_info(event),
+            };
+        }
+
+        StreamEvent::Other {
+            kind: item_type,
+            raw: event.clone(),
+        }
+    }
+}
+
+impl EventRouter for CodexRouter {
+    fn backend(&self) -> &'static str {
+        "codex"
+    }
+
+    fn on_line(&mut self, line: &str) -> Option<StreamEvent> {
+        let value = match jsonl::parse_line(line) {
+            LineRead::Blank => return None,
+            LineRead::Unparsed(raw) => return Some(StreamEvent::Unparsed(raw)),
+            LineRead::Value(value) => value,
+        };
+
+        self.events += 1;
+        let kind = jsonl::s_nonempty(&value, "type").unwrap_or_else(|| "unknown".to_string());
+
+        match kind.as_str() {
+            "thread.started" => {
+                let thread = jsonl::s_nonempty(&value, "thread_id");
+                self.thread_id = thread.clone();
+                Some(StreamEvent::Init {
+                    conversation_id: thread,
+                    cwd: jsonl::s_nonempty(&value, "cwd").map(PathBuf::from),
+                    tools: jsonl::strings(&value, "tools"),
+                })
+            }
+            // No user-visible state: the turn is already implied by the answer.
+            "turn.started" => None,
+            "item.started" | "item.updated" => Some(self.on_item(&value, false, ToolState::Active)),
+            "item.completed" => Some(self.on_item(&value, true, ToolState::Done)),
+            "turn.completed" => {
+                self.usage = usage_from_event(&value);
+                self.finished = true;
+                // A healthy terminal event wins over an earlier transient error.
+                self.failure = None;
+                Some(StreamEvent::Done {
+                    text: self.text.clone(),
+                    status: TURN_COMPLETED.to_string(),
+                })
+            }
+            "turn.failed" => {
+                self.failure = Some(failure_from(&value, TURN_FAILED));
+                Some(StreamEvent::Other {
+                    kind: kind.clone(),
+                    raw: value,
+                })
+            }
+            "error" => {
+                self.failure = Some(failure_from(&value, "error"));
+                Some(StreamEvent::Other {
+                    kind: kind.clone(),
+                    raw: value,
+                })
+            }
+            // Protocol drift must not be fatal (I5): forward and continue.
+            other => Some(StreamEvent::Other {
+                kind: other.to_string(),
+                raw: value,
+            }),
+        }
+    }
+
+    fn outcome(
+        &self,
+        exit_code: Option<i32>,
+        exit_status: &str,
+        stderr_tail: &str,
+    ) -> Result<TurnOutcome> {
+        // A failure the stream reported wins over everything else.
+        if let Some(failure) = &self.failure {
+            return Err(PieError::Backend {
+                backend: "codex".into(),
+                status: failure.status.clone(),
+                detail: failure.detail.clone(),
+            });
+        }
+
+        // Success is decided by the terminal event, not by the exit status
+        // (`DESIGN.md` §6 rule 7) — a chatty stderr or a non-zero exit after a
+        // healthy `turn.completed` is not an error.
+        if self.finished {
+            return Ok(TurnOutcome {
+                text: self.text.clone(),
+                usage: self.usage.clone(),
+                status: TURN_COMPLETED.to_string(),
+                conversation_id: self.thread_id.clone(),
+                duration: Duration::ZERO,
+            });
+        }
+
+        if exit_code != Some(0) {
+            return Err(PieError::Backend {
+                backend: "codex".into(),
+                status: exit_status.to_string(),
+                detail: process::diagnostic(stderr_tail),
+            });
+        }
+
+        // Exit 0 with no terminal event: the stream did not honour its own
+        // contract, so we cannot claim the turn succeeded.
+        Err(PieError::protocol(
+            "codex",
+            format!(
+                "stream closed after {} event(s) without a `turn.completed` (exit 0). {}",
+                self.events,
+                process::diagnostic(stderr_tail)
+            ),
+        ))
+    }
+}
+
+/// Item types that carry the answer.
+fn is_answer_item(item_type: &str) -> bool {
+    matches!(item_type, "agent_message" | "assistant_message")
+}
+
+/// Item types that represent tool activity rather than answer text.
+fn is_tool_item(item_type: &str) -> bool {
+    TOOL_ITEM_TYPES.contains(&item_type)
+        || item_type.ends_with("_call")
+        || item_type.ends_with("_execution")
+        || item_type.ends_with("_change")
+}
+
+/// Text of an agent item.
+///
+/// Verified shapes carry `item.text`; codex also models an item as content
+/// blocks (the on-disk rollout records `item.content[0].text`), so both are
+/// accepted rather than dropping an answer.
+fn item_text(event: &Value) -> Option<String> {
+    if let Some(text) = jsonl::s(event, "item.text") {
+        return Some(text);
+    }
+    let blocks: Vec<String> = jsonl::objects(event, "item.content")
+        .iter()
+        .filter_map(|block| jsonl::s(block, "text"))
+        .collect();
+    if blocks.is_empty() {
+        None
+    } else {
+        Some(blocks.join(""))
+    }
+}
+
+/// Lifecycle state of a tool item.
+///
+/// `item.status` is authoritative when present; `item.exit_code` is the next
+/// best evidence; otherwise the event kind decides (`item.completed` ⇒ `Done`,
+/// `item.started`/`item.updated` ⇒ `Active`).
+fn tool_state(event: &Value, fallback: ToolState) -> ToolState {
+    if let Some(status) = jsonl::s_nonempty(event, "item.status") {
+        let status = status.to_ascii_lowercase();
+        if status.contains("fail") || status.contains("error") || status.contains("cancel") {
+            return ToolState::Error;
+        }
+        if status.contains("progress") || status.contains("running") || status.contains("pending") {
+            return ToolState::Active;
+        }
+        if status.contains("complete") || status.contains("success") || status.contains("done") {
+            return ToolState::Done;
+        }
+    }
+
+    // A non-zero exit code in a completed item is a failed tool step.
+    if matches!(jsonl::u(event, "item.exit_code"), Some(code) if code != 0) {
+        return ToolState::Error;
+    }
+
+    fallback
+}
+
+/// Short, redacted description of what a tool item did.
+fn tool_info(event: &Value) -> Option<String> {
+    for path in [
+        "item.command",
+        "item.query",
+        "item.path",
+        "item.description",
+    ] {
+        if let Some(text) = jsonl::s_nonempty(event, path) {
+            return Some(truncate(&process::redact(&text), 160));
+        }
+    }
+    None
+}
+
+/// Usage carried by `turn.completed`.
+///
+/// The renames are the point: codex's `cached_input_tokens` is pie's
+/// `cache_read_tokens`, and `reasoning_output_tokens` is `thinking_tokens`.
+pub fn usage_from_event(event: &Value) -> Usage {
+    Usage {
+        input_tokens: jsonl::u(event, "usage.input_tokens").unwrap_or(0),
+        output_tokens: jsonl::u(event, "usage.output_tokens").unwrap_or(0),
+        thinking_tokens: jsonl::u(event, "usage.reasoning_output_tokens").unwrap_or(0),
+        cache_read_tokens: jsonl::u(event, "usage.cached_input_tokens").unwrap_or(0),
+        cache_write_tokens: jsonl::u(event, "usage.cache_write_input_tokens").unwrap_or(0),
+        // codex reports no total; `Usage::computed_total` derives it.
+        total_tokens: jsonl::u(event, "usage.total_tokens").unwrap_or(0),
+    }
+}
+
+/// Build a [`Failure`] from `turn.failed` or `error`, redacted at the boundary.
+fn failure_from(event: &Value, status: &str) -> Failure {
+    let detail = jsonl::s_nonempty(event, "error.message")
+        .or_else(|| jsonl::s_nonempty(event, "message"))
+        .or_else(|| jsonl::s_nonempty(event, "error"))
+        .unwrap_or_else(|| jsonl::brief(event, 300));
+
+    Failure {
+        status: status.to_string(),
+        detail: truncate(&process::redact(&detail), 600),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Model catalog
+// ---------------------------------------------------------------------------
+
+/// Read the catalog for a backend. Never spawns a process and never spends
+/// quota (I7): it is codex's own on-disk cache plus a local TTL cache.
+///
+/// A fresh [`crate::paths::codex_model_cache`] short-circuits the source file,
+/// which is what makes `pie models` cheap on repeat calls.
+pub fn model_catalog(cfg: &Config) -> Vec<Model> {
+    let path = paths::codex_model_cache();
+    let ttl = Duration::from_secs(cfg.codex.model_cache_ttl_secs);
+
+    if let Some(models) =
+        cache::read_fresh::<Vec<Model>>(&path, ttl, crate::session_log::now_millis())
+    {
+        if !models.is_empty() {
+            return models;
+        }
+    }
+
+    let Some(models) = read_source_catalog() else {
+        // Fallback is deliberately **not** cached: it is a placeholder until
+        // codex writes its own cache, and caching it would delay picking that
+        // up by a whole TTL.
+        return fallback_models();
+    };
+
+    // A cache write failing must not fail `pie models`.
+    if let Err(e) = cache::write_now(&path, &models) {
+        tracing::debug!(
+            error = %e,
+            path = %path.display(),
+            "could not cache the codex model catalog"
+        );
+    }
+    models
+}
+
+/// `~/.codex/models_cache.json`, shaped. Any read or parse problem is a miss.
+fn read_source_catalog() -> Option<Vec<Model>> {
+    let path = auth::codex_dir().join(MODELS_CACHE_FILE);
+    let text = std::fs::read_to_string(&path).ok()?;
+    let value: Value = serde_json::from_str(&text).ok()?;
+    let models = shape_models(&value);
+    if models.is_empty() {
+        return None;
+    }
+    Some(models)
+}
+
+/// Map codex's `models_cache.json` into pie's [`Model`].
+///
+/// `slug` → id, `display_name` → display, `supported_reasoning_levels[].effort`
+/// → efforts, `default_reasoning_level` → default_effort. Entries without a slug
+/// are dropped; a missing display name falls back to the slug.
+///
+/// Internal entries (`memory4-dream`, `gpt-reserve`, `codex-auto-review`) are
+/// listed as reported: the catalog is codex's own, and pie does not second-guess
+/// which of them accept `--model`.
+pub fn shape_models(value: &Value) -> Vec<Model> {
+    let mut models = Vec::new();
+
+    for entry in jsonl::objects(value, "models") {
+        let Some(id) = jsonl::s_nonempty(&entry, "slug") else {
+            continue;
+        };
+        let display = jsonl::s_nonempty(&entry, "display_name").unwrap_or_else(|| id.clone());
+
+        let mut efforts: Vec<String> = Vec::new();
+        for level in jsonl::objects(&entry, "supported_reasoning_levels") {
+            if let Some(effort) = jsonl::s_nonempty(&level, "effort") {
+                if !efforts.contains(&effort) {
+                    efforts.push(effort);
+                }
+            }
+        }
+        // Tolerate a plain string array if the shape ever simplifies.
+        for effort in jsonl::strings(&entry, "supported_reasoning_levels") {
+            if !effort.trim().is_empty() && !efforts.contains(&effort) {
+                efforts.push(effort);
+            }
+        }
+
+        models.push(Model {
+            id,
+            display,
+            efforts,
+            default_effort: jsonl::s_nonempty(&entry, "default_reasoning_level"),
+        });
+    }
+
+    models
+}
+
+/// Last-resort catalog, used only when `~/.codex/models_cache.json` is absent.
+///
+/// The ids and display names are the ones recorded in `knowledge/codex.md` /
+/// `knowledge/internals.md` from this machine; the effort sets are the
+/// documented common vocabulary (`DEFAULT_EFFORTS`), not per-model truth. This
+/// list exists so `pie models` says something useful on a fresh machine — it is
+/// never used to validate a `--model`, which codex itself does.
+pub fn fallback_models() -> Vec<Model> {
+    [
+        ("gpt-6-luna", "GPT-6-Luna"),
+        ("gpt-6-sol", "GPT-6-Sol"),
+        ("gpt-5.6-luna", "GPT-5.6-Luna"),
+        ("gpt-5.5", "GPT-5.5"),
+    ]
+    .iter()
+    .map(|(id, display)| Model {
+        id: (*id).to_string(),
+        display: (*display).to_string(),
+        efforts: DEFAULT_EFFORTS.iter().map(|e| (*e).to_string()).collect(),
+        default_effort: Some("medium".to_string()),
+    })
+    .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Quota probe
+// ---------------------------------------------------------------------------
+
+/// The report returned when the probe is switched off.
+///
+/// Not an error: `pie usage codex` still prints the session-log totals, only the
+/// bucket table is empty (`knowledge/9router-findings.md` §4 — the endpoint is
+/// private, so it needs a switch that does not require a code change).
+pub fn quota_disabled_report() -> UsageReport {
+    UsageReport {
+        backend: "codex".into(),
+        buckets: Vec::new(),
+        source: "disabled by config".into(),
+        notes: vec![
+            "codex quota_probe = \"off\" — set it to \"http\" to query the usage endpoint"
+                .to_string(),
+        ],
+    }
+}
+
+/// Query the ChatGPT usage endpoint.
+#[cfg(feature = "http")]
+async fn probe_quota(cfg: &Config) -> Result<UsageReport> {
+    let _ = cfg;
+    let (token, account) = usage_credential()?;
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(QUOTA_TIMEOUT_SECS))
+        .build()
+        .map_err(|e| probe_error(&e.to_string()))?;
+
+    let mut request = client
+        .get(USAGE_URL)
+        .header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(reqwest::header::ACCEPT, "application/json");
+    if let Some(account) = account {
+        request = request.header("ChatGPT-Account-Id", account);
+    }
+
+    let response = request
+        .send()
+        .await
+        .map_err(|e| probe_error(&e.to_string()))?;
+    let status = response.status();
+    // Read the body before branching so a failure can report what came back.
+    let body = response.text().await.unwrap_or_default();
+
+    if !status.is_success() {
+        return Err(describe_http_failure(status.as_u16(), &body));
+    }
+
+    let value: Value = serde_json::from_str(&body).map_err(|e| {
+        PieError::protocol("codex", format!("usage endpoint returned non-JSON: {e}"))
+    })?;
+
+    Ok(UsageReport {
+        backend: "codex".into(),
+        buckets: buckets_from_usage(&value),
+        source: "chatgpt backend-api/wham/usage".to_string(),
+        notes: quota_notes(&value),
+    })
+}
+
+/// Without the `http` feature there is no TLS client to probe with.
+#[cfg(not(feature = "http"))]
+async fn probe_quota(_cfg: &Config) -> Result<UsageReport> {
+    Err(PieError::Unsupported {
+        backend: "codex".into(),
+        feature: "quota probe (built without the `http` feature)".into(),
+    })
+}
+
+/// Read the credential, requiring a subscription first (I9).
+///
+/// The token is returned only to be placed in a request header. It is never
+/// logged, never rendered into an error, and never stored.
+#[cfg(feature = "http")]
+fn usage_credential() -> Result<(String, Option<String>)> {
+    require_subscription()?;
+
+    let path = auth::codex_auth_file();
+    let text = std::fs::read_to_string(&path).map_err(|e| PieError::AuthRequired {
+        backend: "codex".into(),
+        hint: format!("could not read {}: {e}", path.display()),
+    })?;
+    let value: Value = serde_json::from_str(&text).map_err(|e| PieError::AuthRequired {
+        backend: "codex".into(),
+        hint: format!("{} is not valid JSON: {e}", path.display()),
+    })?;
+
+    let token =
+        jsonl::s_nonempty(&value, "tokens.access_token").ok_or_else(|| PieError::AuthRequired {
+            backend: "codex".into(),
+            hint: "no access token in ~/.codex/auth.json — run `codex login`".to_string(),
+        })?;
+
+    Ok((token, jsonl::s_nonempty(&value, "tokens.account_id")))
+}
+
+/// A probe transport failure, with the error text redacted.
+#[cfg(feature = "http")]
+fn probe_error(detail: &str) -> PieError {
+    PieError::Backend {
+        backend: "codex".into(),
+        status: "usage probe failed".into(),
+        detail: truncate(&process::redact(detail), 600),
+    }
+}
+
+/// Turn a non-2xx response into an error that names only the status and a
+/// redacted body — never a header, and never the token.
+#[cfg(feature = "http")]
+pub fn describe_http_failure(code: u16, body: &str) -> PieError {
+    let detail = format!("HTTP {code}: {}", process::diagnostic(body));
+
+    if code == 401 || code == 403 {
+        return PieError::AuthRequired {
+            backend: "codex".into(),
+            hint: format!("the codex credential was rejected — run `codex login` ({detail})"),
+        };
+    }
+
+    PieError::Backend {
+        backend: "codex".into(),
+        status: format!("HTTP {code}"),
+        detail,
+    }
+}
+
+/// Map the usage payload's rate-limit windows into [`Bucket`]s.
+///
+/// Verified shape (`chatgpt.com/backend-api/wham/usage`): the windows live under
+/// `rate_limit.primary_window` / `rate_limit.secondary_window`, each with
+/// `used_percent`, `limit_window_seconds` and `reset_at` (epoch seconds). Codex's
+/// own rollout records the same windows as `primary`/`secondary` with
+/// `window_minutes` and `resets_at`, so both spellings are accepted. A window
+/// this plan does not report is simply absent (both were `null` on the
+/// development machine except `primary_window`).
+#[cfg(feature = "http")]
+pub fn buckets_from_usage(value: &Value) -> Vec<Bucket> {
+    let mut buckets = Vec::new();
+
+    for key in ["primary_window", "secondary_window"] {
+        let Some(window) = jsonl::at(value, &format!("rate_limit.{key}")) else {
+            continue;
+        };
+        if !window.is_object() {
+            continue;
+        }
+        buckets.push(window_bucket(key, window));
+    }
+
+    buckets
+}
+
+/// One window → one bucket.
+#[cfg(feature = "http")]
+fn window_bucket(key: &str, window: &Value) -> Bucket {
+    let seconds = jsonl::u(window, "limit_window_seconds")
+        .or_else(|| jsonl::u(window, "window_minutes").map(|m| m.saturating_mul(60)));
+
+    let remaining_fraction = jsonl::u(window, "used_percent")
+        .map(|percent| (100u64.saturating_sub(percent.min(100)) as f64) / 100.0);
+
+    Bucket {
+        label: window_label(key, seconds),
+        remaining_fraction,
+        reset_at: jsonl::u(window, "reset_at")
+            .or_else(|| jsonl::u(window, "resets_at"))
+            .map(iso8601_utc),
+        // The endpoint reports percentages, not unit counts.
+        used: None,
+        limit: None,
+    }
+}
+
+/// Name a window after its real duration, so a plan that reports a 30-day
+/// window is not mislabelled `5h`.
+#[cfg(feature = "http")]
+fn window_label(key: &str, seconds: Option<u64>) -> String {
+    match seconds {
+        Some(18_000) => "5h".to_string(),
+        Some(604_800) => "weekly".to_string(),
+        Some(2_592_000) => "30d".to_string(),
+        Some(s) if s >= 3_600 && s % 3_600 == 0 => format!("{}h", s / 3_600),
+        Some(s) if s >= 60 => format!("{}m", s / 60),
+        Some(s) => format!("{s}s"),
+        None => key.trim_end_matches("_window").to_string(),
+    }
+}
+
+/// Caveats worth showing next to the buckets.
+#[cfg(feature = "http")]
+pub fn quota_notes(value: &Value) -> Vec<String> {
+    let mut notes = Vec::new();
+
+    if jsonl::b(value, "rate_limit.limit_reached") == Some(true) {
+        notes.push("the endpoint reports the rate limit is reached".to_string());
+    }
+    if jsonl::b(value, "rate_limit.allowed") == Some(false) {
+        notes.push("the endpoint reports this plan may not make requests right now".to_string());
+    }
+    let no_credits = jsonl::b(value, "credits.has_credits") == Some(false)
+        && jsonl::b(value, "credits.unlimited") == Some(false);
+    if no_credits {
+        notes.push("no usage credits on this plan — the windows above are the quota".to_string());
+    }
+    if let Some(count) = jsonl::u(value, "rate_limit_reset_credits.available_count") {
+        if count > 0 {
+            notes.push(format!("{count} rate-limit reset credit(s) available"));
+        }
+    }
+    if let Some(extra) = jsonl::at(value, "additional_rate_limits") {
+        if extra.as_array().is_some_and(|items| !items.is_empty()) {
+            notes.push(
+                "the endpoint reported additional per-scope rate limits that pie does not map"
+                    .to_string(),
+            );
+        }
+    }
+
+    notes
+}
+
+/// Render epoch seconds as an RFC 3339 UTC timestamp.
+///
+/// Hand-rolled because pie has no date library: the quota table needs a readable
+/// reset time and one formatting function is cheaper than a dependency.
+#[cfg(feature = "http")]
+pub fn iso8601_utc(epoch_secs: u64) -> String {
+    let secs = epoch_secs as i64;
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        rem / 3_600,
+        (rem % 3_600) / 60,
+        rem % 60
+    )
+}
+
+/// Days since the Unix epoch → civil date (Howard Hinnant's algorithm).
+#[cfg(feature = "http")]
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64; // [0, 146096]
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let year = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
+
+    (if month <= 2 { year + 1 } else { year }, month, day)
 }
 
 #[cfg(test)]
@@ -346,10 +1130,49 @@ mod tests {
         let mut r = req();
         r.resume = Some("thread-9".into());
         let a = strings(&build_args(&Config::default(), &r).unwrap());
+        let at = a.iter().position(|x| x == "resume").unwrap();
         assert_eq!(a[0], "exec");
-        assert_eq!(a[1], "resume");
-        assert_eq!(a[2], "thread-9");
-        assert_eq!(a[3], "--cd");
+        assert_eq!(a[at + 1], "thread-9");
+        assert_eq!(a.last().unwrap(), "hi", "the prompt follows the session id");
+    }
+
+    /// Regression: `resume` is a **subcommand** of `exec`, so an option written
+    /// after it is parsed by `resume`, which accepts neither `--cd` nor
+    /// `--approve-for-me`. M0 emitted `exec resume <id> --cd …` and codex
+    /// rejected it:
+    ///
+    /// ```text
+    /// $ codex exec resume <id> --cd . --approve-for-me --skip-git-repo-check --json --help
+    /// error: unexpected argument '--cd' found
+    /// ```
+    ///
+    /// Every `exec`-level option must precede the subcommand.
+    #[test]
+    fn every_exec_option_precedes_the_resume_subcommand() {
+        let mut r = req();
+        r.resume = Some("thread-9".into());
+        let a = strings(&build_args(&Config::default(), &r).unwrap());
+
+        let resume_at = a.iter().position(|x| x == "resume").unwrap();
+        for flag in [
+            "--cd",
+            "--approve-for-me",
+            "--skip-git-repo-check",
+            "--json",
+        ] {
+            let at = a
+                .iter()
+                .position(|x| x == flag)
+                .unwrap_or_else(|| panic!("missing {flag} in {a:?}"));
+            assert!(
+                at < resume_at,
+                "{flag} must precede `resume` in {a:?}, or codex rejects the argv"
+            );
+        }
+        assert!(
+            !a[resume_at..].contains(&"--cd".to_string()),
+            "nothing exec-level may follow the subcommand: {a:?}"
+        );
     }
 
     #[test]
@@ -389,7 +1212,7 @@ mod tests {
     }
 
     #[test]
-    fn oversized_prompt_is_refused_in_m0() {
+    fn oversized_prompt_is_refused_before_spawning() {
         let mut r = req();
         r.prompt = "p".repeat(30_000);
         let err = build_plan(&Config::default(), &r).unwrap_err();
