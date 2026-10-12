@@ -556,7 +556,74 @@ that is incomplete rather than at the end: **A** persistence · **B**
 `--continue`/`--session` · **C** compaction · **D** `pie ocr` · **E** MCP server ·
 **F** backend switch · **G5** live resume across two turns.
 
-## 12. CLI surface for M0–M3
+## 12. Interactive TUI (M6)
+
+Roadmap: *model picker, streaming output, keybindings*; Done: *interactive parity across
+agy + codex*. New dependencies, the first since M0: `ratatui 0.29` + `crossterm 0.29`,
+both verified to leave the G6 cross-target check clean.
+
+### Testability is the design driver
+
+A TUI resists automated testing, so the one part that cannot be tested is kept as
+small as possible and everything else is pure:
+
+| Layer | Testable how |
+|---|---|
+| `tui::app` — reducer, state | unit tests: a neutral `Input` reaches *no* crossterm type, so `key → Action → state` is asserted without a terminal |
+| `tui::render` | ratatui's `TestBackend`: render into an in-memory buffer and assert its contents |
+| `tui::run` — the terminal loop | **not** automatable. Keep it thin: only crossterm setup, a select loop, and teardown |
+
+**The reducer must never see a crossterm type.** That single rule is what makes M6
+testable at all; a `KeyEvent` parameter would drag the terminal into every test.
+
+### Frozen interfaces (so the layers can be built in parallel)
+
+```rust
+pub enum Input { Char(char), Enter, Esc, Backspace, Up, Down, Left, Right, Tab, Ctrl(char) }
+pub enum Action { None, Quit, Submit, Cancel, ScrollUp, ScrollDown, OpenPicker,
+                  PickerNext, PickerPrev, PickerAccept }
+pub enum Status { Idle, Running, Done, Failed(String) }
+pub enum Entry { User(String), Assistant(String), Tool { name: String, state: ToolState }, Notice(String) }
+
+pub struct App { /* prompt, backend, model, session, status, transcript, tool_events,
+                    scroll, picker, should_quit */ }
+
+pub fn reduce(app: &mut App, input: Input) -> Action;
+pub fn apply_event(app: &mut App, event: &StreamEvent);
+pub fn render(frame: &mut Frame, app: &App);
+pub async fn run_session(app: &mut App, cfg: &Config) -> Result<()>;   // the thin loop
+```
+
+`reduce` and `apply_event` take and return only pie's own types. `Frame` is ratatui's
+and appears in exactly one signature.
+
+### Two constraints that shape the behaviour
+
+- **Delegate mode means the TUI shows the vendor's tool steps, not pie's own.**
+  `agy --print` and `codex exec` run their own tools (`RISKS.md` §1), so this is
+  architecturally unlike the original pi TUI, which displayed its own tool cards.
+  Saying so in the UI is better than implying a capability that does not exist.
+- **The UI never blocks on a turn.** The turn runs as a task and pushes
+  `StreamEvent`s down an `mpsc` channel; the loop selects over that channel and
+  crossterm's event stream. A synchronous turn would freeze the interface until the
+  vendor CLI returned — up to 40 s on agy.
+
+### Entry point
+
+`pie tui`, opt-in. A bare `pie` keeps printing help, so CI and every existing test
+are unaffected, and the TUI can never be entered accidentally by a script.
+
+### Stages
+
+A state + reducer · B render (TestBackend) · C the thin terminal loop and channel
+wiring · D model picker + keybindings · G5 a **real turn's** events driven through the
+reducer, asserting the rendered buffer shows the answer.
+
+G5's shape is deliberate: keystrokes cannot be automated, but "the TUI renders a real
+vendor turn" is the substance of M6's Done condition and *is* checkable — the same
+discipline that made M3's persona gate provable rather than asserted.
+
+## 13. CLI surface for M0–M3
 
 Additions since M0–M2: `--resume <ID>` (M5-preview, see §10's note on ordering) and
 `profile` (M3). `profile` prints the assembled projection and the provenance of each
@@ -579,7 +646,7 @@ parser is tested by the CLI itself, not only by unit tests. Human mode prints
 deltas as they arrive. Zero-token guarantee: `models`/`auth`/`doctor`/`--list-backends`
 must never spend model quota (catalogs come from disk/help, not a model turn).
 
-## 13. Test strategy
+## 14. Test strategy
 
 | Layer | What | Runs |
 |---|---|---|
@@ -592,7 +659,7 @@ Rules: no test spawns a real CLI unless `PIE_LIVE=1`. Fixtures live in
 `knowledge/agy.md` / `knowledge/codex.md` — not invented. Every milestone gate
 runs `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`.
 
-## 14. Explicitly deferred
+## 15. Explicitly deferred
 
 M3 profile/memory projection · M4 unified auth/usage tables · M5 agent loop +
 sessions + OCR MCP · M6 ratatui TUI · M7 learn · M8 watchtower · M9 claude +

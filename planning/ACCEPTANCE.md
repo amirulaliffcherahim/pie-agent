@@ -387,7 +387,40 @@ says so rather than implying coverage it does not have.
   which files moved. The dropped turns are handed back rather than discarded, so the
   detail is recoverable even though it is not in the block.
 
-## 9. Bug protocol
+## 9. M6 — interactive TUI
+
+Contract: `DESIGN.md` §12. Done condition from `ROADMAP.md`: *"interactive parity across
+agy + codex"*.
+
+**Acceptance, per stage.** Every stage gets its **own** gate named after its **own**
+test binary. That is not boilerplate: in M5 two of three stages shipped with a gate
+that could not fail them, because the gate ran a different stage's tests. A stage
+gate that does not name the stage's own tests is decorative.
+
+| Stage | Command | Shape |
+|---|---|---|
+| A state + reducer | `cargo test --test tui_app` | every `Input` maps to the documented `Action`; typing, submit, cancel, scroll, picker transitions; `apply_event` folds a `StreamEvent` into the transcript; no crossterm type appears in the reducer's signature |
+| B render | `cargo test --test tui_render` | with `TestBackend`: the prompt line, the status, and both `User` and `Assistant` entries appear; a long transcript scrolls rather than overflowing; a picker renders its options; the buffer is asserted, not merely non-empty |
+| C loop + wiring | `cargo test --test tui_loop` | the turn runs as a task and its events reach the app through the channel without blocking: assert a scripted sequence of events lands in order while the loop stays responsive to a quit input |
+| D picker + keys | `cargo test --test tui_app` | the documented keybindings each produce their action; choosing a model updates `App::model`; every keybinding is documented in help |
+| G5 | live, by hand | drive a **real** turn's `StreamEvent`s through `apply_event` and assert the rendered buffer contains the answer, then `pie tui` starts and quits cleanly |
+
+**Checks**
+
+- [ ] the reducer takes no crossterm type — `src/tui/app.rs` has zero `crossterm` imports
+- [ ] `render` is asserted through `TestBackend`, so it is tested without a terminal
+- [ ] the UI does not block on a turn: events arrive while the loop still accepts input
+- [ ] a bare `pie` still prints help and never enters the TUI
+- [ ] `pie tui` is opt-in, and no existing test or CI job can enter it accidentally
+- [ ] the UI states that tool steps are the *vendor's*, since delegate mode means pie runs none of its own
+- [ ] the G6 cross-target check still passes with the new dependencies
+- [ ] `pie tui` on a non-TTY stdin fails with a clear message rather than emitting escape codes into a pipe
+
+**Not verifiable here**: human interaction. Keystroke sequences are covered through the
+reducer, and rendering through the buffer — but nobody can automate "does this feel
+usable", so that remains a judgement for the user, and M6's verdict says so.
+
+## 10. Bug protocol
 
 A "bug" is any behavior that contradicts `ROADMAP.md`, `DESIGN.md`, or a
 knowledge file. Process, in order:
@@ -419,7 +452,7 @@ Bug categories to actively hunt before marking a milestone done:
 - **Env leak** — API key reaching a child, flipping it to pay-as-you-go (RISKS §10)
 - **Panic** — `unwrap`/`expect`/index-out-of-bounds on external input
 
-## 10. Independent verification
+## 11. Independent verification
 
 Each milestone, after G1–G3 are green and before it is called done, dispatch an
 independent reviewer subagent with **no shared context** and give it: the design
@@ -429,7 +462,7 @@ is either fixed (with a test) or logged as accepted with a written reason.
 
 The reviewer must not be the same agent that wrote the code.
 
-## 11. Run log
+## 12. Run log
 
 Appended as gates pass. Evidence = command + observed result, not a claim.
 
@@ -471,7 +504,7 @@ No milestone regressed. The lesson worth keeping: **re-run a live gate after any
 change to the payload it proves** — otherwise the earlier green is a statement about
 a revision that no longer exists.
 
-## 12. Bug log
+## 13. Bug log
 
 Every bug found, the gate that caught it, and the regression test that now
 prevents it. This is the record the milestone verdicts above rest on.
@@ -512,7 +545,7 @@ prevents it. This is the record the milestone verdicts above rest on.
 | F2 | codex resolves to `node.exe` + `codex.js` on this machine (no native `codex.exe`, and the `codex.cmd` shim cannot be spawned directly). The BINARY column therefore shows node | Documented in `codex.rs` and `PLATFORMS.md`; the launch path is the verified one |
 | F3 | WSL2 is installed but cannot boot (`HCS_E_SERVICE_NOT_AVAILABLE`) | Linux is verified by G6 locally and by the CI matrix; see `PLATFORMS.md` |
 
-## 13. Open suggestions from the QC sweep
+## 14. Open suggestions from the QC sweep
 
 Accepted as real, deliberately not done yet. Recorded here so they are decisions
 rather than oversights. None affects a milestone verdict.
