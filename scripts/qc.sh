@@ -256,6 +256,12 @@ run_gate 'G4 acceptance (M7 consolidate)' cargo test --test consolidate
 run_gate 'G4 acceptance (M7 schedule)' cargo test --test schedule
 run_gate 'G4 acceptance (M7 commands)' cargo test --test memory_cmd
 
+# M8's stages, one binary each, same reason.
+run_gate 'G4 acceptance (M8 drift)' cargo test --test drift
+run_gate 'G4 acceptance (M8 news)' cargo test --test news
+run_gate 'G4 acceptance (M8 report)' cargo test --test watchtower
+run_gate 'G4 acceptance (M8 command)' cargo test --test watch_cmd
+
 # --- G4 (M6 tui non-TTY) ----------------------------------------------------
 # ACCEPTANCE section 9: `pie tui` on a non-TTY stdin must fail with a clear message
 # rather than emitting escape codes into a pipe.

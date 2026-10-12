@@ -407,6 +407,32 @@ pub trait Provider: Send + Sync {
         ))
     }
 
+    /// Args that make the CLI print its own help.
+    ///
+    /// Added for M8's drift check (`DESIGN.md` §17), which diffs each CLI's `--help`
+    /// between snapshots to catch a renamed flag before pie's argv breaks against it.
+    /// It belongs on the trait for the same reason [`Provider::version_args`] does: a
+    /// probe that is hardcoded per backend at the call site drifts from the argv the
+    /// backend actually builds.
+    fn help_args(&self) -> &'static [&'static str] {
+        &["--help"]
+    }
+
+    /// Program **and** leading args used to capture help.
+    ///
+    /// Mirrors [`Provider::version_command`] exactly, and for the same reason: a backend
+    /// that cannot be launched directly (codex on Windows is `node <codex.js>`) must
+    /// override this, or the probe reports the *launcher's* help. Help is also what drift
+    /// diffs, so a `codex.cmd` that cannot be spawned without a shell would make every
+    /// run look like a change.
+    fn help_command(&self, cfg: &Config) -> Option<(PathBuf, Vec<OsString>)> {
+        let program = self.binary(cfg)?;
+        Some((
+            program,
+            self.help_args().iter().map(OsString::from).collect(),
+        ))
+    }
+
     /// Probe credentials without spending model quota.
     async fn auth_status(&self, cfg: &Config) -> AuthState;
 

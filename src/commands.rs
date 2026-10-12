@@ -17,8 +17,9 @@ pub mod schedule;
 pub mod sessions;
 pub mod tui;
 pub mod usage;
+pub mod watch;
 
-use crate::cli::{Cli, Command, MemoryAction, ScheduleAction};
+use crate::cli::{Cli, Command, MemoryAction, ScheduleAction, WatchScope};
 use crate::config::Config;
 use crate::error::{PieError, Result};
 
@@ -81,6 +82,27 @@ pub async fn dispatch(cli: &Cli, cfg: &Config) -> Result<()> {
             Some(ScheduleAction::Run { job }) => schedule::run(cfg, Some(job)).await,
             _ => schedule::run(cfg, None).await,
         },
+        // The watchtower's two halves are opt-in independently: an empty `news_sources`
+        // means the run fetches nothing, and the shipped cadence/budget mean a *scheduled*
+        // run refuses before probing. `sources_from` names each URL after its host so the
+        // report has something readable without a second config key.
+        Some(Command::Watch {
+            scope,
+            dry_run,
+            month,
+        }) => {
+            watch::run(
+                cfg,
+                &watch::Options {
+                    scope: scope.unwrap_or(WatchScope::All).into(),
+                    dry_run: *dry_run,
+                    month: month.clone(),
+                    sources: watch::sources_from(&cfg.jobs.news_sources),
+                    stack: cfg.jobs.watch_stack.clone(),
+                },
+            )
+            .await
+        }
         // And no `cfg` here either: `pie ocr` reads the itsmini base URL from the
         // environment at call time, so it needs nothing resolved first.
         Some(Command::Ocr {

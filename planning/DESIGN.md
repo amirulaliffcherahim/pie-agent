@@ -1118,15 +1118,92 @@ pub struct CliSnapshot { pub backend: String, pub version: String, pub help: Str
 pub struct Drift { pub backend: String, pub class: DriftClass, pub what: String, pub detail: String }
 
 pub fn snapshot_dir(home: &Path) -> PathBuf;                       // $PIE_HOME/watch
-pub fn diff(previous: &CliSnapshot, current: &CliSnapshot) -> Vec<Drift>;   // pure
-pub fn classify(entry: &Drift) -> DriftClass;                      // pure, table-driven
+pub fn reports_dir() -> PathBuf;                                   // $PIE_HOME/reports
 pub fn render_report(month: &str, drifts: &[Drift], news: &[NewsItem], first_run: bool) -> String;
 
+// src/watch/drift.rs
+pub fn diff(previous: &CliSnapshot, current: &CliSnapshot) -> Vec<Drift>;   // pure
+pub fn classify(entry: &Drift) -> DriftClass;                      // pure, table-driven
+
 // src/watch/news.rs
+pub struct NewsSource { pub name: String, pub url: String }
 pub struct NewsItem { pub title: String, pub url: String, pub source: String, pub impact: u32, pub matched: Vec<String> }
+pub trait Http: Send + Sync { fn get(&self, url: &str) -> Result<String>; }
 pub fn rank(items: Vec<NewsItem>, stack: &[String]) -> Vec<NewsItem>;   // pure, rule-based
-pub fn fetch(source: &Source, client: &HttpClient) -> Result<Vec<NewsItem>>;  // network
+pub fn fetch(source: &NewsSource, http: &dyn Http) -> Result<Vec<NewsItem>>;  // network
 ```
+
+Three corrections the scaffold made to the first draft, each for a reason worth keeping:
+
+* **`NewsSource`, not `Source`.** `learn::Source` already means "which store a turn came
+  from" (M7). Two `Source`s in one crate is a name that means nothing at a call site.
+* **The transport is a `trait Http`, not a concrete client.** A test that reaches the
+  network fails when a blog reorders its index, which teaches nothing about pie. The
+  trait is the seam that makes `fetch` testable *and* keeps the network in one place.
+* **`DriftClass::label()` is part of the type**, because the classification is the
+  report's whole content and a label written twice (once in `render_report`, once in a
+  test) is a label that drifts.
+
+Snapshots live in `$PIE_HOME/watch` and reports in `$PIE_HOME/reports` — different
+lifetimes, one diffed and one read.
+
+### The `--help` producer, which the first draft of this section assumed
+
+`DESIGN` said drift diffs each CLI's `--help`; nothing in `src/` could produce it.
+`Provider` had `version_args`/`version_command` and no help equivalent, so `CliSnapshot::help`
+had **no producer at all** — a contract that names a capability nothing implements, which is
+this project's most-recorded failure shape (B25/B27/B28/B30/S12). Stage A reported it
+instead of hardcoding argv per backend at the call site.
+
+The fix is two trait methods mirroring the version pair, because the *reason* is identical:
+codex is `node <codex.js>` on Windows and its `.cmd` shim cannot be spawned without a
+shell, so `help_command` overrides to carry the launcher prefix. A hardcoded `--help`
+against the launcher would compare **node's** help text between runs and report the
+difference as a change to codex.
+
+**A probe that returns empty help is a diagnostic, not a quiet snapshot.** An empty capture
+is unrepresentable in `render_report` (which sees only findings), so it would read as "no
+drift". The probe must treat empty output as a stated error naming the backend.
+
+### What stage A decided, where this section was silent
+
+* **A changed version is `PieMustChange`**, not `Unclassified`. `RISKS.md` §3 and I8 make the
+  recorded version the baseline the parsers were validated against, so a bump is a signal
+  to re-verify argv, not an unknown.
+* **`classify` is keyed on the finding's label**, because the frozen `classify(&Drift)`
+  signature hands it nothing else. That is why the finding vocabulary is a closed table
+  (`CLASSES`) with every class reachable from a fixture — a class no fixture produces is a
+  class nobody has checked, and the test suite asserts that rather than assuming it.
+* **A rename is paired by similarity and can only escalate a class, never downgrade it.**
+  An unpaired "removed" plus "added" would read as two benign findings when the truth is
+  that a flag pie passes has been renamed out from under it.
+* **`diff` refuses to compare two different backends.** An agy-vs-codex pair is a caller
+  bug, and the alternative — reporting every difference as drift — would produce an
+  all-clear-shaped report from nonsense input.
+* **A `--help` line that vanished is a finding too**, not only flags: prose is where a
+  CLI announces a new consent or automation policy, which is the class that matters most.
+
+### What stage B decided, where this section was silent
+
+* **Matching is whole-word, so `c++` does not match `C++20`** and `ai` does not match
+  `sailboat` or `said`. Stated because it is a real limitation a reader will meet: a
+  prefix rule would fix `c++` and immediately make `ai` match `aix`. The documented rule
+  is the one that does not produce false confidence, and stage C's report text must not
+  imply exhaustive coverage.
+* **A valid-but-empty feed is a stated error, not an empty digest** — the same call M5's
+  `ocr` makes on an empty 200 (`ACCEPTANCE.md` §8). Its message distinguishes "contains no
+  `<item>` or `<entry>`" from "answered with N items, none carrying a title", so a quiet
+  source is diagnosable rather than invisible. An RSS feed lists recent posts, so a truly
+  empty one is anomalous; treating it as "nothing happened" is how a broken fetch reads.
+* **A config-shaped fetch failure keeps its kind** (`PieError::Config`, exit 2) instead of
+  being flattened into a generic transport error (exit 1). A malformed URL is a
+  configuration mistake, and the exit code is what a script sees.
+* **The source's own name is not a haystack.** Scoring matches against the source name
+  would make every item from a feed called "Rust Weekly" match the term `rust`, which is a
+  score that measures the feed rather than the story.
+* **The feed is parsed by hand, with no new dependency** (`Cargo.toml` is the
+  maintainer's), and only ever slices at `str::find` boundaries — a byte slice at a
+  multi-byte boundary is a panic on external input, which is invariant I6.
 
 Three rules carry over, and each has already been paid for once in this project:
 
@@ -1147,6 +1224,20 @@ Three rules carry over, and each has already been paid for once in this project:
 degrades to version + `--help` + binary-strings diff — "REA-lite". Full structural checks
 become available only after `rea setup`. The report labels which mode produced it, so a
 "REA-lite" report is never mistaken for a structural one.
+
+**The third leg does not run, and the report says so.** `CliSnapshot::strings` has no
+producer, and the obvious one is *wrong*: probing the resolved program for codex would run
+`strings` over **node's** binary, because codex is `node <codex.js>` here — the same
+trap `help_command` exists to avoid. A wrong comparison is worse than a missing one, so
+stage D reported the leg as inert in the report body rather than filling the field with
+something plausible. Version and `--help` **are** compared, which is the half that catches
+renamed flags.
+
+The missing producer has a shape, for whoever picks it up: extract strings from the
+**vendor's own artefact** — the native binary for agy and claude, the `codex.js` script
+for codex, both already resolvable through the launcher-prefix logic — and give
+`Provider` a `strings_command` beside `version_command`/`help_command`, since it is the
+same kind of probe with the same failure mode.
 
 ### CLI surface
 

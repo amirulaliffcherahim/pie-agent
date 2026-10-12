@@ -130,6 +130,21 @@ pub enum ScheduleAction {
     },
 }
 
+/// Which half of the watchtower runs.
+///
+/// A value rather than a flag pair so `pie watch drift` and `pie watch news` read as the
+/// scopes they are, and so a typo is a clap error rather than a scope that silently does
+/// everything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum WatchScope {
+    /// Probe the CLIs, fetch the sources, and write the report.
+    All,
+    /// Probe and snapshot only; writes no report.
+    Drift,
+    /// Fetch and print the digest only; writes no report.
+    News,
+}
+
 /// Everything that is not a one-shot prompt.
 #[derive(Debug, Subcommand)]
 pub enum Command {
@@ -211,14 +226,33 @@ pub enum Command {
         action: Option<MemoryAction>,
     },
 
-    /// What background jobs are due, and what budget is left.
-    ///
+    /// What background jobs are due, and what budget is left.    ///
     /// Opt-in on purpose: the default cadence is `never` and the default budget is zero,
     /// so nothing runs and nothing is spent unless it is asked for (`RISKS.md` §13).
     Schedule {
         /// What to do; `pie schedule` with no subcommand reports status.
         #[command(subcommand)]
         action: Option<ScheduleAction>,
+    },
+
+    /// Check the vendor CLIs and the news for changes, and write the monthly report.
+    ///
+    /// **Opt-in twice over.** The cadence is `never` and the budget is zero, so a
+    /// scheduled run refuses before probing anything; and the news sources are empty, so
+    /// with no configuration the run fetches nothing at all. Probing a CLI for its version
+    /// and `--help` costs no model tokens — that is why the drift half is safe to schedule
+    /// — but it is still a process pie starts, which is why `--dry-run` is free.
+    Watch {
+        /// Which half to run. `pie watch drift` probes and snapshots without writing a
+        /// report; `pie watch news` prints the digest without writing one either.
+        #[arg(value_name = "SCOPE")]
+        scope: Option<WatchScope>,
+        /// Decide and report, but write nothing, spawn nothing and fetch nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Report a specific month. Defaults to the current one.
+        #[arg(long, value_name = "YYYY-MM")]
+        month: Option<String>,
     },
 
     /// Convert an image or scanned PDF to text through itsmini.
@@ -415,6 +449,61 @@ mod tests {
     #[test]
     fn schedule_run_requires_a_job() {
         assert!(Cli::try_parse_from(["pie", "schedule", "run"]).is_err());
+    }
+
+    /// The watchtower's scope is a value, and the default is the whole run.
+    ///
+    /// `None` must mean `All` — the maintainer's dispatch does that mapping — so this
+    /// pins the parser half: a bare `pie watch` carries no scope, while `pie watch drift`
+    /// names one explicitly.
+    #[test]
+    fn the_watch_scope_parses_and_a_bare_watch_names_none() {
+        match Cli::try_parse_from(["pie", "watch"]).unwrap().command {
+            Some(Command::Watch {
+                scope,
+                dry_run,
+                month,
+            }) => {
+                assert!(
+                    scope.is_none(),
+                    "a bare `pie watch` must default at dispatch time"
+                );
+                assert!(!dry_run, "only `--dry-run` is free; the default run writes");
+                assert!(month.is_none());
+            }
+            other => panic!("wrong command: {other:?}"),
+        }
+
+        for (word, expected) in [
+            ("all", WatchScope::All),
+            ("drift", WatchScope::Drift),
+            ("news", WatchScope::News),
+        ] {
+            match Cli::try_parse_from(["pie", "watch", word]).unwrap().command {
+                Some(Command::Watch { scope, .. }) => assert_eq!(scope, Some(expected)),
+                other => panic!("wrong command for `{word}`: {other:?}"),
+            }
+        }
+
+        // An unknown scope is a parse error, not a run that silently does everything:
+        // the whole point of naming a scope is to *not* run the other half.
+        assert!(Cli::try_parse_from(["pie", "watch", "everything"]).is_err());
+
+        match Cli::try_parse_from(["pie", "watch", "drift", "--dry-run", "--month", "2026-11"])
+            .unwrap()
+            .command
+        {
+            Some(Command::Watch {
+                scope,
+                dry_run,
+                month,
+            }) => {
+                assert_eq!(scope, Some(WatchScope::Drift));
+                assert!(dry_run);
+                assert_eq!(month.as_deref(), Some("2026-11"));
+            }
+            other => panic!("wrong command: {other:?}"),
+        }
     }
 
     /// `--model` is the opt-in that can spend, so it must be spelled explicitly and must

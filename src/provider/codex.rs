@@ -124,6 +124,16 @@ impl Provider for Codex {
         Some((program, prefix))
     }
 
+    /// Same launcher prefix as the version probe, because the reason is the same: codex
+    /// is `node <codex.js>` on Windows, and the `codex.cmd` shim cannot be spawned
+    /// without a shell. Without this override M8's drift check would run `--help` against
+    /// the wrong program, or fail to spawn at all, and report it as a change.
+    fn help_command(&self, cfg: &Config) -> Option<(PathBuf, Vec<OsString>)> {
+        let (program, mut prefix) = program_and_prefix(cfg)?;
+        prefix.push(OsString::from("--help"));
+        Some((program, prefix))
+    }
+
     async fn auth_status(&self, cfg: &Config) -> AuthState {
         if self.binary(cfg).is_none() {
             return AuthState::BinaryMissing {
@@ -1362,5 +1372,37 @@ mod tests {
                 "the script must precede --version: {a:?}"
             );
         }
+    }
+
+    /// The same requirement for M8's drift probe.
+    ///
+    /// `CliSnapshot::help` is what drift diffs, so a help probe that ran `--help`
+    /// against the launcher would compare node's help text between runs and report the
+    /// result as a change to codex. The override exists for exactly this, and nothing
+    /// else would notice if it were dropped.
+    #[test]
+    fn the_help_probe_carries_the_node_script_prefix_too() {
+        use crate::provider::Provider;
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("codex.js");
+        std::fs::write(&script, "// stub").unwrap();
+
+        let mut cfg = Config::default();
+        cfg.codex.bin = script.to_string_lossy().to_string();
+
+        if let Some((program, args)) = Codex.help_command(&cfg) {
+            assert!(is_javascript(&program) || program.to_string_lossy().contains("node"));
+            let a = strings(&args);
+            assert_eq!(a.last().unwrap(), "--help");
+            assert!(
+                a.iter().any(|x| x.ends_with("codex.js")),
+                "the script must precede --help, or drift diffs the launcher: {a:?}"
+            );
+        }
+
+        // And the default really is `--help`, so a backend that overrides nothing still
+        // gets a working probe rather than an empty argv.
+        assert_eq!(Codex.help_args(), &["--help"]);
     }
 }

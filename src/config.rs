@@ -245,6 +245,27 @@ pub struct Jobs {
     /// sufficient for M7; reading `~/.gemini`, `~/.codex` or `~/.claude` is a decision
     /// the user makes deliberately, not a side effect of enabling the job.
     pub read_vendor_history: bool,
+    /// News feeds the monthly watchtower may fetch (M8).
+    ///
+    /// **Empty by default, and that is the opt-in.** With no source configured the
+    /// watchtower fetches nothing at all, so a fresh install makes no network request
+    /// and the milestone's "nothing runs unasked" claim is a property of the default
+    /// rather than a hope about the code path. `PLAN.md` §11a calls the sources
+    /// "configured" and this is where they are configured.
+    ///
+    /// A bare URL is enough: the report's display name comes from the host, because
+    /// requiring a name as well would be two keys to express one source.
+    pub news_sources: Vec<String>,
+    /// Terms the news digest ranks headlines against (M8).
+    ///
+    /// Empty is a stated rule of `watch::rank` rather than a special case: with nothing
+    /// to match, every item keeps `impact == 0` and the feed's own order is preserved,
+    /// because a digest sorted by nothing is one the reader cannot interpret.
+    ///
+    /// It lives here rather than in `profile.toml` because `Profile` is deliberately
+    /// opaque — it exposes a projection, not fields — and inventing a persona key to
+    /// feed a ranking would couple the persona to one consumer.
+    pub watch_stack: Vec<String>,
 }
 
 /// Anthropic Claude Code CLI settings. Disabled: no subscription on this machine.
@@ -374,6 +395,16 @@ impl Config {
                 }
             };
         }
+        // Comma-separated, and an empty value is a *deliberate* opt-out rather than a
+        // no-op — the same reasoning `PIE_DEFAULT_BACKEND` gets: a user turning the
+        // watchtower's fetching off must be able to, and `env_non_empty` would silently
+        // keep the configured list.
+        if let Ok(raw) = std::env::var("PIE_JOBS_NEWS_SOURCES") {
+            self.jobs.news_sources = split_list(&raw);
+        }
+        if let Ok(raw) = std::env::var("PIE_JOBS_WATCH_STACK") {
+            self.jobs.watch_stack = split_list(&raw);
+        }
         Ok(())
     }
 
@@ -455,6 +486,21 @@ fn parse_num<T: std::str::FromStr>(raw: &str, key: &str) -> Result<T> {
     raw.trim()
         .parse::<T>()
         .map_err(|_| PieError::Config(format!("{key} must be a number, got `{raw}`")))
+}
+
+/// Split a comma-separated environment value into a list.
+///
+/// Blank entries are dropped so a trailing comma does not become a source with an empty
+/// URL, and each entry is trimmed because a list typed into a shell profile collects
+/// spaces after the commas. An **empty** value yields an empty list rather than keeping a
+/// previously configured one: for both callers, an empty list is the documented opt-out
+/// and "set but empty" has to mean off.
+fn split_list(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 #[cfg(test)]
@@ -795,12 +841,23 @@ mod tests {
                 ("PIE_JOBS_LEARN_CADENCE", Some("DAILY")),
                 ("PIE_JOBS_LEARN_BUDGET_TOKENS", Some("42000")),
                 ("PIE_JOBS_READ_VENDOR_HISTORY", Some("true")),
+                (
+                    "PIE_JOBS_NEWS_SOURCES",
+                    Some("https://a.example/rss, https://b.example/feed"),
+                ),
+                ("PIE_JOBS_WATCH_STACK", Some("rust, codex")),
             ]);
             let mut cfg = Config::default();
             cfg.apply_env().unwrap();
             assert_eq!(cfg.jobs.learn_cadence, JobCadence::Daily);
             assert_eq!(cfg.jobs.learn_budget_tokens, 42_000);
             assert!(cfg.jobs.read_vendor_history);
+            assert_eq!(
+                cfg.jobs.news_sources,
+                vec!["https://a.example/rss", "https://b.example/feed"],
+                "the list is split and each entry trimmed"
+            );
+            assert_eq!(cfg.jobs.watch_stack, vec!["rust", "codex"]);
         }
 
         // An explicit false must mean off rather than "set, therefore on": this switch
@@ -811,6 +868,29 @@ mod tests {
             cfg.jobs.read_vendor_history = true;
             cfg.apply_env().unwrap();
             assert!(!cfg.jobs.read_vendor_history, "`0` must turn it off");
+        }
+
+        // **Set but empty must mean off, not "keep what was configured".** This is the
+        // switch that makes the watchtower fetch nothing, so a user turning it off has to
+        // be able to, and a trailing comma must not become a source with an empty URL.
+        {
+            let _env = EnvGuard::set(&[
+                ("PIE_JOBS_NEWS_SOURCES", Some("")),
+                ("PIE_JOBS_WATCH_STACK", Some("rust,")),
+            ]);
+            let mut cfg = Config::default();
+            cfg.jobs.news_sources = vec!["https://was-configured.example/rss".into()];
+            cfg.apply_env().unwrap();
+            assert!(
+                cfg.jobs.news_sources.is_empty(),
+                "an empty value must clear the list, not keep it: {:?}",
+                cfg.jobs.news_sources
+            );
+            assert_eq!(
+                cfg.jobs.watch_stack,
+                vec!["rust"],
+                "a trailing comma is dropped"
+            );
         }
 
         for (value, blamed) in [

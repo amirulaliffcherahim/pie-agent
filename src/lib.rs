@@ -39,6 +39,7 @@ pub mod schedule;
 pub mod session;
 pub mod session_log;
 pub mod tui;
+pub mod watch;
 
 /// Test-only helpers. Compiled out of every non-test build.
 #[cfg(test)]
