@@ -111,7 +111,12 @@ impl Script {
 #[derive(Clone)]
 struct Recorded {
     url: String,
-    body: Value,
+    /// `None` for a GET.
+    ///
+    /// Optional rather than defaulted to an empty object because the assertions in this file
+    /// are about *what was sent*, and `{}` would read as a POST with an empty body — which is
+    /// a different request that the same code could make.
+    body: Option<Value>,
     headers: Vec<(String, String)>,
 }
 
@@ -126,6 +131,18 @@ impl fmt::Debug for Recorded {
 }
 
 impl Recorded {
+    /// The request body, for an assertion about what was sent.
+    ///
+    /// Panics with a reason rather than defaulting: indexing `body` directly was the old
+    /// shape, and once `body` became optional a GET would have indexed `None` at the same
+    /// call site — a panic that says `Option` tells the reader nothing about which verb they
+    /// were looking at. The message names the mistake instead.
+    fn json(&self) -> &Value {
+        self.body
+            .as_ref()
+            .expect("this record is a GET, so it has no body to assert on")
+    }
+
     fn header(&self, name: &str) -> Option<&str> {
         self.headers
             .iter()
@@ -134,7 +151,7 @@ impl Recorded {
     }
 
     fn messages(&self) -> Vec<Value> {
-        self.body["messages"]
+        self.json()["messages"]
             .as_array()
             .cloned()
             .unwrap_or_default()
@@ -181,7 +198,7 @@ impl HttpClient for Fixture {
     fn post(&self, request: &HttpRequest) -> Result<HttpResponse, PieError> {
         self.requests.lock().unwrap().push(Recorded {
             url: request.url.clone(),
-            body: request.body.clone(),
+            body: Some(request.body.clone()),
             headers: request.headers.clone(),
         });
 
@@ -189,19 +206,48 @@ impl HttpClient for Fixture {
             return Err(PieError::NotReachable(reason));
         }
 
+        Ok(self.next_scripted())
+    }
+
+    /// A GET, recorded the same way so `requests()` still tells the whole story.
+    ///
+    /// `body: None` is what distinguishes it in the record: a GET carries no body, and the
+    /// assertions in this file are about *what was sent*, so collapsing the two verbs into
+    /// one record shape would make a POST read as a GET.
+    fn get(&self, url: &str, headers: &[(String, String)]) -> Result<HttpResponse, PieError> {
+        self.requests.lock().unwrap().push(Recorded {
+            url: url.to_string(),
+            body: None,
+            headers: headers.to_vec(),
+        });
+
+        if let Some(reason) = self.failure.lock().unwrap().take() {
+            return Err(PieError::NotReachable(reason));
+        }
+
+        Ok(self.next_scripted())
+    }
+}
+
+impl Fixture {
+    /// Take the next scripted response, or fail loudly.
+    ///
+    /// Shared by both verbs so a test cannot script a GET's response differently from a
+    /// POST's, and so the "every allowed request was scripted" invariant holds for both.
+    fn next_scripted(&self) -> HttpResponse {
         let script = self
             .scripts
             .lock()
             .unwrap()
             .pop_front()
             .expect("the test scripted a response for every request it allows");
-        Ok(HttpResponse {
+        HttpResponse {
             status: script.status,
             stream: Box::new(Chunks {
                 chunks: script.chunks.into(),
                 failure: script.failure,
             }),
-        })
+        }
     }
 }
 
@@ -411,9 +457,12 @@ fn a_scripted_client_drives_one_full_loop_iteration_answering_a_tool_use() {
     assert_eq!(answer["tool_call_id"], "call_a");
     assert_eq!(answer["content"], "file contents of a.txt");
 
-    assert_eq!(requests[0].body["stream"], true);
-    assert_eq!(requests[0].body["model"], "test-model");
-    assert_eq!(requests[0].body["messages"][0]["content"], "read the file");
+    assert_eq!(requests[0].json()["stream"], true);
+    assert_eq!(requests[0].json()["model"], "test-model");
+    assert_eq!(
+        requests[0].json()["messages"][0]["content"],
+        "read the file"
+    );
 
     // Positive control for the leak tests: the key really does reach the wire, so a scan
     // that finds nothing later is a scan of something that was there.
@@ -813,7 +862,17 @@ fn the_key_never_reaches_an_error_a_log_line_or_a_formatted_value() {
     }
     for request in fixture.requests() {
         produced.push(("a recorded request", format!("{request:?}")));
-        produced.push(("a request body", request.body.to_string()));
+        produced.push((
+            "a request body",
+            // `None` for a GET, and rendered as the JSON `null` rather than via `Display`,
+            // because `Option<Value>` has none — and the point of this loop is to have a
+            // string for every value the code can produce, so a `None` that skipped the
+            // check would be a hole in the assertion rather than a convenience.
+            request
+                .body
+                .as_ref()
+                .map_or_else(|| "null".to_string(), Value::to_string),
+        ));
         for (name, value) in &request.headers {
             // Every header except the one the key is legitimately in: the assertion is that
             // the key reaches no *output*, and the authorization header is the request.

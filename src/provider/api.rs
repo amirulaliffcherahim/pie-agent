@@ -34,7 +34,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 
 use crate::error::{PieError, Result};
-use crate::provider::http::{live_client, HttpSpec, HttpTransport};
+use crate::provider::http::{self, live_client, HttpSpec, HttpTransport};
 use crate::provider::{
     AuthState, Capabilities, ChatRequest, Model, Provider, StreamEvent, TurnOutcome, UsageReport,
 };
@@ -70,6 +70,34 @@ impl Vendor {
     /// The chat-completions endpoint.
     pub fn completions_url(&self) -> String {
         format!("{}/chat/completions", self.base_url)
+    }
+
+    /// The model catalog endpoint (`GET`).
+    pub fn models_url(&self) -> String {
+        format!("{}/models", self.base_url)
+    }
+
+    /// The credit endpoint, where the vendor has one.
+    ///
+    /// Only OpenRouter: it is a prepaid balance rather than a quota window, which is the
+    /// closest thing either API-key vendor has to "remaining". DeepSeek exposes nothing, and
+    /// `None` here is what keeps `usage` honest for it instead of inventing a bucket.
+    pub fn credit_url(&self) -> Option<String> {
+        (self.id == OPENROUTER.id).then(|| format!("{}/key", self.base_url))
+    }
+
+    /// The headers a request to this vendor carries.
+    ///
+    /// One place, so a catalog request and a completion request cannot disagree about
+    /// attribution — and so the credential is attached in exactly one function.
+    pub fn headers(&self, key: &str) -> Vec<(String, String)> {
+        let mut headers = vec![("Authorization".to_string(), format!("Bearer {key}"))];
+        if self.id == OPENROUTER.id {
+            // OpenRouter attributes traffic by header. Sent because its own docs ask for it,
+            // which also keeps pie identifiable rather than anonymous.
+            headers.push(("X-Title".to_string(), crate::NAME.to_string()));
+        }
+        headers
     }
 
     /// The body field that asks the endpoint for usage accounting.
@@ -167,16 +195,23 @@ impl Provider for ApiBackend {
     }
 
     async fn list_models(&self, _cfg: &crate::config::Config) -> Result<Vec<Model>> {
-        // The catalog needs a GET, and `HttpClient` is POST-only by construction (its one
-        // caller needs to stream a completion). Reporting that rather than inventing a
-        // static list: a hardcoded catalog for a vendor that ships models weekly would be
-        // wrong within a month and would look authoritative while being wrong.
-        Err(PieError::Unsupported {
-            backend: self.0.id.to_string(),
-            feature: "model catalog: the shared HTTP client exposes POST only, so `GET /models` \
-                      is a follow-up (M10 note)"
-                .to_string(),
-        })
+        let Some(key) = self.key() else {
+            // Refused before any request, so a machine with no key never has one attached to
+            // an outbound call. The same shape as `stream`, for the same reason.
+            return Err(PieError::AuthRequired {
+                backend: self.0.id.to_string(),
+                hint: format!("{} is not set", self.0.key_env),
+            });
+        };
+
+        let client = live_client(READ_TIMEOUT)?;
+        let value = http::get_json(
+            client.as_ref(),
+            self.0.id,
+            &self.0.models_url(),
+            &self.0.headers(&key),
+        )?;
+        Ok(models_from_catalog(&value))
     }
 
     async fn stream(
@@ -249,18 +284,42 @@ impl Provider for ApiBackend {
     }
 
     async fn usage(&self, _cfg: &crate::config::Config) -> Result<UsageReport> {
-        // Neither vendor exposes a quota window: these are pay-as-you-go accounts, so there
-        // is no "remaining" to report and the honest answer is none rather than a zero.
-        // `pie usage` still prints the session-log totals, which for these backends now
-        // carry a real `cost_usd_micros`.
+        // A prepaid balance, where the vendor exposes one. DeepSeek exposes nothing, and the
+        // honest answer there is a report with no buckets and a note saying Why — never a
+        // zero, which would read as "nothing left" rather than "not reported".
+        let notes = vec![
+            "cost is reported per turn in the session-log totals, from the endpoint's own \
+             accounting; an API-key account has no quota window"
+                .to_string(),
+        ];
+
+        let Some(url) = self.0.credit_url() else {
+            return Ok(UsageReport {
+                backend: self.0.id.to_string(),
+                buckets: Vec::new(),
+                source: "pay-as-you-go: this vendor exposes no balance endpoint".to_string(),
+                notes,
+            });
+        };
+
+        let Some(key) = self.key() else {
+            return Ok(UsageReport {
+                backend: self.0.id.to_string(),
+                buckets: Vec::new(),
+                source: format!("balance needs {}", self.0.key_env),
+                notes,
+            });
+        };
+
+        let client = live_client(READ_TIMEOUT)?;
+        let value = http::get_json(client.as_ref(), self.0.id, &url, &self.0.headers(&key))?;
+        let buckets = credit_bucket(&value).into_iter().collect();
+
         Ok(UsageReport {
             backend: self.0.id.to_string(),
-            buckets: Vec::new(),
-            source: "pay-as-you-go: no quota window to report".to_string(),
-            notes: vec![format!(
-                "cost is reported per turn in `pie usage`'s totals, from the endpoint's own \
-                 accounting; there is no quota bucket for an API-key account"
-            )],
+            buckets,
+            source: format!("{} /key", self.0.base_url),
+            notes,
         })
     }
 }
@@ -276,5 +335,213 @@ impl ApiBackend {
             .ok()
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
+    }
+}
+
+/// Parse an OpenAI-compatible `GET /models` body.
+///
+/// **Pure**, so the catalog mapping is tested without a network — the transport's own tests
+/// cover the HTTP half, and a shape test that needed a live endpoint would fail the day a
+/// vendor reordered its JSON, which teaches nothing about pie.
+///
+/// A row with no usable `id` is skipped rather than given a placeholder: a model nobody can
+/// name is not selectable, and inventing an id would put a `--model` value in the picker that
+/// the endpoint rejects.
+pub fn models_from_catalog(value: &serde_json::Value) -> Vec<Model> {
+    let rows = match value.get("data").and_then(serde_json::Value::as_array) {
+        Some(rows) => rows,
+        // Some OpenAI-compatible builds answer with a bare array.
+        None => match value.as_array() {
+            Some(rows) => rows,
+            None => return Vec::new(),
+        },
+    };
+
+    let mut models: Vec<Model> = rows
+        .iter()
+        .filter_map(|row| {
+            let id = crate::jsonl::s_nonempty(row, "id")?;
+            let display = crate::jsonl::s_nonempty(row, "name").unwrap_or_else(|| id.clone());
+            // One `Model` per row: these endpoints publish ids, not effort axes, so
+            // `efforts` and `default_effort` stay empty rather than being invented.
+            Some(Model::plain(id, display))
+        })
+        .collect();
+
+    // Sorted by id so two runs over the same catalog produce the same picker order — a list
+    // that reordered between runs would make the picker's highlight land somewhere different
+    // for no reason the user could see.
+    models.sort_by(|a, b| a.id.cmp(&b.id));
+    models.dedup_by(|a, b| a.id == b.id);
+    models
+}
+
+/// Parse OpenRouter's `GET /key` body into one bucket.
+///
+/// The fields are dollars as JSON numbers (or `null` for an unlimited key), converted to
+/// micro-USD integers so the figure matches what `usage.jsonl` records rather than drifting
+/// apart by a rounding step. `None` when the body carries no limit at all — an unlimited key
+/// has no "remaining" to draw, and a bar for it would be a fiction.
+pub fn credit_bucket(value: &serde_json::Value) -> Option<crate::provider::Bucket> {
+    let data = value.get("data").unwrap_or(value);
+    let limit = data.get("limit")?.as_f64()?;
+    if limit <= 0.0 {
+        return None;
+    }
+    let used = data
+        .get("usage")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(0.0);
+
+    let micros = |usd: f64| -> u64 { (usd.max(0.0) * 1_000_000.0).round() as u64 };
+    Some(crate::provider::Bucket {
+        label: "credit".to_string(),
+        remaining_fraction: Some(((limit - used) / limit).clamp(0.0, 1.0)),
+        // A prepaid balance has no reset time: it is topped up, not renewed.
+        reset_at: None,
+        used: Some(micros(used)),
+        limit: Some(micros(limit)),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+    use serde_json::json;
+
+    /// The catalog maps ids and keeps them stable between runs.
+    #[test]
+    fn the_catalog_maps_ids_and_orders_them_deterministically() {
+        let body = json!({"data": [
+            {"id": "z-model", "name": "Z"},
+            {"id": "a-model", "name": "A"},
+            {"id": "a-model", "name": "A again"},
+        ]});
+        let models = models_from_catalog(&body);
+        assert_eq!(
+            models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec!["a-model", "z-model"],
+            "sorted by id, and a duplicate id collapses rather than appearing twice"
+        );
+        // A bare array is accepted too, because some OpenAI-compatible builds answer that way.
+        let bare = json!([{"id": "only"}]);
+        assert_eq!(models_from_catalog(&bare).len(), 1);
+    }
+
+    /// A row nobody can name is skipped, not given a placeholder.
+    ///
+    /// A fabricated id would put a `--model` value in the picker that the endpoint rejects,
+    /// which is worse than a shorter list.
+    #[test]
+    fn a_catalog_row_with_no_usable_id_is_skipped() {
+        let body = json!({"data": [
+            {"id": ""},
+            {"name": "no id at all"},
+            {"id": "real"},
+        ]});
+        let models = models_from_catalog(&body);
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "real");
+        assert_eq!(
+            models[0].display, "real",
+            "with no name the id is its own display, not an empty cell"
+        );
+    }
+
+    /// A body that is neither shape yields nothing rather than panicking.
+    #[test]
+    fn a_catalog_of_an_unexpected_shape_is_empty_not_a_panic() {
+        for body in [
+            json!({}),
+            json!("a string"),
+            json!({"data": 7}),
+            json!(null),
+        ] {
+            assert!(models_from_catalog(&body).is_empty(), "{body}");
+        }
+    }
+
+    /// The credit bucket is real micros, and a fraction that cannot go out of range.
+    #[test]
+    fn the_credit_bucket_converts_dollars_to_micros() {
+        let bucket = credit_bucket(&json!({"data": {"limit": 10.0, "usage": 2.5}}))
+            .expect("a limited key has a balance");
+        assert_eq!(bucket.label, "credit");
+        assert_eq!(bucket.limit, Some(10_000_000));
+        assert_eq!(bucket.used, Some(2_500_000));
+        assert_eq!(bucket.remaining_fraction, Some(0.75));
+        assert!(
+            bucket.reset_at.is_none(),
+            "a prepaid balance does not renew"
+        );
+
+        // Over-spend is clamped rather than rendering a negative bar.
+        let over = credit_bucket(&json!({"data": {"limit": 1.0, "usage": 5.0}})).unwrap();
+        assert_eq!(over.remaining_fraction, Some(0.0));
+    }
+
+    /// An unlimited key, and a body with no limit at all, both yield **no** bucket.
+    ///
+    /// `None` rather than a zero: a zero would render as "nothing left", which is the
+    /// opposite of an unlimited key.
+    #[test]
+    fn an_unlimited_or_absent_limit_is_no_bucket_rather_than_zero() {
+        for body in [
+            json!({"data": {"limit": null, "usage": 1.0}}),
+            json!({"data": {"usage": 1.0}}),
+            json!({"data": {"limit": 0}}),
+            json!({}),
+        ] {
+            assert!(credit_bucket(&body).is_none(), "{body}");
+        }
+    }
+
+    /// The two vendors differ only in the constants the design document names.
+    #[test]
+    fn the_vendors_differ_only_where_the_design_document_says_they_do() {
+        assert_eq!(OPENROUTER.id, "openrouter");
+        assert_eq!(OPENROUTER.key_env, "OPENROUTER_API_KEY");
+        assert_eq!(DEEPSEEK.id, "deepseek");
+        assert_eq!(DEEPSEEK.key_env, "DEEPSEEK_API_KEY");
+        assert_ne!(OPENROUTER.base_url, DEEPSEEK.base_url);
+
+        // The credit endpoint exists for one of them, and its absence is what keeps
+        // DeepSeek's `usage` honest instead of inventing a bucket.
+        assert!(OPENROUTER.credit_url().is_some());
+        assert!(DEEPSEEK.credit_url().is_none());
+
+        // Both endpoints are derived from the base URL rather than written out twice.
+        for vendor in [OPENROUTER, DEEPSEEK] {
+            assert!(vendor.models_url().ends_with("/models"));
+            assert!(vendor.completions_url().ends_with("/chat/completions"));
+        }
+    }
+
+    /// Attribution is the only header difference, and both carry the credential.
+    #[test]
+    fn the_headers_carry_the_key_and_only_openrouter_gets_attribution() {
+        let openrouter = OPENROUTER.headers("k");
+        assert_eq!(openrouter[0].1, "Bearer k");
+        assert!(openrouter.iter().any(|(name, _)| name == "X-Title"));
+
+        let deepseek = DEEPSEEK.headers("k");
+        assert_eq!(
+            deepseek.len(),
+            1,
+            "no attribution header DeepSeek never asked for"
+        );
+        assert_eq!(deepseek[0].1, "Bearer k");
+    }
+
+    /// Asking for usage accounting is vendor vocabulary, not shared.
+    ///
+    /// It is the whole reason `cost_usd_micros` can be real, and a shared module guessing the
+    /// spelling would `400` on the vendor that spells it differently.
+    #[test]
+    fn each_vendor_asks_for_usage_in_its_own_vocabulary() {
+        assert_eq!(DEEPSEEK.usage_request().0, "stream_options");
+        assert_eq!(OPENROUTER.usage_request().0, "usage");
+        assert_ne!(DEEPSEEK.usage_request().1, OPENROUTER.usage_request().1);
     }
 }

@@ -153,6 +153,24 @@ pub trait HttpClient: Send + Sync {
     /// `HttpTransport` would then report the decoder's truncation error instead — the
     /// failure would be misattributed rather than hidden.
     fn post(&self, request: &HttpRequest) -> Result<HttpResponse>;
+
+    /// Send one GET with no body, and return its response.
+    ///
+    /// Added by M10's follow-up. Until then the trait was POST-only *by construction* — its
+    /// one caller streams a completion — and two things had no route through it:
+    /// `GET /models` for a catalog, and OpenRouter's `GET /key` for the only quota-like
+    /// figure either API-key vendor has. Both are honest stubs in `provider/api.rs` that
+    /// this method unblocks.
+    ///
+    /// Same contract as [`HttpClient::post`]: a non-2xx is **returned**, not raised, so one
+    /// place decides how a failure is described. And the same rule about the credential — the
+    /// caller reads the key and passes it in as a header, so no client ever holds or logs it.
+    ///
+    /// **No default implementation on purpose.** A default that errored would let a client
+    /// silently lack the capability, and the one place that would show up is a stub returning
+    /// the wrong reason for the wrong cause. Requiring it makes every client state what it
+    /// does.
+    fn get(&self, url: &str, headers: &[(String, String)]) -> Result<HttpResponse>;
 }
 
 /// Everything one endpoint needs, minus the credential.
@@ -214,6 +232,71 @@ impl HttpSpec {
         }
     }
 }
+
+/// Read a whole (non-streaming) body, with a hard size cap.
+///
+/// For the two calls that are not a streamed completion: a model catalog and a
+/// credit figure. Both come from a remote even pie does not control, and `cache::read`
+/// already had to learn this lesson (B22) — an unbounded read of somebody else's file is an
+/// allocation you did not choose. The cap is generous because a catalog is legitimately
+/// large and a credit figure is not, and one cap for both is one thing to reason about.
+pub fn read_body(response: &mut HttpResponse, cap_bytes: usize) -> Result<String> {
+    let mut out: Vec<u8> = Vec::new();
+    while let Some(chunk) = response.stream.next_chunk()? {
+        if out.len().saturating_add(chunk.len()) > cap_bytes {
+            return Err(PieError::Backend {
+                backend: "http".to_string(),
+                status: "response too large".to_string(),
+                detail: format!(
+                    "the body exceeded the {cap_bytes}-byte cap, so it was not read in full"
+                ),
+            });
+        }
+        out.extend_from_slice(&chunk);
+    }
+
+    // Lossy rather than strict: a catalog entry with one bad byte should cost that byte, not
+    // the whole request. The same choice `drain_tail` makes for stderr, and the reason is the
+    // same — the alternative discards a good answer because a vendor printed something odd.
+    Ok(String::from_utf8_lossy(&out).into_owned())
+}
+
+/// Send a GET and read its body, turning a non-2xx into a stated error.
+///
+/// The error names the status and a **redacted** body, exactly as the streaming path does —
+/// one place decides how an HTTP failure is described, or the two would eventually disagree
+/// about whether a body is echoed. (It is redacted, and never a header, so the credential
+/// cannot be read back out of a failure.)
+pub fn get_json(
+    client: &dyn HttpClient,
+    backend: &str,
+    url: &str,
+    headers: &[(String, String)],
+) -> Result<Value> {
+    let mut response = client.get(url, headers)?;
+    let status = response.status;
+    let body = read_body(&mut response, MAX_JSON_BODY_BYTES)?;
+
+    if !(200..300).contains(&status) {
+        // Both the backend **and** the URL, because two vendors share this helper: a failure
+        // that named neither would leave a user with both configured unable to tell which one
+        // refused — and `http` alone, the first version, told them nothing at all.
+        return Err(PieError::Backend {
+            backend: backend.to_string(),
+            status: format!("HTTP {status}"),
+            detail: format!("{url}: {}", truncate(&process::redact(&body), 600)),
+        });
+    }
+
+    serde_json::from_str(&body).map_err(|e| PieError::Backend {
+        backend: backend.to_string(),
+        status: "non-JSON response".to_string(),
+        detail: format!("{url}: {e}"),
+    })
+}
+
+/// Generous enough for a model catalog, finite enough to be a bound.
+const MAX_JSON_BODY_BYTES: usize = 8 * 1024 * 1024;
 
 /// M9's [`Transport`], over one HTTP endpoint.
 pub struct HttpTransport {
@@ -658,11 +741,25 @@ struct NoTransport;
 #[cfg(not(feature = "http"))]
 impl HttpClient for NoTransport {
     fn post(&self, request: &HttpRequest) -> Result<HttpResponse> {
-        Err(PieError::Config(format!(
-            "this build has no TLS transport (`http` was disabled), so {} cannot be reached — \
-             a turn against an API-key backend needs a build with the default features",
-            request.url
-        )))
+        Err(self.no_tls(&request.url))
+    }
+
+    fn get(&self, url: &str, _headers: &[(String, String)]) -> Result<HttpResponse> {
+        Err(self.no_tls(url))
+    }
+}
+
+#[cfg(not(feature = "http"))]
+impl NoTransport {
+    /// The one thing a no-TLS build can say, said the same way for both verbs.
+    ///
+    /// Shared rather than repeated: two copies of this message would eventually disagree
+    /// about which feature is missing, and the message is the whole value of the stub.
+    fn no_tls(&self, url: &str) -> PieError {
+        PieError::Config(format!(
+            "this build has no TLS transport (`http` was disabled), so {url} cannot be reached — \
+             this needs a build with the default features"
+        ))
     }
 }
 
@@ -689,6 +786,27 @@ impl HttpClient for ReqwestClient {
                 }
 
                 let response = builder.json(body).send().await?;
+                Ok(HttpResponse {
+                    status: response.status().as_u16(),
+                    stream: Box::new(ReqwestStream { response }),
+                })
+            })
+        })
+    }
+
+    fn get(&self, url: &str, headers: &[(String, String)]) -> Result<HttpResponse> {
+        let client = &self.client;
+
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async move {
+                let mut builder = client.get(url);
+                // Headers only — a GET carries no body, so there is nothing else to attach
+                // and nothing that could carry the conversation by accident.
+                for (name, value) in headers {
+                    builder = builder.header(name.as_str(), value.as_str());
+                }
+
+                let response = builder.send().await?;
                 Ok(HttpResponse {
                     status: response.status().as_u16(),
                     stream: Box::new(ReqwestStream { response }),
