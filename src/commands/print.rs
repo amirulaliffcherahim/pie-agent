@@ -50,6 +50,13 @@ pub async fn run(cfg: &Config, cli: &Cli, prompt: &str) -> Result<()> {
                 }
             }
 
+            // Surfaced so the id can be passed back via `--resume`: without it a
+            // conversation is unreachable, which is what makes resume usable at
+            // all. stderr, so stdout stays a clean answer channel.
+            if let Some(id) = &turn.conversation_id {
+                eprintln!("[resume] {id}");
+            }
+
             session_log::append_best_effort(&SessionLogRow::from_turn(
                 &backend,
                 &model,
@@ -78,6 +85,7 @@ fn build_request(cli: &Cli, prompt: &str, model: &str) -> ChatRequest {
     let mut request = ChatRequest::new(prompt);
     request.model = Some(model.to_string());
     request.effort = cli.effort.clone();
+    request.resume = cli.resume.clone();
     request.cwd = cli
         .cwd
         .clone()

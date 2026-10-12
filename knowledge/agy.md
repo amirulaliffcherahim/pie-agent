@@ -164,6 +164,44 @@ always correct. Do not "fix" pie for a shell artifact.
 
 ## Usage / quota
 
+## Resume, and cache-token accounting (measured 2026-10-12)
+
+Measured through pie against agy 1.3.3, three turns on `gemini-3.8-flash`:
+
+| Turn | `input_tokens` | `cache_read_tokens` | duration | answer |
+|---|---|---|---|---|
+| A fresh, seeds "remember 41" | 20 670 | 0 | 40.5 s | `ok` |
+| B **resumed** via `--conversation <id>` | 22 937 | 18 619 | **41.2 s** | `41` |
+| C fresh, same follow-up as B, no resume | 13 556 | **104 041** | 69.7 s | verbose |
+
+**Two conclusions, both contradicting an assumption we were about to build on.**
+
+### 1. Resume works, and does not make agy faster
+
+B answered `41`, so `--conversation <id>` genuinely continues the conversation. But it
+cost 41.2 s against A's 40.5 s: **no latency win at all.** agy's ~10 s per-invocation
+initialisation plus inference dominates, and resume does not avoid the init because it
+is still a fresh process. Resume buys *context continuity*, not speed — which M5 needs
+for multi-turn work, but is not the answer to "agy is slow".
+
+For latency the lever is backend choice: codex answers a full turn in ~3.6 s.
+
+### 2. `cache_read_tokens` is not a subset of `input_tokens`
+
+Row C reported more cached tokens than input tokens (104 041 against 13 556), because
+agy accumulates cache reads across its own internal tool-loop steps rather than
+reporting a single prompt's cached portion. codex, by contrast, uses OpenAI semantics
+where `cached_input_tokens` *is* a subset of `input_tokens` (1 792 of 13 424).
+
+Consequence: any "cache hit rate" of the form `cached / input` is wrong for agy and
+can exceed 100% — it did, 767%. `report::cache_hit_rate` now divides by the larger of
+the two, which is bounded and defensible under either reading, but **the semantics are
+still not pinned per backend** and any token-efficiency metric built on this field
+must say which backend it is talking about. See `TOKEN-ECONOMICS.md` section 9.
+
+Row C is also not a clean control: it answered verbosely (857 output tokens), so its
+duration and token counts are not comparable to B's terse `41`.
+
 ## Caveats
 
 - `--model` must be paired with `--effort`.

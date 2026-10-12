@@ -46,6 +46,14 @@ pub struct Cli {
     #[arg(long)]
     pub json: bool,
 
+    /// Resume a previous conversation by id.
+    ///
+    /// The id is backend-specific: agy's `--conversation`, codex's `exec resume`.
+    /// `pie` prints the id it was given after every turn, and `--json` carries it
+    /// in the `init` event, so a caller can pick it up and pass it back.
+    #[arg(long, value_name = "ID")]
+    pub resume: Option<String>,
+
     /// Print a short argument-error hint.
     #[arg(long, hide = true)]
     pub explain_errors: bool,

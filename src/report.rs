@@ -44,12 +44,30 @@ impl Totals {
             .saturating_add(self.reasoning_tokens)
     }
 
-    /// Share of prompt tokens that came from cache, 0.0–1.0.
+    /// Share of the prompt that came from cache, 0.0–1.0.
+    ///
+    /// **The two backends do not agree on what `cached_input_tokens` means.**
+    /// codex (OpenAI semantics) reports it as a *subset* of `input_tokens`, so
+    /// 1 792 of 13 424 is a 13.3% hit rate. agy reports `cache_read_tokens`
+    /// separately and it can exceed `input_tokens` — measured 2026-10-12, a real
+    /// agy turn reported `input 13 556` with `cache 104 041`, because agy
+    /// accumulates cache reads across its own internal tool-loop steps.
+    ///
+    /// Dividing by `input_tokens` therefore produced a nonsense rate above 100%,
+    /// so the denominator is the larger of the two. That yields a defensible
+    /// "share of prompt work served from cache" under either interpretation and
+    /// stays inside 0..1, which is the honest thing to do until the semantics are
+    /// pinned down per backend (an open question in `TOKEN-ECONOMICS.md`).
     pub fn cache_hit_rate(&self) -> Option<f64> {
-        if self.input_tokens == 0 {
+        let cached = self.cached_input_tokens;
+        if cached == 0 {
+            return (self.input_tokens > 0).then_some(0.0);
+        }
+        let denominator = self.input_tokens.max(cached);
+        if denominator == 0 {
             return None;
         }
-        Some(self.cached_input_tokens as f64 / self.input_tokens as f64)
+        Some((cached as f64 / denominator as f64).clamp(0.0, 1.0))
     }
 }
 
@@ -214,6 +232,42 @@ mod tests {
         assert_eq!(Totals::default().cache_hit_rate(), None);
         let t = totals(&[row("agy", true, 1)]);
         assert!((t.cache_hit_rate().unwrap() - 0.4).abs() < f64::EPSILON);
+    }
+
+    /// Regression: agy reports `cache_read_tokens` separately from
+    /// `input_tokens`, and it can be far larger — a real turn showed
+    /// `input 13 556, cached 104 041`. Dividing by input gave a 767% hit rate.
+    #[test]
+    fn cache_hit_rate_stays_within_zero_and_one_for_both_backend_semantics() {
+        // codex-style: cached is a subset of input.
+        let codex_like = Totals {
+            input_tokens: 13_424,
+            cached_input_tokens: 1_792,
+            ..Totals::default()
+        };
+        let rate = codex_like.cache_hit_rate().unwrap();
+        assert!((rate - 0.1335).abs() < 0.01, "codex style gave {rate}");
+
+        // agy-style: cached exceeds input (measured on a real turn).
+        let agy_like = Totals {
+            input_tokens: 13_556,
+            cached_input_tokens: 104_041,
+            ..Totals::default()
+        };
+        let rate = agy_like.cache_hit_rate().unwrap();
+        assert!(
+            (0.0..=1.0).contains(&rate),
+            "a rate must be a fraction, got {rate}"
+        );
+        assert!((rate - 1.0).abs() < f64::EPSILON, "got {rate}");
+
+        // And a turn with no cache at all is a 0% hit, not `None`.
+        let uncached = Totals {
+            input_tokens: 100,
+            cached_input_tokens: 0,
+            ..Totals::default()
+        };
+        assert_eq!(uncached.cache_hit_rate(), Some(0.0));
     }
 
     #[test]
