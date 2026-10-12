@@ -119,8 +119,13 @@ jobs:
       # agy, codex, claude. This step asserts the command *succeeds*; the
       # printed rows are the reviewer's evidence in the run log.
       #
-      # `--locked` is deliberately not used yet: Cargo.lock is not committed at
-      # the time this workflow was written. Once it is committed, add
-      # `cargo run --locked -- --list-backends` here to make CI reproducible.
-      - name: "G4 acceptance (M0): cargo run -- --list-backends"
-        run: cargo run -- --list-backends
+      # On a CI runner none of the three vendor CLIs is installed, so this step
+      # proves the *degraded* path — every backend resolved and reported as
+      # `binary-missing` rather than panicking or hanging. The happy path is
+      # gate G5 on the developer's machine.
+      #
+      # `--locked` keeps CI reproducible: Cargo.lock is committed, and a
+      # dependency resolving differently on a runner than it did locally is a
+      # class of failure that should be caught, not smoothed over.
+      - name: "G4 acceptance (M0): cargo run --locked -- --list-backends"
+        run: cargo run --locked -- --list-backends

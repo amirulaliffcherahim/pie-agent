@@ -22,7 +22,7 @@ for M0–M2.
 |---|---|---|---|
 | Hidden child console | `CREATE_NO_WINDOW` = `0x0800_0000` creation flag; no console flash, ever | No-op — the flag does not exist; spawn normally | `src/process.rs` (invariant I1; unit test asserts the constant is applied) |
 | Process-tree kill | `taskkill /PID <pid> /T /F` — kills the shim's whole tree | Process-group kill (own group + signal the group), since the tree otherwise outlives the parent | `src/process.rs` (DESIGN §6.5); `kill_on_drop(true)` on both |
-| Binary resolution | Search `PATH` + `PATHEXT` (`.exe`, `.cmd`, `.bat`); a bare `codex` may resolve to a shim that cannot be spawned directly | Search `PATH` only; unix launcher scripts are executable and spawn directly | `src/paths.rs` helpers, consumed by each `Provider::binary(cfg)` |
+| Binary resolution | Search `PATH` + `PATHEXT` (`.exe`, `.cmd`, `.bat`); a bare `codex` may resolve to a shim that cannot be spawned directly | Search `PATH` only; unix launcher scripts are executable and spawn directly | `src/process.rs::resolve_binary`, consumed by each `Provider::binary(cfg)` |
 | Home directory | No `HOME` by default → fall back to `USERPROFILE` | `HOME` | `src/paths.rs` — resolve `HOME`, then `USERPROFILE` |
 | State directory | `%USERPROFILE%\.pie` unless overridden | `$HOME/.pie` unless overridden | `src/paths.rs`; `PIE_HOME` overrides the root on **both** platforms (DESIGN §7) |
 | argv length | `CreateProcess` limit ~32 767 chars | `execve` limit is much larger (per-arg `MAX_ARG_STRLEN` ~128 KiB) | pie bounds the *portable* case, not the Windows one: `Capabilities::max_prompt_argv = 20_000` for agy → `PieError::PromptTooLong`, exit 2 (I4). The 20 000 cap is deliberately OS-independent so a prompt cannot pass on Linux and fail on Windows. |
@@ -36,7 +36,8 @@ for M0–M2.
 |---|---|---|---|
 | Local Windows (primary) | `cargo fmt --check` · `cargo clippy --all-targets -- -D warnings` · `cargo test` · `cargo run -- --list-backends` — or `scripts/qc.ps1` | G1–G4 on the real target, including `cfg(windows)` paths: hidden spawn, `taskkill`, `PATHEXT`, `USERPROFILE` | Nothing about unix |
 | Local Windows, live | `scripts/qc.ps1 -Live` (**spends real subscription quota**) | G5: real agy/codex turns, usage probes, secret redaction | Linux |
-| Local cross-target | `cargo check --target x86_64-unknown-linux-gnu` (after `rustup target add x86_64-unknown-linux-gnu`) | `cfg`-gated compile errors in **pie's own** code — catches a `#[cfg(unix)]` block that does not type-check besides a Windows-only one. Type-checking does not link. | Linking, runtime behaviour, anything needing a Linux kernel. May also fail *earlier*, inside dependency build scripts (the rustls/`ring`/aws-lc C build needs a cross C toolchain); if it fails there, the result is **inconclusive, not a pie failure** — do not report it as a pie bug. |
+| Local cross-target | `cargo check --target x86_64-unknown-linux-gnu --all-targets --no-default-features` (after `rustup target add x86_64-unknown-linux-gnu`) | `cfg`-gated compile errors in **pie's own** code — catches a `#[cfg(unix)]` block that does not type-check besides a Windows-only one. Type-checking links nothing. | Linking, runtime behaviour, anything needing a Linux kernel |
+| Local cross-target, full features | `cargo check --target x86_64-unknown-linux-gnu` (no `--no-default-features`) | Nothing extra on this machine | **Unavailable here.** The `http` feature pulls `rustls` → `ring`, which compiles C for the target and needs a `x86_64-linux-gnu-gcc` cross toolchain that does not exist on a Windows dev box. The failure is **inconclusive, not a pie bug** — that is exactly why the `http` feature exists and why G6 passes `--no-default-features`. Full-feature Linux compilation is proven by the ubuntu CI job. |
 | WSL2 | `bash scripts/qc.sh` | Everything Linux does, locally | **Currently impossible**: WSL cannot boot on this machine (`HCS_E_SERVICE_NOT_AVAILABLE`). Not a verified channel today. |
 | Linux | `.github/workflows/ci.yml`, job `gates (ubuntu-latest)` | G1–G4 on real Linux with a real linker — the authoritative Linux check | G5 (a subscription-account operation, never run in CI) |
 | macOS | `.github/workflows/ci.yml`, job `gates (macos-latest)` | The unix code paths build and pass tests on a second unix kernel | Any macOS-specific behaviour, and x86_64 macOS |
@@ -85,7 +86,7 @@ CI is the **only** real Linux verification channel for this project
 
 - `planning/DESIGN.md` — §1 platform facts, §6 process contract, §7 state,
   §8 config/env scrubbing, §9 backend argv. **Authoritative.**
-- `planning/ACCEPTANCE.md` — §1 the five gates, §2 global invariants I1–I9.
+- `planning/ACCEPTANCE.md` — §1 the six gates (G1–G6), §2 global invariants I1–I11, §9 the bug log.
 - `.gitattributes` — line-ending normalisation; LF is pinned for source and
   scripts so a Linux/WSL/macOS checkout is byte-identical to a Windows one.
 - `scripts/qc.sh` · `scripts/qc.ps1` — the local gate runners. CI runs the same
