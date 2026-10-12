@@ -59,7 +59,9 @@ fn ready(model: &str) -> bool {
     );
 
     if !live_enabled() {
-        eprintln!("skipping: set PIE_LIVE=1 to run live smoke tests (this spends subscription quota)");
+        eprintln!(
+            "skipping: set PIE_LIVE=1 to run live smoke tests (this spends subscription quota)"
+        );
         return false;
     }
     true
@@ -108,7 +110,11 @@ fn assert_turn_recorded(home: &Path, provider: &str, output: &std::process::Outp
     );
 
     let rows = session_rows(home);
-    assert_eq!(rows.len(), 1, "expected exactly one session-log row, got {rows:#?}");
+    assert_eq!(
+        rows.len(),
+        1,
+        "expected exactly one session-log row, got {rows:#?}"
+    );
 
     let row = &rows[0];
     assert_eq!(row["provider"], provider);
@@ -138,7 +144,10 @@ fn assert_turn_recorded(home: &Path, provider: &str, output: &std::process::Outp
         "error_kind",
         "stop_reason",
     ] {
-        assert!(row.get(key).is_some(), "session row is missing `{key}`: {row}");
+        assert!(
+            row.get(key).is_some(),
+            "session row is missing `{key}`: {row}"
+        );
     }
 }
 

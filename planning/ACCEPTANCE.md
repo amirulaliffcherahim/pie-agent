@@ -224,7 +224,7 @@ Appended as gates pass. Evidence = command + observed result, not a claim.
 
 | Milestone | G1 | G2 | G3 | G4 | G5 | G6 | Verdict | Evidence |
 |---|---|---|---|---|---|---|---|---|
-| M0 | ✅ | ✅ | ✅ | ✅ | n/a | ✅ | **done** | 90 tests pass (`86` lib + `4` bin); `--list-backends` prints agy/codex/claude with agy `1.3.3`, codex `codex-cli 0.162.0`, claude `2.1.296` + `no-subscription`; `cargo check --target x86_64-unknown-linux-gnu` clean |
+| M0 | ✅ | ✅ | ✅ | ✅ | n/a | ✅ | **done** | 113 tests pass (100 lib + 6 `no_secrets` + 7 `process`), 5 live-smoke tests correctly ignored; `--list-backends` prints agy/codex/claude with agy `1.3.3`, codex `codex-cli 0.162.0`, claude `2.1.296` + `no-subscription`; `cargo check --target x86_64-unknown-linux-gnu --all-targets --no-default-features` clean |
 | M1 | — | — | — | — | — | — | not started | — |
 | M2 | — | — | — | — | — | — | not started | — |
 
@@ -246,6 +246,7 @@ prevents it. This is the record the milestone verdicts above rest on.
 | B4 | major | `#[async_trait]` missing on the three `impl Provider` blocks — the crate did not compile at all (E0195) | `cargo check` | Added the attribute to each impl | compile gate |
 | B5 | minor | Env-mutating tests raced on `HOME`/`PIE_HOME` (process-global, parallel threads), producing a nonsense failure in `paths::tests::empty_override_is_ignored` | `cargo test` | Added `src/testing.rs` with a shared `EnvGuard` that serialises env mutation and restores prior values on drop | whole `paths`/`auth`/`config` env suite |
 | B6 | minor | Table truncated paths with `…[truncated]`, hiding which binary was meant. `agy\bin\agy.exe` was unreadable | `--list-backends` acceptance run | Added `short_path`: keep the last three components, clip to the column width | `long_paths_keep_the_identifying_tail`, `short_path_never_exceeds_the_column_width`, `unix_style_paths_are_shortened_too` |
+| B7 | minor (process) | **A committed tree failed G1.** `tests/live_smoke.rs` was committed unformatted, because `cargo fmt --all` was run *before* writing that file and the next commit staged only selected paths. The tree at HEAD was red | `cargo fmt --all --check` run with the change stashed, to prove HEAD rather than the working tree | Reformat committed; the habit is now **`cargo fmt --all` → `git add -A` → run G1–G3 → commit**, so a formatting change can never be left behind in the working tree | covered by G1 itself |
 
 ### Findings that are not code bugs
 
