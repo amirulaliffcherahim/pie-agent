@@ -110,6 +110,8 @@ pub struct Codex {
     pub use_node_shim: bool,
     /// How long a cached model catalog stays fresh.
     pub model_cache_ttl_secs: u64,
+    /// How `pie usage codex` obtains quota buckets.
+    pub quota_probe: CodexQuotaProbe,
 }
 
 impl Default for Codex {
@@ -118,8 +120,29 @@ impl Default for Codex {
             bin: "codex".to_string(),
             use_node_shim: true,
             model_cache_ttl_secs: 86_400,
+            quota_probe: CodexQuotaProbe::default(),
         }
     }
+}
+
+/// Strategy for the codex quota probe.
+///
+/// `codex` has no CLI subcommand that reports quota, so `PLAN.md` §6 specifies
+/// the ChatGPT usage endpoint using the credential from `~/.codex/auth.json`.
+/// That is the closest thing in pie to calling a vendor endpoint directly, which
+/// is the pattern `PLAN.md` §5 and `knowledge/9router-findings.md` warn about.
+/// It is kept because the plan asks for it, and it is read-only using the
+/// user's own credential — but it is **not unconditional**: a private-endpoint
+/// call needs an off switch that does not require a code change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CodexQuotaProbe {
+    /// Query the ChatGPT usage endpoint. Default, per `PLAN.md` §6.
+    #[default]
+    Http,
+    /// Never call it. `pie usage codex` still reports pie's session-log totals;
+    /// only the quota buckets are unavailable.
+    Off,
 }
 
 /// Anthropic Claude Code CLI settings. Disabled: no subscription on this machine.
@@ -200,6 +223,17 @@ impl Config {
         }
         if let Some(v) = env_non_empty("PIE_CLAUDE_BIN") {
             self.claude.bin = v;
+        }
+        if let Some(v) = env_non_empty("PIE_CODEX_QUOTA_PROBE") {
+            self.codex.quota_probe = match v.to_ascii_lowercase().as_str() {
+                "http" => CodexQuotaProbe::Http,
+                "off" => CodexQuotaProbe::Off,
+                other => {
+                    return Err(PieError::Config(format!(
+                        "PIE_CODEX_QUOTA_PROBE must be http|off, got `{other}`"
+                    )))
+                }
+            };
         }
         Ok(())
     }
@@ -302,6 +336,42 @@ mod tests {
         assert_eq!(Agy::default().default_effort.as_deref(), Some("medium"));
         assert_eq!(Agy::default().print_timeout_secs, 0);
         assert!(!Claude::default().enabled, "claude stays off by default");
+        assert_eq!(
+            Codex::default().quota_probe,
+            CodexQuotaProbe::Http,
+            "PLAN §6 specifies the HTTP probe by default"
+        );
+    }
+
+    /// A private-endpoint call must be switchable off by the user, in config or
+    /// in the environment, with no code change.
+    #[test]
+    fn codex_quota_probe_can_be_turned_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[codex]\nquota_probe = \"off\"\n").unwrap();
+
+        let cfg = Config::load_from(&path).unwrap();
+        assert_eq!(cfg.codex.quota_probe, CodexQuotaProbe::Off);
+        // unrelated keys keep their defaults
+        assert!(cfg.codex.use_node_shim);
+
+        let _env = EnvGuard::set(&[("PIE_CODEX_QUOTA_PROBE", Some("OFF"))]);
+        let mut cfg = Config::default();
+        cfg.apply_env().unwrap();
+        assert_eq!(
+            cfg.codex.quota_probe,
+            CodexQuotaProbe::Off,
+            "case-insensitive"
+        );
+    }
+
+    #[test]
+    fn an_unrecognised_quota_probe_is_rejected_not_guessed() {
+        let _env = EnvGuard::set(&[("PIE_CODEX_QUOTA_PROBE", Some("maybe"))]);
+        let mut cfg = Config::default();
+        let err = cfg.apply_env().unwrap_err();
+        assert!(err.to_string().contains("PIE_CODEX_QUOTA_PROBE"));
     }
 
     #[test]

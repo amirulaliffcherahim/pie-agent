@@ -303,6 +303,7 @@ print_timeout_secs = 0             # 0 = wait for completion
 [codex]
 bin      = "codex"
 use_node_shim = true               # Windows: spawn node codex.js, not codex.cmd
+quota_probe   = "http"             # http | off — see the note below
 
 [claude]
 enabled  = false                   # no subscription on this machine
@@ -367,6 +368,13 @@ codex exec --cd <CWD> --approve-for-me --skip-git-repo-check --json
 - Usage: `GET https://chatgpt.com/backend-api/wham/usage` with
   `Authorization: Bearer <token>` + `ChatGPT-Account-Id: <account>`, both read
   from `~/.codex/auth.json`. Token never logged (redact in any error path).
+- **This is the only place pie reaches a vendor endpoint directly**, and it is
+  therefore gated: `codex.quota_probe = "http" | "off"` (env
+  `PIE_CODEX_QUOTA_PROBE`). `codex` exposes no CLI subcommand for quota, so
+  `PLAN.md` §6 specifies the endpoint — but a private-endpoint call must be
+  switchable off without a code change. With `off`, `Probe` returns an empty
+  report with a `notes` entry and makes no request; `pie usage codex` still
+  prints session-log totals. See `knowledge/9router-findings.md` §0 and §4.
 
 ### claude (M0 stub)
 

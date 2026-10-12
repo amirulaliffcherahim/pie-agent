@@ -109,10 +109,15 @@ than no compression step.
 
 1. **Is `wham/usage` acceptable?** `PLAN.md` §6 plans `pie usage codex` via the
    ChatGPT usage endpoint using the token from `~/.codex/auth.json`. 9router shows
-   the endpoint and the risk. Options: (a) keep it, documented as read-only and
-   credential-local; (b) drop it and report codex quota as unavailable; (c) derive
-   what we can from `turn.completed` usage in the session log. Decide explicitly
-   and record it in `DESIGN.md`, do not drift into it.
+   the endpoint and the risk. **Decision taken (2026-10-12):** keep it, because
+   the plan asks for it and the call is read-only using the user's own
+   credential — but gate it. `codex.quota_probe = "http" | "off"`
+   (`PIE_CODEX_QUOTA_PROBE`) turns it off with no code change, and with `off` no
+   request is constructed at all. It stays the *only* vendor-endpoint call in
+   pie; any second one should be treated as a design change, not a feature.
+   The alternatives that remain open if you later want them: (b) drop the probe
+   and report codex quota as unavailable, (c) derive what we can from
+   `turn.completed` usage in the session log.
 2. **Does resume actually beat a fresh turn?** Recommendation 1 is the largest
    claimed saving and the cheapest to test. Once M5 exists, measure
    `input_tokens` for the same task with and without resume using the frozen

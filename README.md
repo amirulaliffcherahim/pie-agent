@@ -95,7 +95,15 @@ default_effort = "medium"   # agy rejects --model without --effort
 [codex]
 bin           = "codex"
 use_node_shim = true        # never spawn codex.cmd; use node + codex.js
+quota_probe   = "http"      # http | off — see the note below
 ```
+
+`codex` has no CLI subcommand that reports quota, so `pie usage codex` is the one
+place pie reaches a vendor endpoint directly (the ChatGPT usage endpoint, with the
+credential from `~/.codex/auth.json`). It is read-only and local to your own
+credential, and it is switchable off: set `quota_probe = "off"`, or
+`PIE_CODEX_QUOTA_PROBE=off`, and no request is made — session-log totals still
+work. See `knowledge/9router-findings.md` for why that switch exists.
 
 ## Platform support
 
