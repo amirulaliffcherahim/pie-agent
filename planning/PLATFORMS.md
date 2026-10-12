@@ -30,6 +30,7 @@ for M0–M2.
 | Path separators in argv | `--add-dir <CWD>` receives a Windows path | unix path | `PathBuf` end-to-end; never string-concatenate paths |
 | Env scrubbing | API-key deny-list removed from the child env; `GOOGLE_APPLICATION_CREDENTIALS` preserved (agy's own auth path) | identical - no OS branch | `src/process.rs` / `src/config.rs` (I2) |
 | Gate-runner scripts | `scripts/qc.ps1` must be **pure ASCII**: Windows PowerShell 5.1 reads a `.ps1` without a UTF-8 BOM as Windows-1252, so one non-ASCII character inside a string is mojibake and the script fails to *parse* | `scripts/qc.sh` is UTF-8 and runs under `bash`; no constraint | CI step "Gate runner self-check"; documented in the `qc.ps1` header. This was bug B8 - it broke the Windows runner silently |
+| Manual CLI probes | Any probe passing a leading-slash argument (`agy --print /usage`) **must** set `MSYS_NO_PATHCONV=1`, or git-bash rewrites `/usage` into `C:/Program Files/Git/usage` and the CLI receives it as prompt text | not applicable - the trap is Windows-only | `knowledge/agy.md` "Probing slash commands from git-bash". This was bug B10: three probes produced misleading results and nearly dropped a working, free feature. **pie's own spawn path is unaffected** - `std::process::Command` does no rewriting, so pie's argv was always correct; do not "fix" pie for a shell artifact |
 
 ## 3. How each platform is verified
 

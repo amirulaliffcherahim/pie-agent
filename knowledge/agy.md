@@ -98,28 +98,71 @@ suffix is always present.
 
 ## Usage / quota
 
-`agy --print /usage --output-format json --print-timeout 30s`
-(slash-command expansion — do **not** pass `--disable-slash-commands`). Intended
-to return quota groups/buckets (5h + weekly, remaining fraction + reset time) at
-zero model tokens.
+`agy --print /usage --output-format json --print-timeout 0`
+(slash-command expansion — do **not** pass `--disable-slash-commands`). Returns the
+quota groups/buckets at **zero model tokens**.
 
-**Not reproducible on agy 1.3.3 as of 2026-10-12.** That exact command returned a
-`result` envelope with `status:"SUCCESS"`, `num_turns:0`, `response:""` and an
-all-zero `usage`, plus a partial-output warning on stderr — no quota payload at
-all. Verbatim capture: `tests/fixtures/agy_usage.json`.
+**Verified 2026-10-12 on agy 1.3.3.** `num_turns: 0`, `duration_seconds: 0`, every
+field of `usage` zero, and the quota payload under a `command` key — verbatim
+capture in `tests/fixtures/agy_usage.json`:
 
-So on this version `pie usage agy` cannot obtain buckets this way. Requirements
-that follow:
+```json
+{"status":"SUCCESS","num_turns":0,"usage":{all zeros},
+ "command":{"name":"usage","data":{
+   "description":"Within each group, models share a weekly limit and a 5-hour limit...",
+   "groups":[
+     {"name":"Gemini Models","description":"Models within this group: Gemini Flash, Gemini Pro",
+      "buckets":[
+        {"id":"gemini-weekly","name":"Weekly Limit Remaining","window":"weekly",
+         "remaining_fraction":0.884968638420105,"reset_time":"2026-10-15T01:32:32Z"},
+        {"id":"gemini-5h","name":"Five Hour Limit Remaining","window":"5h",
+         "remaining_fraction":0.9882727265357971,"reset_time":"2026-10-12T16:00:37Z"}]},
+     {"name":"Claude and GPT models",
+      "buckets":[
+        {"id":"3p-weekly","window":"weekly","remaining_fraction":0,
+         "reset_time":"2026-10-16T00:37:40Z"},
+        {"id":"3p-5h","window":"5h","remaining_fraction":1}]}]}}}
+```
 
-- "no buckets returned" must be surfaced as a **note**, never as an error and
-  never as an empty table the user could read as "no quota left" or "all fine";
-- the note must say that agy 1.3.3 returned no quota payload for `/usage` in print
-  mode, so the buckets are *missing*, not zero;
-- retry candidates for a later probe: `--output-format text`, dropping
-  `--print-timeout`, or a non-`--print` invocation.
+Path: `command.data.groups[]` → each group's `buckets[]` →
+`{id, name, description, window, remaining_fraction, reset_time}`. `reset_time`
+is **absent** on a disabled bucket, so a missing value is normal, not an error.
 
-`PLAN.md` §6 assumes this worked; that assumption is now tracked as an open
-question rather than a fact.
+Two details that matter for pie:
+
+- **A bucket's group is required to identify it.** Both groups carry a bucket
+  whose `window` is `weekly`, and both are named "Weekly Limit Remaining". A label
+  built from the bucket alone renders two indistinguishable rows, so the group
+  name must be part of it.
+- **`--print-timeout 0` is required**, not a shorter timeout. With `30s` the
+  expansion did not complete inside the window and the capture came back as an
+  empty `response` with no payload; with `0` ("wait for the turn to complete") it
+  returns immediately. Do not "protect" this probe with a short timeout — it is
+  free, so waiting is the correct behaviour.
+
+## Probing slash commands from git-bash: set `MSYS_NO_PATHCONV=1`
+
+> **This cost a wrong design decision once. Read it.**
+
+MSYS/git-bash rewrites an argument that begins with `/` into a Windows path
+before the child process sees it. So this probe:
+
+```sh
+agy --print /usage --output-format json --print-timeout 0     # WRONG from git-bash
+```
+
+reaches agy with the literal prompt text `C:/Program Files/Git/usage`. agy then
+treats it as a *prompt*, spends a real model turn (~20 700 input tokens), and
+answers a question about how much disk space Git uses. Three separate probes
+produced three different misleading results this way, and nearly concluded that
+`/usage` was broken and expensive when it is in fact free and reliable.
+
+Set `MSYS_NO_PATHCONV=1` for any manual probe from git-bash that passes a
+leading-slash argument. This affects probes only: pie spawns `agy` through
+`std::process::Command`, which performs no such rewriting, so pie's own argv was
+always correct. Do not "fix" pie for a shell artifact.
+
+## Usage / quota
 
 ## Caveats
 

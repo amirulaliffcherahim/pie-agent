@@ -146,17 +146,39 @@ cargo run -- usage agy
 - the `hi` turn prints a short reply and exits 0
 - one row is appended to `~/.pie/usage.jsonl` with `provider:"agy"`,
   `model:"gemini-3.8-flash"`, `ok:true`, non-zero `input_tokens` (§7 schema of DESIGN.md)
-- `usage agy` prints quota buckets with remaining fraction + reset time, and the
-  run makes **no** model call (it is a slash expansion)
-- `--model` without `--effort` is auto-filled from config (`medium`), never errors
+- `usage agy` prints quota buckets with remaining fraction + reset time
+- `usage agy` prints **no** session-log row: it is a zero-token slash expansion
+  (`num_turns: 0`, all usage fields zero), so it must never be recorded as a turn
+
+**Effort and the model catalog** (revised 2026-10-12, after live evidence — see §9 B10)
+
+- The catalog id is `{base}-{effort}` and effort support is **per model and not
+  uniform**: `gemini-3.8/3.7/3.6-flash` offer low|medium|high, `gemini-3.1-pro`
+  offers low|high with no medium, `gpt-oss-120b` offers only medium
+  (`knowledge/agy.md` Models).
+- `--model` without `--effort` takes the configured default when the model offers
+  it; when it does not, the closest supported effort is substituted and announced
+  on stderr — it must never build an argv agy will reject.
+- an **explicit** `--effort` the model does not offer ⇒ `PieError::Config` (exit 2)
+  naming that model's valid set
+- the catalog is the source of truth; any hardcoded list is a fallback for when
+  the catalog is unavailable, and must be documented as such
 
 **Checks**
 
 - [ ] `--disable-slash-commands` present for turns, **absent** for `/usage` (deliberate asymmetry)
-- [ ] `--print-timeout <N>s` always passed; `0` means wait for completion
+- [ ] `--print-timeout` passed for both; turns may use `0`, and the `/usage` probe
+      **must** use `0` — with `30s` the expansion returned an empty payload (B10)
 - [ ] model catalog read from `agy models` and cached with 24h TTL; a cache hit makes no CLI call
+- [ ] catalog rows are grouped by base id, one `Model` per base, carrying that model's own effort set
+- [ ] `usage` buckets carry their **group** name in the label: both groups contain a
+      `weekly` bucket named "Weekly Limit Remaining", so a bucket-only label is ambiguous
+- [ ] a missing `reset_time` (a disabled bucket) becomes `None`, not an error
 - [ ] hidden spawn — no console flash on the live run (I1)
 - [ ] timeout ⇒ process tree killed, `PieError::Timeout`, exit 5 (test with a tiny timeout)
+- [ ] a manual `/usage` probe from git-bash must set `MSYS_NO_PATHCONV=1`, or MSYS
+      rewrites `/usage` into a Windows path and the probe answers a question about
+      Git instead (B10). pie's own spawn path is unaffected
 
 ## 5. M2 — codex backend (delegate) — LIVE
 
@@ -266,6 +288,7 @@ prevents it. This is the record the milestone verdicts above rest on.
 | B7 | minor (process) | **A committed tree failed G1.** `tests/live_smoke.rs` was committed unformatted, because `cargo fmt --all` was run *before* writing that file and the next commit staged only selected paths. The tree at HEAD was red | `cargo fmt --all --check` run with the change stashed, to prove HEAD rather than the working tree | Reformat committed; the habit is now **`cargo fmt --all` → `git add -A` → run G1–G3 → commit**, so a formatting change can never be left behind in the working tree | covered by G1 itself |
 | B8 | **blocker** | **The Windows gate runner did not run at all.** `scripts/qc.ps1` contained UTF-8 em-dashes and no BOM, so Windows PowerShell 5.1 read the file as Windows-1252, turned `—` into `\uFFFD?"` inside string literals, and failed to *parse* — `Unexpected token ')'`. The gate runner on the primary platform was dead, and nothing had ever executed it | Running it (`powershell -NoProfile -ExecutionPolicy Bypass -File scripts/qc.ps1`), which failed before G1 with parse errors | Both gate scripts converted to pure ASCII; the encoding rule documented in `qc.ps1`'s header; CI now parse-checks `qc.ps1` under `shell: powershell` **and** asserts it contains no byte > 127 | CI step "Gate runner self-check (parse + ASCII-only)" |
 | B9 | minor (process) | A commit landed with a **red G2**. `cargo clippy` failed in a test (`unnecessary_to_owned`) but the command was `cargo clippy … \| grep … ; git commit`: the pipe made the status that of `grep`, and `;` committed regardless. Same family as B7 - the gate ran, but could not gate | Reading the gate output in the same command that committed | Fixed the lint; the rule is now written into §1 | the gate runners themselves |
+| B10 | **major** | **Three `/usage` probes gave three different wrong answers, because the shell rewrote the argument.** git-bash/MSYS turns a leading-slash argument into a Windows path, so `agy --print /usage` reached agy as the literal prompt text `C:/Program Files/Git/usage`. Consequences: one probe burned a real ~20 700-token model turn answering *"how much disk space does Git use"*; another returned an empty payload with `num_turns: 0`; that empty one was recorded as the fixture. The near-miss: I concluded `/usage` was broken and quota-costing and drafted a design change to drop `pie usage agy` entirely. It is in fact free (`num_turns: 0`, all usage zero) and returns a full quota payload | Re-running with `MSYS_NO_PATHCONV=1`, which returned the real payload. The discriminator is cheap and should have been used first: a **mangled** probe shows `num_turns: 1` with ~20 700 input tokens, while a **real** expansion shows `num_turns: 0` and all-zero usage - a free probe reporting 20 700 tokens spent is a probe-harness bug, not CLI behaviour | Corrected `tests/fixtures/agy_usage.json` to the real capture; fixed `usage_args()` to `--print-timeout 0` (with `30s` the expansion returned an empty payload); **reverted a false claim I had written into `knowledge/agy.md`** from the corrupted capture; documented the trap in `knowledge/agy.md` and `PLATFORMS.md`; ACCEPTANCE section 4 now requires a manual probe to set `MSYS_NO_PATHCONV=1` | Real-capture parser tests (4 buckets across 2 groups, `remaining_fraction` ~= 0.8849); ACCEPTANCE section 4 checks. Note pie's own spawn path was never affected - `std::process::Command` does no rewriting |
 
 ### Findings that are not code bugs
 
