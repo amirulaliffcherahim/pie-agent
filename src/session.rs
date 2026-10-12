@@ -231,6 +231,30 @@ impl Session {
         }
     }
 
+    /// Re-open a recorded session whose next turn runs on a **different** backend.
+    ///
+    /// `--switch <backend>` (`DESIGN.md` §11) continues one of pie's sessions on
+    /// another backend, so the id and the transcript are kept — that is what makes
+    /// a switch a continuation rather than a second conversation — while
+    /// `provider` becomes the backend the next turn runs on.
+    ///
+    /// It has to change, and for a reason that is not cosmetic: the index frame
+    /// describes the **newest** turn, so a frame still naming the backend that was
+    /// left would disagree with the row written beneath it — the two are asserted
+    /// to agree — and `--continue` on the new backend could never find a
+    /// conversation it now holds, because the id it would hand back was the one
+    /// that backend issued.
+    pub fn reopen_on_in(
+        root: impl Into<PathBuf>,
+        summary: SessionSummary,
+        provider: impl Into<String>,
+    ) -> Self {
+        Self {
+            provider: provider.into(),
+            ..Self::reopen_in(root, summary)
+        }
+    }
+
     /// `$PIE_HOME/sessions/<id>.jsonl`
     pub fn transcript_path(&self) -> PathBuf {
         transcript_path(&self.root, &self.id)

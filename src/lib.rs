@@ -26,6 +26,7 @@ pub mod config;
 pub mod error;
 pub mod jsonl;
 pub mod logging;
+pub mod mcp;
 pub mod ocr;
 pub mod paths;
 pub mod process;

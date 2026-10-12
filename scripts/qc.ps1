@@ -169,6 +169,9 @@ Invoke-Gate -Label 'G4 acceptance (M4 usage)' -Argv @('run', '--', 'usage')
 Invoke-Gate -Label 'G4 acceptance (M5 sessions)' -Argv @('test', '--test', 'sessions')
 Invoke-Gate -Label 'G4 acceptance (M5 compact)' -Argv @('test', '--test', 'compact')
 Invoke-Gate -Label 'G4 acceptance (M5 ocr)' -Argv @('test', '--test', 'ocr')
+# Stage E's server has its own binary, so its gate is its own command: the stdio
+# handshake, driven through the built binary rather than through the library.
+Invoke-Gate -Label 'G4 acceptance (M5 mcp)' -Argv @('test', '--test', 'mcp')
 
 # --- G5 (live acceptance) ---------------------------------------------------
 if ($Live) {

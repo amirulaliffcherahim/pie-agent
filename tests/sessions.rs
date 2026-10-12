@@ -1,12 +1,15 @@
-//! Gate G4 for M5 sessions: persistence (stage A) and continuation (stage B).
+//! Gate G4 for M5 sessions: persistence (stage A), continuation (stage B) and the
+//! backend switch (stage F).
 //!
 //! `planning/ACCEPTANCE.md` §8: row A is *"a turn writes `<id>.jsonl` plus an
 //! index row; a write failure never fails the turn"*, row B is *"`--continue`
 //! picks the newest session for provider+cwd; `--session <id>` targets one; a
 //! vendor id that no longer exists re-bootstraps instead of erroring; **the
-//! session id is surfaced after a turn**"*. `planning/DESIGN.md` §11 is the
-//! contract. This file is where both are enforced — one binary for both stages,
-//! because they are two halves of the same store.
+//! session id is surfaced after a turn**"*, and row F is *"switching backends
+//! rebuilds the prompt from pie's transcript and records the new vendor id —
+//! payload-level, no quota"*. `planning/DESIGN.md` §11 is the contract. This file
+//! is where all three are enforced — one binary for all three stages, because they
+//! are three halves of the same store.
 //!
 //! Every turn here runs against a **stand-in** `agy` that prints a recorded
 //! fixture (the same mechanism `tests/parse_agy.rs` and `tests/cache.rs` use), so
@@ -883,8 +886,14 @@ fn a_stale_conversation_is_recognised_and_an_unrelated_failure_is_not() {
     }
 }
 
-/// The prompt a re-bootstrap sends: the history pie still has, then `---`, then
-/// the task. This is the stage C seam, so the shape is asserted here.
+/// The prompt a re-bootstrap sends: the history pie still has, then the task.
+///
+/// Stage B pinned this shape when the replay was raw, and it is the seam stage C
+/// filled: the bytes now come from `compact::assemble`, so what is asserted here
+/// is the property stage B was actually protecting — the whole history, in order,
+/// with the volatile task text last — rather than the old framing. The failed
+/// turn's `stop_reason` is not in this payload: `compact` renders only a row's
+/// prompt and response outside the state block, which is its own documented rule.
 #[test]
 fn seeding_renders_the_earlier_turns_then_the_task() {
     let rows = vec![
@@ -917,14 +926,25 @@ fn seeding_renders_the_earlier_turns_then_the_task() {
     // Both halves of the earlier turn, which is what makes the rebuild useful.
     assert!(seeded.contains("first task"), "{seeded}");
     assert!(seeded.contains("FIRST ANSWER"), "{seeded}");
-    // A failed turn is history too: what was asked, and why nothing came back.
+    // A failed turn is history too: what was asked, with no answer after it.
     assert!(seeded.contains("second task"), "{seeded}");
-    assert!(seeded.contains("timeout"), "{seeded}");
-    // The separator §11 asks for, with the task after it — and last, because the
-    // task is the volatile text.
-    let separator = seeded.find("\n---\n").expect("a `---` separator");
-    assert!(seeded[separator..].contains("third task"), "{seeded}");
+    assert!(
+        !seeded.contains("timeout"),
+        "the reason is rendered in the state block, not in a replayed turn: {seeded}"
+    );
+
+    // The task is last, and the history precedes it in order.
     assert!(seeded.ends_with("third task"), "{seeded}");
+    let task = seeded.rfind("third task").expect("the task text");
+    let history = &seeded[..task];
+    let first = history.find("first task").expect("the first turn");
+    let second = history.find("second task").expect("the second turn");
+    assert!(first < second, "chronological: {seeded}");
+
+    // Nothing is elided below the compaction threshold, and the note says what the
+    // payload is: not the backend's own context, but a reconstruction.
+    assert!(seeded.starts_with(print::REBUILD_NOTE), "{seeded}");
+
     // Seeding is not recursive: a recorded row holds the user's text, never a
     // payload, so a re-bootstrapped turn cannot nest history inside history.
     assert_eq!(seeded.matches("first task").count(), 1, "{seeded}");
@@ -1727,4 +1747,615 @@ fn no_other_command_writes_a_session_row() {
             command.join(" ")
         );
     }
+}
+
+// ----------------------------------------------- the backend switch (stage F) --
+
+/// A transcript of `rows`, written directly, with fixed timestamps.
+///
+/// Stage A's writer has its own tests. What stage F needs is a transcript whose
+/// *shape* is chosen — how long it is, which backend it ran on, which vendor id it
+/// recorded — without running a turn for each, because a turn costs quota and the
+/// switch is a payload transformation.
+fn seed_rows(
+    fixture: &Fixture,
+    id: &str,
+    provider: &str,
+    vendor: Option<&str>,
+    rows: &[(&str, &str)],
+) -> SessionSummary {
+    std::fs::create_dir_all(fixture.sessions_dir()).unwrap();
+
+    let mut text = String::new();
+    for (index, (prompt, response)) in rows.iter().enumerate() {
+        let row = TurnRow {
+            ts: 1_000 + index as u64,
+            provider: provider.to_string(),
+            model: "gemini-3.8-flash".to_string(),
+            prompt: (*prompt).to_string(),
+            response: (*response).to_string(),
+            conversation_id: vendor.map(str::to_string),
+            usage: Usage::default(),
+            ok: true,
+            stop_reason: "SUCCESS".to_string(),
+        };
+        text.push_str(&serde_json::to_string(&row).unwrap());
+        text.push('\n');
+    }
+    std::fs::write(session::transcript_path(&fixture.sessions_dir(), id), text).unwrap();
+
+    SessionSummary {
+        id: id.to_string(),
+        provider: provider.to_string(),
+        cwd: fixture.work().display().to_string(),
+        started_at: 1_000,
+        updated_at: 1_000,
+        turns: rows.len() as u64,
+        preview: rows
+            .first()
+            .map(|(prompt, _)| (*prompt).to_string())
+            .unwrap_or_default(),
+    }
+}
+
+/// A recorded session with an empty transcript, and its own index frame.
+///
+/// The store tolerates one on purpose ("Empty transcript files read as empty"), and
+/// it is the one shape whose rebuilt payload is a single line — which is the only
+/// payload a batch-file stand-in can be handed on Windows, where `std` refuses to
+/// spawn a `.bat` with a multi-line argument. The multi-line rebuild is asserted at
+/// the payload level on every platform, and end to end where it can be delivered.
+fn seed_empty(fixture: &Fixture, id: &str, provider: &str) -> SessionSummary {
+    std::fs::create_dir_all(fixture.sessions_dir()).unwrap();
+    std::fs::write(session::transcript_path(&fixture.sessions_dir(), id), "").unwrap();
+
+    SessionSummary {
+        id: id.to_string(),
+        provider: provider.to_string(),
+        cwd: fixture.work().display().to_string(),
+        started_at: 1_000,
+        updated_at: 1_000,
+        turns: 0,
+        preview: String::new(),
+    }
+}
+
+/// A transcript of `turns` successful turns, for the compaction threshold.
+fn long_transcript(turns: usize) -> Vec<TurnRow> {
+    (0..turns)
+        .map(|i| TurnRow {
+            ts: 1_000 + i as u64,
+            provider: "agy".into(),
+            model: "gemini-3.8-flash".into(),
+            prompt: format!("ask {i}"),
+            response: format!("ANSWER-{i}"),
+            conversation_id: Some("conv-old".into()),
+            usage: Usage::default(),
+            ok: true,
+            stop_reason: "SUCCESS".into(),
+        })
+        .collect()
+}
+
+/// agy's argv for a request, as text. Pure: no process, so no quota.
+fn agy_argv(request: &ChatRequest) -> Vec<String> {
+    pie::provider::agy::build_args(&pie::config::Config::default(), request)
+        .expect("a request this test built is buildable")
+        .iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect()
+}
+
+/// ACCEPTANCE §8, stage F: switching backends rebuilds the prompt from pie's own
+/// transcript. The old vendor id belongs to the backend being left, so it is not
+/// handed over; the transcript is.
+#[test]
+fn switching_rebuilds_the_prompt_from_the_transcript() {
+    let fixture = Fixture::new();
+    let frame = seed_rows(
+        &fixture,
+        "s-1000-1",
+        "agy",
+        Some("conv-old"),
+        &[
+            ("first task", "FIRST ANSWER"),
+            ("second task", "SECOND ANSWER"),
+        ],
+    );
+    write_index(&fixture, &[frame]);
+
+    // `codex` is the new backend, so that is the provider `run` passes — and the
+    // session it finds is an agy one, which is exactly what a switch is for.
+    let selection = print::select(
+        &fixture.sessions_dir(),
+        &cli(&["-p", "next task", "--continue", "--switch", "codex"]),
+        "codex",
+        &fixture.work(),
+    )
+    .unwrap();
+
+    assert!(selection.is_switch(), "the selection is a switch");
+    let continuation = selection
+        .continuation()
+        .expect("the agy session is what is continued");
+    assert_eq!(continuation.summary.id, "s-1000-1");
+
+    let mut request = ChatRequest::new("next task");
+    let rebuilt = print::apply_selection(&selection, &mut request, "next task")
+        .expect("a switch rebuilds the payload");
+
+    // Both halves of every earlier turn: that is what makes a rebuild a
+    // continuation rather than a fresh question.
+    assert!(request.prompt.contains("first task"), "{}", request.prompt);
+    assert!(
+        request.prompt.contains("FIRST ANSWER"),
+        "{}",
+        request.prompt
+    );
+    assert!(request.prompt.contains("second task"), "{}", request.prompt);
+    assert!(
+        request.prompt.contains("SECOND ANSWER"),
+        "{}",
+        request.prompt
+    );
+    assert!(request.prompt.ends_with("next task"), "{}", request.prompt);
+
+    // Nothing was elided, so the counts say so rather than being absent.
+    assert_eq!(rebuilt.turns, 2);
+    assert_eq!(rebuilt.kept, 2);
+    assert_eq!(rebuilt.dropped, 0);
+    assert_eq!(rebuilt.prompt, request.prompt);
+    assert!(print::switch_notice("agy", "codex", &rebuilt).contains("all 2 turn(s) re-sent"));
+
+    // `--continue` under a switch matches the directory, not the backend: the
+    // backend is what is being left, so a session elsewhere is still not this one.
+    let elsewhere = fixture.root.path().join("other-work");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let error = print::select(
+        &fixture.sessions_dir(),
+        &cli(&["-p", "next task", "--switch", "codex", "--continue"]),
+        "codex",
+        &elsewhere,
+    )
+    .unwrap_err();
+    assert!(matches!(error, PieError::Config(_)), "{error:?}");
+    assert!(
+        error.to_string().contains("no session to continue"),
+        "{error}"
+    );
+}
+
+/// The cache-safety ordering (`TOKEN-ECONOMICS.md` §4, `DESIGN.md` §11): persona,
+/// then the stable history, then the volatile task text — so a compaction can never
+/// invalidate the prefix a vendor has already cached.
+#[test]
+fn a_switched_payload_keeps_the_persona_first_and_the_task_last() {
+    const PERSONA: &str = "# Persona\nname: pie\ntone: terse";
+
+    let fixture = Fixture::new();
+    let frame = seed_rows(
+        &fixture,
+        "s-1000-1",
+        "agy",
+        Some("conv-old"),
+        &[("first task", "FIRST ANSWER")],
+    );
+    write_index(&fixture, &[frame]);
+
+    let selection = print::select(
+        &fixture.sessions_dir(),
+        &cli(&[
+            "-p",
+            "next task",
+            "--session",
+            "s-1000-1",
+            "--switch",
+            "codex",
+        ]),
+        "codex",
+        &fixture.work(),
+    )
+    .unwrap();
+
+    let mut request = ChatRequest::new("next task");
+    request.persona = Some(PERSONA.to_string());
+    let rebuilt = print::apply_selection(&selection, &mut request, "next task")
+        .expect("a switch rebuilds the payload");
+
+    // The bytes the backend receives: agy and codex fold the persona in front of the
+    // prompt themselves, so the folded payload is what the ordering rule is about.
+    // `fold` is the one implementation both providers use.
+    let sent = request.folded_prompt();
+    assert!(sent.starts_with(PERSONA), "{sent}");
+    assert!(sent.ends_with("next task"), "{sent}");
+    assert_eq!(
+        sent,
+        pie::profile::fold(Some(PERSONA), &rebuilt.prompt),
+        "the rebuilt prompt is the folded payload minus the persona, never minus the task"
+    );
+
+    // …and inside the payload the order is the one `compact::assemble` owns: the
+    // note, the head turns, and then the task.
+    assert!(
+        rebuilt.prompt.starts_with(print::REBUILD_NOTE),
+        "{rebuilt:?}"
+    );
+    let first = rebuilt.prompt.find("first task").expect("the head turn");
+    let task = rebuilt.prompt.rfind("next task").expect("the task text");
+    assert!(first < task, "history before the task: {}", rebuilt.prompt);
+
+    // The persona is not folded into the prompt as well: agy and codex would then
+    // receive it twice, which is the drift `compact::assemble(None, ..)` prevents.
+    assert!(
+        !rebuilt.prompt.contains(PERSONA),
+        "the persona travels beside the prompt, not inside it: {}",
+        rebuilt.prompt
+    );
+}
+
+/// ACCEPTANCE §8, stage F: a long session is compacted rather than replayed in full,
+/// and the dropped count is reported instead of being silent.
+#[test]
+fn a_long_session_is_compacted_rather_than_replayed_in_full() {
+    let mut rows = long_transcript(41);
+    // One elided turn that failed, so the state block's outcome ledger has something
+    // to say: `stop_reason` is where a failure class lives (§11), and the block is the
+    // only place a rebuild renders it.
+    rows[5].ok = false;
+    rows[5].response = String::new();
+    rows[5].stop_reason = "timeout".into();
+
+    let rebuilt = print::rebuild(&rows, "next task");
+
+    assert_eq!(rebuilt.turns, 41, "the transcript is 41 turns");
+    assert_eq!(
+        rebuilt.kept, 10,
+        "the head plus the tail window survive verbatim"
+    );
+    assert_eq!(
+        rebuilt.dropped, 31,
+        "the middle is what the block stands in for"
+    );
+
+    // The head and the tail are the transcript's own text…
+    assert!(rebuilt.prompt.contains("ask 0"), "{}", rebuilt.prompt);
+    assert!(rebuilt.prompt.contains("ANSWER-0"), "{}", rebuilt.prompt);
+    assert!(rebuilt.prompt.contains("ask 40"), "{}", rebuilt.prompt);
+    assert!(rebuilt.prompt.contains("ANSWER-40"), "{}", rebuilt.prompt);
+
+    // …and the elided middle is not: its answers never reach the payload, because the
+    // block lists what was asked and what changed, never half an answer.
+    assert!(
+        !rebuilt.prompt.contains("ANSWER-5"),
+        "a dropped turn's answer is not replayed: {}",
+        rebuilt.prompt
+    );
+    assert!(
+        rebuilt.prompt.contains("- ask 5"),
+        "but what was asked still is: {}",
+        rebuilt.prompt
+    );
+    assert!(
+        rebuilt
+            .prompt
+            .contains("## Compacted history (31 of 41 turns elided)"),
+        "{}",
+        rebuilt.prompt
+    );
+    assert!(
+        rebuilt.prompt.contains("- 1 failed: timeout"),
+        "the failure class of a dropped turn is kept: {}",
+        rebuilt.prompt
+    );
+    assert!(rebuilt.prompt.ends_with("next task"), "{}", rebuilt.prompt);
+
+    // The count is *reported*: silence would be history disappearing from a payload
+    // the user paid for.
+    let notice = print::switch_notice("agy", "codex", &rebuilt);
+    assert!(notice.contains("[switch] agy -> codex"), "{notice}");
+    assert!(notice.contains("31 of 41 turns compacted"), "{notice}");
+    assert!(notice.contains("10 re-sent"), "{notice}");
+    assert!(notice.contains("from pie's transcript"), "{notice}");
+
+    // The same call leaves a short session alone, which is what makes the threshold a
+    // threshold rather than a second code path.
+    let short = print::rebuild(&rows[..3], "next task");
+    assert_eq!(short.turns, 3);
+    assert_eq!(short.kept, 3);
+    assert_eq!(short.dropped, 0);
+    assert!(short.prompt.contains("ask 2"), "{}", short.prompt);
+    assert!(short.prompt.contains("ANSWER-1"), "{}", short.prompt);
+    assert!(print::switch_notice("agy", "codex", &short).contains("all 3 turn(s) re-sent"));
+}
+
+/// The core of the switch: the old vendor id belongs to the backend being left, and
+/// must not be handed to the new one — not in the request, not in the payload, and
+/// not in the argv the new backend would be spawned with.
+#[test]
+fn a_switched_turn_never_hands_the_old_vendor_id_to_the_new_backend() {
+    let fixture = Fixture::new();
+    let frame = seed_rows(
+        &fixture,
+        "s-1000-1",
+        "codex",
+        Some("conv-old"),
+        &[("first task", "FIRST ANSWER")],
+    );
+    write_index(&fixture, &[frame]);
+
+    let selection = print::select(
+        &fixture.sessions_dir(),
+        &cli(&["-p", "next task", "--continue", "--switch", "agy"]),
+        "agy",
+        &fixture.work(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        selection.vendor_id(),
+        None,
+        "a switch hands the new backend no conversation id"
+    );
+    assert_eq!(
+        selection.continuation().unwrap().vendor_id.as_deref(),
+        Some("conv-old"),
+        "…even though the transcript recorded one"
+    );
+
+    let mut request = ChatRequest::new("next task");
+    print::apply_selection(&selection, &mut request, "next task");
+
+    assert!(
+        request.resume.is_none(),
+        "the request resumes nothing: {:?}",
+        request.resume
+    );
+    assert!(
+        !request.prompt.contains("conv-old"),
+        "and the id is not smuggled through the payload either: {}",
+        request.prompt
+    );
+
+    // The proof at the level that would actually spend quota: the argv the new
+    // backend would be spawned with. `build_args` is pure, so this holds on every
+    // platform without a process.
+    let argv = agy_argv(&request);
+    assert!(
+        !argv.iter().any(|arg| arg.contains("conv-old")),
+        "the old id must not reach agy's argv: {argv:?}"
+    );
+    assert!(
+        !argv.contains(&"--conversation".to_string()),
+        "nor the flag that carries it: {argv:?}"
+    );
+
+    // The control: a turn that *does* resume an id still builds the flag, so the
+    // assertions above are not passing because it could never appear.
+    let mut resumed = ChatRequest::new("next task");
+    resumed.resume = Some("conv-old".to_string());
+    assert!(
+        agy_argv(&resumed).contains(&"--conversation".to_string()),
+        "the flag is built when there is an id to resume"
+    );
+}
+
+/// ACCEPTANCE §8, stage F: the **new** vendor id is recorded in the session's next
+/// turn — the same session, so the switch continued it rather than starting over.
+#[test]
+fn a_switched_turn_records_the_new_vendor_id_in_the_session() {
+    let fixture = Fixture::new();
+    // An empty transcript, so the rebuilt payload is the task text alone — the one
+    // shape a batch-file stand-in can be handed on Windows. What is asserted here is
+    // the recording path and the session identity; the multi-line payload is asserted
+    // above, at the payload level.
+    let frame = seed_empty(&fixture, "s-1000-1", "codex");
+    write_index(&fixture, &[frame]);
+
+    let output = fixture.run_stub(
+        Stub::Args,
+        &fixture.args("next task", &["--switch", "agy", "--session", "s-1000-1"]),
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(stdout(&output).contains("OK"), "{}", stdout(&output));
+
+    // The turn landed in the session it switched…
+    let rows = session::load_from(&fixture.sessions_dir(), "s-1000-1").unwrap();
+    assert_eq!(rows.len(), 1, "one turn, in the switched session");
+    assert_eq!(rows[0].provider, "agy", "it ran on the new backend");
+    assert_eq!(rows[0].prompt, "next task", "the row keeps the user's text");
+    assert_eq!(
+        rows[0].conversation_id.as_deref(),
+        Some(FIXTURE_CONVERSATION_ID),
+        "…and records the id the *new* backend minted"
+    );
+
+    // …and the index agrees with the row beneath it, which is what lets a later
+    // `--continue` on the new backend find it.
+    let sessions = session::list_from(&fixture.sessions_dir()).unwrap();
+    assert_eq!(sessions.len(), 1, "no second session was minted");
+    assert_eq!(sessions[0].provider, "agy");
+    assert_eq!(sessions[0].turns, 1);
+
+    let err = stderr(&output);
+    assert!(err.contains("[switch] codex -> agy"), "{err}");
+    assert!(err.contains("from pie's transcript"), "{err}");
+    assert!(err.contains("[session] s-1000-1"), "{err}");
+}
+
+/// An unknown backend name is a configuration error naming the valid ones, and costs
+/// nothing: nothing is spawned, so no quota is spent on a typo.
+#[test]
+fn an_unknown_switch_backend_is_refused_naming_the_valid_ones() {
+    let error = print::Switch::from_cli(&cli(&["-p", "next", "--continue", "--switch", "gemini"]))
+        .unwrap_err();
+    assert!(matches!(error, PieError::Config(_)), "{error:?}");
+    assert_eq!(error.exit_code(), 2, "a configuration error, not a crash");
+    let message = error.to_string();
+    assert!(message.contains("gemini"), "{message}");
+    for known in ["agy", "codex", "claude"] {
+        assert!(
+            message.contains(known),
+            "the valid ids are named: {message}"
+        );
+    }
+
+    let fixture = Fixture::new();
+    two_sessions(&fixture);
+    let output = fixture.run_stub(
+        Stub::Args,
+        &fixture.args("next task", &["--continue", "--switch", "gemini"]),
+    );
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("agy, codex, claude"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(fixture.stub_calls(), 0, "an unknown backend spawns nothing");
+}
+
+/// `--resume` names a vendor conversation on one backend, and leaving that backend is
+/// the point of a switch, so the pair is refused rather than resolved.
+#[test]
+fn switching_while_resuming_a_vendor_id_is_refused() {
+    let args = [
+        "-p",
+        "next",
+        "--continue",
+        "--resume",
+        "conv-old",
+        "--switch",
+        "codex",
+    ];
+    let error = print::Switch::from_cli(&cli(&args)).unwrap_err();
+    assert!(matches!(error, PieError::Config(_)), "{error:?}");
+    assert_eq!(error.exit_code(), 2);
+    let message = error.to_string();
+    assert!(
+        message.contains("--switch") && message.contains("--resume"),
+        "the message names the conflict: {message}"
+    );
+
+    let fixture = Fixture::new();
+    two_sessions(&fixture);
+    let output = fixture.run_stub(Stub::Args, &fixture.args("next task", &args));
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    assert_eq!(
+        fixture.stub_calls(),
+        0,
+        "refused before anything is spawned"
+    );
+}
+
+/// A switch needs a session to switch. Silently running a fresh turn when the user
+/// asked to leave one backend is the failure this milestone keeps designing against,
+/// so it is an error that says what to pass instead.
+#[test]
+fn switching_without_a_session_is_refused_rather_than_starting_fresh() {
+    let error = print::Switch::from_cli(&cli(&["-p", "next", "--switch", "codex"])).unwrap_err();
+    assert!(matches!(error, PieError::Config(_)), "{error:?}");
+    assert_eq!(error.exit_code(), 2);
+    let message = error.to_string();
+    assert!(
+        message.contains("--continue") && message.contains("--session"),
+        "{message}"
+    );
+    assert!(message.contains("--switch codex"), "{message}");
+
+    // On the command line: exit 2, and no session started behind the user's back.
+    // Built without `--model`, because the fixture's `--model agy/…` beside
+    // `--switch codex` is a second, separate contradiction.
+    let fixture = Fixture::new();
+    let args = vec![
+        "-p".to_string(),
+        "next task".to_string(),
+        "--cwd".to_string(),
+        fixture.work().display().to_string(),
+        "--switch".to_string(),
+        "codex".to_string(),
+    ];
+    let output = fixture.run_stub(Stub::Args, &args);
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("needs a session to switch"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(fixture.stub_calls(), 0, "nothing was spawned");
+    assert!(
+        !fixture.sessions_dir().exists(),
+        "and no session was started behind the user's back"
+    );
+
+    // A selector does not by itself make one: an empty store still has nothing to
+    // switch, and says so in the switch's own terms — the backend was dropped from
+    // the match, so naming it would send the user looking for the wrong thing.
+    let args = vec![
+        "-p".to_string(),
+        "next task".to_string(),
+        "--cwd".to_string(),
+        fixture.work().display().to_string(),
+        "--continue".to_string(),
+        "--switch".to_string(),
+        "codex".to_string(),
+    ];
+    let output = fixture.run_stub(Stub::Args, &args);
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    let err = stderr(&output);
+    assert!(err.contains("no session to continue"), "{err}");
+    assert!(err.contains("nothing to switch"), "{err}");
+    assert_eq!(fixture.stub_calls(), 0);
+}
+
+/// `--model` may name the model *on* the new backend, and nothing else: a spec naming
+/// a third backend is a contradiction, and silently preferring one of the two would
+/// leave the subscription it names.
+#[test]
+fn a_switch_model_must_name_the_new_backend_or_none() {
+    // The model on the new backend is carried into the turn.
+    let switch = print::Switch::from_cli(&cli(&[
+        "-p",
+        "next",
+        "--continue",
+        "--switch",
+        "codex",
+        "--model",
+        "codex/gpt-6-luna",
+    ]))
+    .unwrap()
+    .expect("a switch");
+    assert_eq!(switch.backend, "codex");
+    assert_eq!(switch.model.as_deref(), Some("gpt-6-luna"));
+
+    // No model: the new CLI picks its own, exactly as a `default_backend` turn does.
+    let switch = print::Switch::from_cli(&cli(&["-p", "next", "--continue", "--switch", "codex"]))
+        .unwrap()
+        .expect("a switch");
+    assert_eq!(switch.backend, "codex");
+    assert_eq!(switch.model, None);
+
+    // A model from the backend being left is refused.
+    let error = print::Switch::from_cli(&cli(&[
+        "-p",
+        "next",
+        "--continue",
+        "--switch",
+        "codex",
+        "--model",
+        "agy/gemini-3.8-flash",
+    ]))
+    .unwrap_err();
+    assert!(matches!(error, PieError::Config(_)), "{error:?}");
+    assert_eq!(error.exit_code(), 2);
+    let message = error.to_string();
+    assert!(
+        message.contains("codex") && message.contains("agy"),
+        "{message}"
+    );
+
+    // And no `--switch` at all reads nothing of this: the flag is opt-in.
+    assert_eq!(
+        print::Switch::from_cli(&cli(&["-p", "next"])).unwrap(),
+        None
+    );
 }

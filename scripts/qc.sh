@@ -161,6 +161,9 @@ run_gate 'G4 acceptance (M4 usage)' cargo run -- usage
 run_gate 'G4 acceptance (M5 sessions)' cargo test --test sessions
 run_gate 'G4 acceptance (M5 compact)' cargo test --test compact
 run_gate 'G4 acceptance (M5 ocr)' cargo test --test ocr
+# Stage E's server has its own binary, so its gate is its own command: the stdio
+# handshake, driven through the built binary rather than through the library.
+run_gate 'G4 acceptance (M5 mcp)' cargo test --test mcp
 
 # --- G5 (live acceptance) ---------------------------------------------------
 if [ "$LIVE" -eq 1 ]; then

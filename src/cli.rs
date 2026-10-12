@@ -77,6 +77,20 @@ pub struct Cli {
     #[arg(long = "session", value_name = "ID")]
     pub session: Option<String>,
 
+    /// Continue this session on a different backend, re-bootstrapping from pie's
+    /// own transcript.
+    ///
+    /// `--switch codex --continue` re-sends the conversation the session already
+    /// recorded as a fresh prompt for codex: pie's own transcript, compacted once
+    /// it is long enough, and then the new task. A vendor conversation id belongs
+    /// to the backend that minted it, so the old one is never handed over — the
+    /// id the new backend returns is recorded on the same session's next turn.
+    /// Combines with `--continue` or `--session`, and is a configuration error
+    /// with `--resume`: naming a vendor conversation and leaving its backend are
+    /// contradictory.
+    #[arg(long, value_name = "BACKEND")]
+    pub switch: Option<String>,
+
     /// Print a short argument-error hint.
     #[arg(long, hide = true)]
     pub explain_errors: bool,
@@ -146,6 +160,22 @@ pub enum Command {
         /// Ignore the cache and ask itsmini again.
         #[arg(long)]
         refresh: bool,
+    },
+
+    /// Host a pie capability as an MCP server on stdio, for the delegate CLIs.
+    ///
+    /// In delegate mode `agy` and `codex` run their own tools, so a pie-native
+    /// tool never reaches them; pointing each CLI at this server through that
+    /// CLI's own MCP config is the only route that serves all three backends
+    /// uniformly (`DESIGN.md` §11).
+    ///
+    /// Opt-in on purpose, and it advertises exactly one tool: an advertised tool
+    /// costs the vendor input tokens on **every** turn of the session, including
+    /// turns that never call it.
+    Mcp {
+        /// The capability to expose. `ocr` is the only server pie hosts.
+        #[arg(value_name = "CAPABILITY")]
+        capability: String,
     },
 }
 

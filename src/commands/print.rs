@@ -21,10 +21,20 @@
 //! selection is resolved *before* anything is spawned, so a contradictory or
 //! impossible selection costs no quota and leaves no trace on disk.
 //!
+//! `--switch <backend>` is the fourth answer: keep the session, change the
+//! backend. A vendor conversation id belongs to the backend that minted it, so a
+//! switch **never resumes** — the new backend receives pie's own transcript,
+//! rebuilt by [`rebuild`], and the id *that* backend returns is what the next turn
+//! records. Nothing on that path touches a vendor until the rebuilt payload is
+//! sent, which is why stage F is verified at the payload level and spends no
+//! quota.
+//!
 //! A resumed turn whose vendor id no longer exists re-bootstraps from pie's own
-//! transcript exactly once (`RISKS.md` §6). The prompt for that rebuild is one
-//! function — [`seed_prompt`] — because stage C replaces raw seeding with a
-//! compacted state block, and nothing else needs to move.
+//! transcript exactly once (`RISKS.md` §6), through the same [`rebuild`] the
+//! switch uses, so the two paths cannot send different shapes for the same
+//! session. Compaction (`compact.rs`) is folded in there rather than here: the
+//! rebuild is the only place an outgoing prompt is rebuilt, which is the seam
+//! stage B left and stage C filled.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -32,6 +42,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::cli::Cli;
+use crate::compact;
 use crate::config::Config;
 use crate::error::{PieError, Result};
 use crate::paths;
@@ -48,7 +59,16 @@ pub async fn run(cfg: &Config, cli: &Cli, prompt: &str) -> Result<()> {
     // `profile.toml` therefore fails before a turn is paid for, not after.
     let profile = Profile::from_home()?;
 
-    let (backend, model) = provider::resolve_target(cfg, cli.model.as_deref())?;
+    // `--switch` decides the backend, so it is resolved before the model is: an
+    // unknown backend, a `--resume` a switch cannot honour and a switch with no
+    // session to switch are all refused here, before a store read and long before
+    // a spawn (`DESIGN.md` §5, exit 2).
+    let switch = Switch::from_cli(cli)?;
+
+    let (backend, model) = match &switch {
+        Some(switch) => (switch.backend.clone(), switch.model.clone()),
+        None => provider::resolve_target(cfg, cli.model.as_deref())?,
+    };
 
     let provider = provider::by_id(&backend).ok_or_else(|| PieError::UnknownBackend {
         backend: backend.clone(),
@@ -66,12 +86,18 @@ pub async fn run(cfg: &Config, cli: &Cli, prompt: &str) -> Result<()> {
     // The session the turn is recorded in: the one it continues, or a new one.
     // Re-opening keeps the id *and* the transcript it names, so a continued turn
     // lands *in* that conversation instead of beside it.
-    let mut session = match selection.continuation() {
-        Some(continuation) => Session::reopen_in(&store, continuation.summary.clone()),
-        None => Session::start_in(&store, &backend, &request.cwd),
-    };
+    let mut session = session_for(&store, &selection, &backend, &request.cwd);
 
-    apply_selection(&selection, &mut request, prompt);
+    // A switch hands back the payload it rebuilt, and that is reported before the
+    // turn runs: history compaction left out is history the user paid for, so it
+    // is never dropped in silence.
+    if let Some(rebuilt) = apply_selection(&selection, &mut request, prompt) {
+        let from = selection
+            .continuation()
+            .map(|continuation| continuation.summary.provider.as_str())
+            .unwrap_or_default();
+        eprintln!("{}", switch_notice(from, &backend, &rebuilt));
+    }
 
     let started = Instant::now();
     let streamed = Arc::new(AtomicBool::new(false));
@@ -199,13 +225,133 @@ fn announce(session: &Session, vendor_id: Option<&str>) {
     }
 }
 
+/// `--switch <backend>`: continue one of pie's sessions on a different backend.
+///
+/// The whole reason this exists is that a vendor conversation id is **not
+/// portable**: it belongs to the backend that minted it, and a backend that has
+/// never seen it either errors or, worse, resolves it to something else. So a
+/// switch never resumes. It re-sends pie's own transcript — rebuilt by [`rebuild`]
+/// — and records the id *that* backend returns (`DESIGN.md` §11), which makes it a
+/// payload transformation and therefore testable without spending quota.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Switch {
+    /// The backend this turn runs on.
+    pub backend: String,
+    /// The model on that backend, when `--model` named one.
+    pub model: Option<String>,
+}
+
+impl Switch {
+    /// Read `--switch` off the command line, refusing the combinations that have no
+    /// honest meaning.
+    ///
+    /// Four rules, each a [`PieError::Config`] (exit 2, `DESIGN.md` §5) decided
+    /// before a store read and long before a spawn:
+    ///
+    /// * an **unknown backend** is named back at the user with the valid ids,
+    ///   exactly as a misspelt `--model` is. Never a silent fallback to the default
+    ///   backend: that would answer on a subscription the user did not ask for,
+    ///   which is the failure routing exists to prevent.
+    /// * `--model` may name the model **on** the new backend and nothing else. A
+    ///   spec naming a third backend is a contradiction, and silently preferring
+    ///   one of the two would leave the account it names.
+    /// * `--resume <id>` names a vendor conversation on a specific backend, and the
+    ///   point of a switch is to leave that conversation behind, so the pair is
+    ///   refused rather than resolved: there is no precedence that honours both.
+    /// * a switch needs something to switch. With neither `--continue` nor
+    ///   `--session` there is no session to re-bootstrap, and quietly running a
+    ///   fresh turn is the failure mode this milestone keeps designing against.
+    ///
+    /// `general.default_model` is deliberately **not** consulted: it names a
+    /// backend, and a switch that quietly used another backend's configured model
+    /// would leave the account it names. With `--switch` the model is either named
+    /// beside the new backend, or the new CLI picks its own.
+    pub fn from_cli(cli: &Cli) -> Result<Option<Self>> {
+        let Some(backend) = cli.switch.as_deref() else {
+            return Ok(None);
+        };
+        let backend = backend.trim();
+
+        if provider::by_id(backend).is_none() {
+            return Err(PieError::Config(format!(
+                "unknown backend `{}` for `--switch` (known: {}) — a switch continues this session \
+                 on one of those, and nothing else is a subscription pie can drive",
+                crate::error::truncate(backend, 40),
+                super::models::known_backends().join(", ")
+            )));
+        }
+
+        if cli.resume.is_some() {
+            return Err(PieError::Config(format!(
+                "`--switch {backend}` and `--resume` are mutually exclusive — `--resume` names a \
+                 vendor conversation on one backend, and the point of a switch is to leave it. \
+                 Drop `--resume` (the conversation is rebuilt from pie's transcript instead), or \
+                 drop `--switch` to resume it."
+            )));
+        }
+
+        if !cli.continue_session && cli.session.is_none() {
+            return Err(PieError::Config(format!(
+                "`--switch {backend}` needs a session to switch — pass `--continue` to re-bootstrap \
+                 the newest session in this directory, or `--session <id>` to name one. A switch \
+                 continues a conversation pie already recorded; it is never a fresh one."
+            )));
+        }
+
+        let model = match cli.model.as_deref() {
+            Some(spec) => {
+                let (named, model) = provider::parse_model_spec(spec)?;
+                if named != backend {
+                    return Err(PieError::Config(format!(
+                        "`--switch {backend}` and `--model {spec}` name different backends — \
+                         `--model` may name the model *on* the new backend, e.g. \
+                         `--switch {backend} --model {backend}/<model>`"
+                    )));
+                }
+                Some(model)
+            }
+            None => None,
+        };
+
+        Ok(Some(Self {
+            backend: backend.to_string(),
+            model,
+        }))
+    }
+}
+
+/// The session a turn is recorded in: the one it continues, or a new one.
+///
+/// A **switched** turn is recorded under the backend it runs on rather than the one
+/// the session was recorded on. That is not bookkeeping: the index frame describes
+/// the newest turn, so a frame still naming the old backend would disagree with the
+/// row written beneath it — the two are asserted to agree — and `--continue` on the
+/// new backend could never find the conversation it now holds, because the id it
+/// hands back is one that backend issued.
+fn session_for(store: &Path, selection: &Selection, backend: &str, cwd: &Path) -> Session {
+    match selection.continuation() {
+        // Re-opening keeps the id *and* the transcript it names, so a continued
+        // turn lands *in* that conversation instead of beside it.
+        Some(continuation) => {
+            let provider = if selection.is_switch() {
+                backend
+            } else {
+                continuation.summary.provider.as_str()
+            };
+            Session::reopen_on_in(store, continuation.summary.clone(), provider)
+        }
+        None => Session::start_in(store, backend, cwd),
+    }
+}
+
 // ------------------------------------------------- which conversation, if any --
 
 /// Which conversation a turn continues.
 ///
-/// One concept, three flags: `--resume <ID>` names a *vendor* conversation id,
-/// while `--continue` and `--session <ID>` name one of *pie's* sessions and get
-/// the vendor id out of that session's own transcript.
+/// One concept, four flags: `--resume <ID>` names a *vendor* conversation id,
+/// `--continue` and `--session <ID>` name one of *pie's* sessions and get the
+/// vendor id out of that session's own transcript, and `--switch <backend>` does
+/// the same but **drops** that id, because it names the backend being left.
 #[derive(Debug, Clone)]
 pub enum Selection {
     /// No selector: a fresh conversation. The default, on purpose.
@@ -214,6 +360,14 @@ pub enum Selection {
     Vendor(String),
     /// `--continue` or `--session <id>`: continue one of pie's sessions.
     Session(Continuation),
+    /// `--switch <backend>`: continue pie's session on a **different** backend.
+    ///
+    /// A variant of its own rather than a flag on [`Continuation`]: being a switch
+    /// changes the payload (a rebuild, never a resume), the recording (the next
+    /// row runs on the new backend) and the retry rule (`RISKS.md` §6 does not
+    /// apply, because nothing was resumed). Three behaviours that must not be
+    /// settable independently of one another.
+    Switch(Continuation),
 }
 
 /// A session this turn continues.
@@ -234,20 +388,34 @@ pub struct Continuation {
 
 impl Selection {
     /// The vendor conversation id this selection hands to the backend.
+    ///
+    /// `None` for a switch even when the transcript recorded one: that id belongs
+    /// to the backend being left, and handing it to the new backend would ask it
+    /// to continue a conversation it has never heard of (`DESIGN.md` §11).
     pub fn vendor_id(&self) -> Option<&str> {
         match self {
             Selection::Vendor(id) => Some(id),
             Selection::Session(continuation) => continuation.vendor_id.as_deref(),
-            Selection::Fresh => None,
+            Selection::Switch(_) | Selection::Fresh => None,
         }
     }
 
     /// The session this turn continues, when a selector named one.
     pub fn continuation(&self) -> Option<&Continuation> {
         match self {
-            Selection::Session(continuation) => Some(continuation),
+            Selection::Session(continuation) | Selection::Switch(continuation) => {
+                Some(continuation)
+            }
             _ => None,
         }
+    }
+
+    /// Whether this selection changes the backend under the session.
+    ///
+    /// The one selection whose payload is rebuilt instead of resumed, and the one
+    /// whose next row is recorded on a different backend than the session's own.
+    pub fn is_switch(&self) -> bool {
+        matches!(self, Selection::Switch(_))
     }
 }
 
@@ -261,6 +429,11 @@ impl Selection {
 ///   "explicitly" means, and the provider has to agree because the id is not
 ///   portable between backends.
 /// * Neither selects nothing, and nothing is the default.
+/// * `--switch <backend>` is the **only** case in which the backend is dropped
+///   from the match, for `--continue` and `--session` alike: the session being
+///   left is on another backend by definition, so requiring the new backend's id
+///   would make a switch impossible. The turn is rebuilt from pie's own transcript
+///   instead of resumed (`DESIGN.md` §11).
 ///
 /// A selection that cannot be honoured is an error rather than a silent fresh
 /// turn: silently starting over when the user asked to continue is the failure
@@ -278,21 +451,18 @@ pub fn select(root: &Path, cli: &Cli, provider: &str, cwd: &Path) -> Result<Sele
         return Ok(Selection::Fresh);
     }
 
+    let switching = cli.switch.is_some();
+
     let summaries = session::list_from(root)?;
 
     let summary = match cli.session.as_deref() {
         Some(id) => named(&summaries, root, id)?,
-        None => newest_for(&summaries, provider, cwd)
-            .cloned()
-            .ok_or_else(|| {
-                PieError::Config(format!(
-                "no session to continue for `{provider}` in {} — a conversation is continued in \
-                 the directory and on the backend it ran in. `pie sessions` lists what exists, \
-                 and a plain `pie -p` starts a fresh one",
-                cwd.display()
-            ))
-            })?,
+        None => newest_session(&summaries, provider, cwd, switching)?,
     };
+
+    if switching {
+        return Ok(Selection::Switch(continuation(root, summary)?));
+    }
 
     // The one check the `--continue` filter cannot make for `--session`: a
     // conversation id belongs to the backend that issued it, so continuing an
@@ -312,17 +482,43 @@ pub fn select(root: &Path, cli: &Cli, provider: &str, cwd: &Path) -> Result<Sele
 
 /// Point the request at the conversation the selection names.
 ///
-/// A session whose transcript recorded no vendor id (every turn in it failed)
-/// has no conversation to hand back, so it is seeded from its own rows straight
-/// away — the same re-bootstrap as the stale-id path, minus the failed attempt.
-pub fn apply_selection(selection: &Selection, request: &mut ChatRequest, task: &str) {
+/// Returns the rebuild when the selection was a **switch**: the payload is pie's
+/// own transcript in that case, and the caller reports what compaction dropped
+/// (`ACCEPTANCE.md` §8, stage F). Every other selection returns `None` — a resumed
+/// turn sends the task as given, and there is nothing to report about it.
+///
+/// A session whose transcript recorded no vendor id (every turn in it failed) has
+/// no conversation to hand back, so it is seeded from its own rows straight away —
+/// the same rebuild as the switch, minus the backend change.
+pub fn apply_selection(
+    selection: &Selection,
+    request: &mut ChatRequest,
+    task: &str,
+) -> Option<Rebuilt> {
     match selection {
-        Selection::Vendor(id) => request.resume = Some(id.clone()),
-        Selection::Session(continuation) => match &continuation.vendor_id {
-            Some(id) => request.resume = Some(id.clone()),
-            None => request.prompt = seed_prompt(&continuation.rows, task),
-        },
-        Selection::Fresh => {}
+        Selection::Vendor(id) => {
+            request.resume = Some(id.clone());
+            None
+        }
+        Selection::Session(continuation) => {
+            match &continuation.vendor_id {
+                Some(id) => request.resume = Some(id.clone()),
+                None => request.prompt = seed_prompt(&continuation.rows, task),
+            }
+            None
+        }
+        // A switch never resumes: the id in the transcript belongs to the backend
+        // being left (`DESIGN.md` §11), so the new backend is handed the history
+        // instead. `resume` is cleared rather than merely not set, so a request
+        // that was already pointed at a vendor id cannot carry it across a
+        // switch.
+        Selection::Switch(continuation) => {
+            let rebuilt = rebuild(&continuation.rows, task);
+            request.resume = None;
+            request.prompt = rebuilt.prompt.clone();
+            Some(rebuilt)
+        }
+        Selection::Fresh => None,
     }
 }
 
@@ -363,16 +559,72 @@ fn newest_for<'a>(
     provider: &str,
     cwd: &Path,
 ) -> Option<&'a SessionSummary> {
-    summaries
-        .iter()
-        .filter(|summary| {
-            summary.provider == provider && same_directory(Path::new(&summary.cwd), cwd)
-        })
-        .max_by(|a, b| {
-            a.updated_at
-                .cmp(&b.updated_at)
-                .then_with(|| a.id.cmp(&b.id))
-        })
+    newest_where(summaries, |summary| {
+        summary.provider == provider && same_directory(Path::new(&summary.cwd), cwd)
+    })
+}
+
+/// The newest summary recorded in `cwd`, whatever backend it ran on.
+///
+/// `--switch`'s filter: the backend is what the turn is *leaving*, so it cannot
+/// also be part of the match — requiring it would mean the one case a switch
+/// exists for could never select anything.
+fn newest_in<'a>(summaries: &'a [SessionSummary], cwd: &Path) -> Option<&'a SessionSummary> {
+    newest_where(summaries, |summary| {
+        same_directory(Path::new(&summary.cwd), cwd)
+    })
+}
+
+/// The newest summary the predicate accepts, by `updated_at` and then id.
+///
+/// The tie-break on `id` is what keeps the answer deterministic when two sessions
+/// share a millisecond, which is exactly what the seeded fixtures do.
+fn newest_where(
+    summaries: &[SessionSummary],
+    keep: impl Fn(&SessionSummary) -> bool,
+) -> Option<&SessionSummary> {
+    summaries.iter().filter(|s| keep(s)).max_by(|a, b| {
+        a.updated_at
+            .cmp(&b.updated_at)
+            .then_with(|| a.id.cmp(&b.id))
+    })
+}
+
+/// The session `--continue` continues, or the error that says why none was found.
+///
+/// The two messages are not interchangeable. Without `--switch` the backend is
+/// part of the match, so the error can name both it and the directory, and the
+/// user's fix is a `--model` on the backend the session ran on. With `--switch`
+/// the backend was deliberately dropped from the match, so naming it would send the
+/// user looking for the wrong thing; naming the directory is all that is honest.
+fn newest_session(
+    summaries: &[SessionSummary],
+    provider: &str,
+    cwd: &Path,
+    switching: bool,
+) -> Result<SessionSummary> {
+    let newest = match switching {
+        true => newest_in(summaries, cwd),
+        false => newest_for(summaries, provider, cwd),
+    };
+    if let Some(summary) = newest {
+        return Ok(summary.clone());
+    }
+
+    Err(match switching {
+        true => PieError::Config(format!(
+            "no session to continue in {} — `--switch` re-sends a session pie already recorded, \
+             and there is none here, so there is nothing to switch. `pie sessions` lists what \
+             exists, and a plain `pie -p` starts a fresh conversation.",
+            cwd.display()
+        )),
+        false => PieError::Config(format!(
+            "no session to continue for `{provider}` in {} — a conversation is continued in the \
+             directory and on the backend it ran in. `pie sessions` lists what exists, and a \
+             plain `pie -p` starts a fresh one",
+            cwd.display()
+        )),
+    })
 }
 
 /// One session by pie's own id.
@@ -446,59 +698,124 @@ fn normalised(path: &Path) -> String {
 
 // -------------------------------------------------------- re-bootstrapping ----
 
-/// Render a session's recorded turns into the prompt that re-bootstraps it.
+/// The line a rebuilt prompt opens with.
+///
+/// It says what the payload *is*: not the backend's own context but a
+/// reconstruction pie is sending, so a replayed history is not misread as
+/// something the model remembers. Kept from stage B, where a re-bootstrap was the
+/// only caller of a rebuild; a switch needs it for the stronger reason, that the
+/// conversation it re-sends was never this backend's at all.
+pub const REBUILD_NOTE: &str = "pie is re-sending the earlier part of this session, because the \
+                                 backend does not have the conversation.";
+
+/// An outgoing prompt rebuilt from a session's own transcript, and what building
+/// it had to elide.
+///
+/// The counts are part of the value rather than a side channel: compaction must
+/// never be silent, because the turns it drops from the payload are turns the user
+/// paid for (`DESIGN.md` §11).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rebuilt {
+    /// The payload: the compacted history, then the task text.
+    pub prompt: String,
+    /// Turns the transcript held.
+    pub turns: usize,
+    /// Turns sent verbatim.
+    pub kept: usize,
+    /// Turns the state block stands in for.
+    pub dropped: usize,
+}
+
+/// Rebuild an outgoing prompt from a session's own transcript.
 ///
 /// Used when there is no conversation to hand back: the vendor id is gone
-/// (`RISKS.md` §6), or the transcript never recorded one. The shape is the
-/// history, then `---`, then the task — the same shape `DESIGN.md` §11 asks
-/// compaction for, with the volatile task text last.
+/// (`RISKS.md` §6), the transcript never recorded one, or the backend is being left
+/// behind entirely (`--switch`, `DESIGN.md` §11). **One** function for both, so the
+/// two paths cannot send different shapes for the same session.
 ///
-/// **Stage C seam.** Compaction replaces the body of this function with the head
-/// plus an extractive state block plus a tail window, and nothing else has to
-/// move: this is the only place an outgoing prompt is rebuilt. It takes the rows
-/// rather than a session so stage C can hand it whatever window it decides on.
+/// The *order* is [`compact::assemble`]'s, never this function's — persona, head
+/// turns, state block, tail turns, task — because it is a caching rule rather than
+/// tidiness (`TOKEN-ECONOMICS.md` §4): the volatile task text goes last and nothing
+/// volatile may precede something stable. Re-joining the pieces here is exactly how
+/// that order would drift.
+///
+/// The persona is passed as `None` on purpose: agy and codex fold it in front of
+/// the prompt themselves and claude receives it in `--append-system-prompt`, so
+/// folding it here as well would send it twice.
 ///
 /// `TurnRow::prompt` is the user's own text and never the payload that was sent,
 /// so seeding a payload that already contains a transcript cannot nest history
-/// inside history. The rows are rendered in full: bounding them is exactly the
-/// compaction stage C owns, and the argv cap (`DESIGN.md` §1) reports a prompt
-/// that has outgrown a backend rather than silently dropping history here.
-pub fn seed_prompt(rows: &[TurnRow], task: &str) -> String {
-    let mut out = String::from(
-        "pie is re-sending the earlier part of this session, because the backend does not have \
-         the conversation.\n",
-    );
+/// inside history. The argv cap (`DESIGN.md` §1) still reports a rebuilt prompt that
+/// has outgrown a backend, rather than silently dropping history here.
+pub fn rebuild(rows: &[TurnRow], task: &str) -> Rebuilt {
+    let compacted = compact::compact(rows, rebuild_budget(rows.len()));
+    let body = compact::assemble(None, &compacted, task);
 
-    for (index, row) in rows.iter().enumerate() {
-        out.push_str(&format!(
-            "\n## turn {} ({}{})\n",
-            index + 1,
-            row.provider,
-            // The model is empty when the backend picked its own (`DESIGN.md` §7).
-            if row.model.is_empty() {
-                String::new()
-            } else {
-                format!("/{}", row.model)
-            }
-        ));
-        out.push_str("user: ");
-        out.push_str(&row.prompt);
-        out.push('\n');
+    // The note only appears when there is something to re-send: with an empty
+    // transcript the payload is the task text alone — the bytes a fresh turn sends
+    // — and announcing a replay that did not happen would be a lie inside the
+    // payload itself.
+    let prompt = if compacted.is_empty() {
+        body
+    } else {
+        format!("{REBUILD_NOTE}\n\n{body}")
+    };
 
-        out.push_str("assistant: ");
-        if row.response.trim().is_empty() {
-            // A failed turn is still history: what was asked, and that nothing
-            // came back. `stop_reason` is where the reason lives (§11).
-            out.push_str(&format!("(no answer: {})", row.stop_reason));
-        } else {
-            out.push_str(&row.response);
-        }
-        out.push('\n');
+    Rebuilt {
+        prompt,
+        turns: compacted.turns(),
+        kept: compacted.kept(),
+        dropped: compacted.elided(),
     }
+}
 
-    out.push_str("\n---\n\n");
-    out.push_str(task);
-    out
+/// The budget a rebuilt transcript is sent under.
+///
+/// `DESIGN.md` §11: *past* `agent.compact_after_turns` turns older turns collapse
+/// into a state block; below it the whole transcript is replayed. The trigger and the
+/// budget are two separate decisions — [`compact::is_due`] says whether to compact,
+/// and the budget says what survives when it does — so a session either side of the
+/// threshold can be asserted against the same one composition.
+///
+/// `config.rs` has no `agent.compact_after_turns` field, so the contract's default is
+/// used; it is the one number here that belongs to configuration.
+fn rebuild_budget(turns: usize) -> compact::Budget {
+    if compact::is_due(turns, compact::DEFAULT_COMPACT_AFTER_TURNS) {
+        compact::Budget::default()
+    } else {
+        // Head = every turn, tail = none: nothing is elided and the block comes back
+        // empty, so a short transcript is replayed whole through the same
+        // composition rather than through a second code path.
+        compact::Budget::new(turns, 0)
+    }
+}
+
+/// Render a session's recorded turns into the prompt that re-bootstraps it.
+///
+/// [`rebuild`]'s text, for the callers that do not report what compaction dropped.
+/// It takes the rows rather than a session so a caller can hand it whatever window it
+/// decided on.
+pub fn seed_prompt(rows: &[TurnRow], task: &str) -> String {
+    rebuild(rows, task).prompt
+}
+
+/// What a switch says on stderr: which backend changed, and what the rebuild had to
+/// elide.
+///
+/// The count is the point. A compaction the user cannot see is history disappearing
+/// from a payload they paid for, so the number is reported on every switch rather
+/// than only when it is surprising — a quiet "all turns re-sent" is evidence that the
+/// session is still being replayed whole.
+pub fn switch_notice(from: &str, to: &str, rebuilt: &Rebuilt) -> String {
+    let payload = if rebuilt.dropped == 0 {
+        format!("all {} turn(s) re-sent", rebuilt.turns)
+    } else {
+        format!(
+            "{} of {} turns compacted, {} re-sent",
+            rebuilt.dropped, rebuilt.turns, rebuilt.kept
+        )
+    };
+    format!("[switch] {from} -> {to}: {payload} from pie's transcript")
 }
 
 /// The prompt a failed resume is replaced by, when the failure means the backend
@@ -507,9 +824,11 @@ pub fn seed_prompt(rows: &[TurnRow], task: &str) -> String {
 /// The decision and the rebuild are one function on purpose: a retry exists only
 /// where there is a history to send instead of resuming, so the two cannot drift
 /// apart. `None` means "report the failure" — either nothing was being resumed,
-/// the session had no vendor id to lose, the attempt already produced answer text
-/// (so whatever failed, it was not an empty conversation), or the message is not
-/// about a missing conversation at all.
+/// the selection was not a session **resume** (a switch deliberately handed over no
+/// vendor id, and `Fresh` and `Vendor` have no transcript to send), the session had
+/// no vendor id to lose, the attempt already produced answer text (so whatever
+/// failed, it was not an empty conversation), or the message is not about a missing
+/// conversation at all.
 ///
 /// Callers retry **once**: this says whether a fresh attempt is warranted, never
 /// how many.
@@ -519,7 +838,14 @@ pub fn rebootstrap_prompt(
     streamed: bool,
     task: &str,
 ) -> Option<String> {
-    let continuation = selection.continuation()?;
+    // Only a session resume has an id that can go stale. A switch resumed nothing,
+    // so a missing conversation cannot be about pie's own id — retrying it would
+    // spend the new backend's quota a second time on a payload that never changed,
+    // and report the retry's outcome instead of the real error.
+    let continuation = match selection {
+        Selection::Session(continuation) => continuation,
+        _ => return None,
+    };
     continuation.vendor_id.as_ref()?;
     if streamed || !is_stale_conversation(error) {
         return None;

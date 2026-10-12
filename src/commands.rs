@@ -6,6 +6,7 @@
 
 pub mod auth;
 pub mod backends;
+pub mod mcp;
 pub mod models;
 pub mod ocr;
 pub mod print;
@@ -47,6 +48,11 @@ pub async fn dispatch(cli: &Cli, cfg: &Config) -> Result<()> {
             output,
             refresh,
         }) => ocr::run(file, lang.as_deref(), output.as_deref(), *refresh, cli.json).await,
+        // And no `cfg` here: the MCP server reads itsmini's address and pie's cache
+        // directory the same way `pie ocr` does, at call time, and speaks JSON-RPC
+        // over this process's own stdin/stdout. It writes nothing to stdout that is
+        // not a frame, so nothing may be printed before it starts either.
+        Some(Command::Mcp { capability }) => mcp::run(capability).await,
         None => match cli.print.as_deref() {
             Some(prompt) => print::run(cfg, cli, prompt).await,
             None => print_help(),

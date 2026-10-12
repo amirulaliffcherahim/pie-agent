@@ -494,8 +494,7 @@ context. The user opts in.
 
 ### Compaction: deterministic and quota-free by default
 
-Past `agent.compact_after_turns` (default 40) turns, older turns collapse into a
-state block:
+Past `agent.compact_after_turns` turns, older turns collapse into a state block. **The key is not yet wired to config**: the threshold is currently a constant of 40, and stage F uses it directly. Recorded as S6 rather than left as a promise the code does not keep.
 
 - **Extractive, not summarised.** The head and a tail window are kept; the middle is
   replaced by a structured block of what was asked and what changed. No model call,
@@ -535,6 +534,20 @@ becomes the prompt for the new backend, and the new vendor conversation id is
 recorded. This is a payload transformation and therefore testable without quota. It is
 what "no per-CLI config" means in practice — the persona and the history travel with
 the user, not with the CLI.
+
+Three properties the implementation must hold, each with a test:
+
+- the **old vendor id is never handed to the new backend** — otherwise the switch
+  silently becomes a resume against a conversation the new CLI has never seen
+- the persona still comes first and the task text last, so switching cannot break
+  the prefix cache any more than compaction can
+- switching while `--resume` is set is refused: `--resume` names a vendor
+  conversation on one backend, and leaving it is the entire point of switching
+
+Composing `compact::assemble` drops the per-turn framing stage B wrote, so on a
+switched turn a failed turn's `stop_reason` reaches the payload only through the
+state block. `compact.rs` is frozen by design, so this is recorded as S7 rather than
+patched around.
 
 ### Stages
 
