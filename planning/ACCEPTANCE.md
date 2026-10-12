@@ -17,7 +17,7 @@ Every milestone must pass all five before it is committed as complete.
 | G3 Tests | `cargo test` | all pass, 0 ignored-without-reason |
 | G4 Offline acceptance | the milestone's `Acceptance` commands below | exact expected output |
 | G5 Live acceptance | the milestone's `Live` commands below | exact expected shape, real CLI |
-| G6 Cross-target check | `cargo check --target x86_64-unknown-linux-gnu --all-targets` | compiles |
+| G6 Cross-target check | `cargo check --target x86_64-unknown-linux-gnu --all-targets --no-default-features` | compiles |
 
 G5 spends real subscription quota. Approved models only: **`agy/gemini-3.8-flash`**
 and **`codex/gpt-6-luna`** — do not substitute a pricier model. G5 is skippable
@@ -30,6 +30,30 @@ installed on the development machine (`FedoraLinux-44`) but cannot boot
 cannot be verified locally by running tests. G6 catches `cfg`-gated compile
 errors without linking; the GitHub Actions matrix is the real Linux evidence.
 See `PLAN.md` companion `PLATFORMS.md` for the per-platform support matrix.
+
+**G6's command was wrong until M6, and it had no runner.** Two separate defects,
+found together while wiring M6's dependencies:
+
+1. **`--no-default-features` is required, not optional.** As originally written the
+   command fails locally with `failed to find tool "x86_64-linux-gnu-gcc"`: the
+   default `http` feature pulls `reqwest` → `rustls` → `ring`, which needs a C
+   compiler for the target, and this machine has no Linux cross toolchain. The
+   documented gate therefore **could not pass as written.** Same class as B12 — a
+   criterion derived from a document instead of from running the command it
+   names.
+2. **Nothing ran it.** Every run-log row reports G6 green, but neither
+   `scripts/qc.ps1` nor `scripts/qc.sh` invoked it; the G6 column rested on a
+   hand-run command and a claim, with nothing able to contradict it. That is
+   B20's shape ("a gate ran but could not fail") pointing the other way: a gate
+   that could not run.
+
+Both runners now invoke G6, and both **SKIP it loudly and count it separately**
+when the target is not installed, rather than passing silently — a silent skip is
+how B20 happened. The consequence of (1) is stated rather than hidden:
+`--no-default-features` means G6 does **not** cover `cfg(feature = "http")` code
+for Linux. CI's ubuntu job compiles and runs it natively and is the stronger
+evidence; G6 is the local pre-flight that catches those errors before a CI round
+trip.
 
 G1–G3 are the standing QC loop: run them after **every** code change, not only at
 the end of a milestone. `scripts/qc.sh` (unix/WSL) and `scripts/qc.ps1` (Windows)

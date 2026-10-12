@@ -53,7 +53,13 @@ reqwest = { version = "0.12", optional = true, default-features = false, feature
     "stream",
 ] }
 ratatui = "0.29.0"
-crossterm = "0.29.0"
+# `event-stream` is NOT a default crossterm feature, and it is required: the
+# interactive loop selects over the terminal's event stream and the turn channel
+# together (`src/tui/mod.rs`), which is what keeps the UI responsive while a turn
+# runs. The alternative — polling `event::poll` on a timer — works without the
+# feature but wakes the process ~33 times a second to discover nothing happened.
+# It pulls in `futures-core` only.
+crossterm = { version = "0.29.0", features = ["event-stream"] }
 
 [features]
 default = ["http"]

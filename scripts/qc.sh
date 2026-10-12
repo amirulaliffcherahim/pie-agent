@@ -11,6 +11,10 @@
 #   G2  cargo clippy --all-targets -- -D warnings      zero warnings
 #   G3  cargo test                                     all pass
 #   G4  offline acceptance - M0: cargo run -- --list-backends
+#   G6  cargo check --target x86_64-unknown-linux-gnu --all-targets
+#       --no-default-features  (cross-target; SKIPped loudly if the target is
+#       not installed). `--no-default-features` is required, not optional: the
+#       default `http` feature needs a C compiler for the target.
 #   G5  live acceptance                                ONLY with --live
 #
 # G4 is the milestone's offline acceptance command, one gate per milestone:
@@ -55,6 +59,7 @@ cd -- "$REPO_ROOT"
 
 LIVE=0
 GATES_RUN=0
+GATES_SKIPPED=0
 
 usage() {
   cat >&2 <<'USAGE'
@@ -165,6 +170,51 @@ run_gate 'G4 acceptance (M5 ocr)' cargo test --test ocr
 # handshake, driven through the built binary rather than through the library.
 run_gate 'G4 acceptance (M5 mcp)' cargo test --test mcp
 
+# --- G6 (cross-target check) ------------------------------------------------
+# ACCEPTANCE section 1. Linux cannot be *run* locally (WSL2 is installed but
+# cannot boot - PLATFORMS.md F3), so this catches cfg-gated compile errors
+# without linking. CI's ubuntu job is the real Linux evidence; this is the local
+# pre-flight that catches those errors before a CI round trip.
+#
+# TWO things this has to get right, and until M6 it got both wrong:
+#
+#   1. It had NO RUNNER AT ALL. ACCEPTANCE section 1 lists G6 as a required gate
+#      and every run-log row reports it green, but neither this script nor
+#      scripts/qc.ps1 ever ran it - it was a hand-run command and a claim, which
+#      is B20's shape ("a gate ran but could not fail") in its other direction:
+#      a gate that could not run. The run-log G6 column rested on nothing that
+#      could have contradicted it.
+#
+#   2. The documented command COULD NOT PASS AS WRITTEN.
+#      `cargo check --target x86_64-unknown-linux-gnu --all-targets` fails with
+#      "failed to find tool x86_64-linux-gnu-gcc", because the default `http`
+#      feature pulls reqwest -> rustls -> ring, which needs a C compiler for the
+#      target. The flag that makes it work is `--no-default-features`. Same class
+#      as B12: a criterion derived from a document rather than from running the
+#      command it names.
+#
+# The cost of that second point is real and stated rather than hidden:
+# `--no-default-features` means this check does NOT cover cfg(feature = "http")
+# code on Linux. The CI ubuntu job covers it natively, and is stronger evidence.
+#
+# A missing target is reported as SKIP, loudly and counted separately, never as a
+# pass: a silent skip is exactly how B20 happened.
+G6_TARGET='x86_64-unknown-linux-gnu'
+G6_INSTALLED=0
+if command -v rustup >/dev/null 2>&1; then
+  if rustup target list --installed 2>/dev/null | grep -qx -- "$G6_TARGET"; then
+    G6_INSTALLED=1
+  fi
+fi
+if [ "$G6_INSTALLED" -eq 1 ]; then
+  run_gate 'G6 cross-target (linux, no-default-features)' \
+    cargo check --target "$G6_TARGET" --all-targets --no-default-features
+else
+  printf '\nSKIP: G6 cross-target - %s is not installed\n      rustup target add %s\n' \
+    "$G6_TARGET" "$G6_TARGET" >&2
+  GATES_SKIPPED=$((GATES_SKIPPED + 1))
+fi
+
 # --- G5 (live acceptance) ---------------------------------------------------
 if [ "$LIVE" -eq 1 ]; then
   printf '\n!! --live: the next gate spends REAL subscription quota on the\n' >&2
@@ -175,7 +225,12 @@ if [ "$LIVE" -eq 1 ]; then
   PIE_LIVE=1 run_gate 'G5 live smoke' cargo test --test live_smoke -- --ignored --test-threads=1
 fi
 
-printf '\n==> verdict: PASS - %d/%d gates green%s\n' \
-  "$GATES_RUN" "$((GATES_RUN + (LIVE == 1 ? 0 : 1)))" \
+if [ "$GATES_SKIPPED" -gt 0 ]; then
+  SKIP_SUFFIX=", $GATES_SKIPPED SKIPPED"
+else
+  SKIP_SUFFIX=''
+fi
+printf '\n==> verdict: PASS - %d/%d gates green%s%s\n' \
+  "$GATES_RUN" "$((GATES_RUN + (LIVE == 1 ? 0 : 1)))" "$SKIP_SUFFIX" \
   "$([ "$LIVE" -eq 1 ] && printf '' || printf ' (G5 live smoke not run - milestone would be `offline-verified`)')"
 exit 0

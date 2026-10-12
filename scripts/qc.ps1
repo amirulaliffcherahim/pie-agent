@@ -12,7 +12,12 @@
       G2  cargo clippy --all-targets -- -D warnings       zero warnings
       G3  cargo test                                      all pass
       G4  offline acceptance - M0: cargo run -- --list-backends
-      G5  live acceptance                                 ONLY with -Live
+      G6  cargo check --target x86_64-unknown-linux-gnu --all-targets
+          --no-default-features (cross-target; SKIPped loudly when the target
+          is not installed). `--no-default-features` is REQUIRED, not a
+          preference: with the default `http` feature the check needs a C
+          compiler for the target and fails.
+      G5  live acceptance                                  ONLY with -Live
 
     G4 is the milestone's offline acceptance command, one gate per milestone
     (M0: `cargo run -- --list-backends`, M1: `cargo test --test parse_agy`,
@@ -80,6 +85,7 @@ $RepoRoot = Split-Path -Parent $PSScriptRoot
 Set-Location -LiteralPath $RepoRoot
 
 $script:GatesRun = 0
+$script:GatesSkipped = 0
 
 function Invoke-Gate {
     <#
@@ -173,6 +179,51 @@ Invoke-Gate -Label 'G4 acceptance (M5 ocr)' -Argv @('test', '--test', 'ocr')
 # handshake, driven through the built binary rather than through the library.
 Invoke-Gate -Label 'G4 acceptance (M5 mcp)' -Argv @('test', '--test', 'mcp')
 
+# --- G6 (cross-target check) ------------------------------------------------
+# ACCEPTANCE section 1. Linux cannot be *run* locally (WSL2 is installed but
+# cannot boot - PLATFORMS.md F3), so this catches cfg-gated compile errors
+# without linking. CI's ubuntu job is the real Linux evidence; this is the local
+# pre-flight that catches those errors before a CI round trip.
+#
+# TWO things this has to get right, and until M6 it got both wrong:
+#
+#   1. It had NO RUNNER AT ALL. ACCEPTANCE section 1 lists G6 as a required gate
+#      and every run-log row reports it green, but neither this script nor
+#      scripts/qc.sh ever ran it - it was a hand-run command and a claim, which
+#      is B20's shape ("a gate ran but could not fail") in its other direction:
+#      a gate that could not run. The run-log G6 column rested on nothing that
+#      could have contradicted it.
+#
+#   2. The documented command COULD NOT PASS AS WRITTEN.
+#      `cargo check --target x86_64-unknown-linux-gnu --all-targets` fails
+#      locally with "failed to find tool x86_64-linux-gnu-gcc", because the
+#      default `http` feature pulls reqwest -> rustls -> ring, which needs a C
+#      compiler for the target. The flag that makes it work is
+#      `--no-default-features`. Same class as B12: a criterion derived from a
+#      document rather than from running the command.
+#
+# The cost of that second point is real and stated rather than hidden:
+# `--no-default-features` means this check does NOT cover cfg(feature = "http")
+# code on Linux. The CI ubuntu job covers it natively, and is the stronger
+# evidence.
+#
+# A missing target is reported as SKIP, loudly and counted separately, never as a
+# pass: a silent skip is exactly how B20 happened.
+$g6Target = 'x86_64-unknown-linux-gnu'
+$g6Installed = $false
+if (Get-Command rustup -ErrorAction SilentlyContinue) {
+    $g6Installed = (rustup target list --installed 2>$null) -contains $g6Target
+}
+if ($g6Installed) {
+    Invoke-Gate -Label 'G6 cross-target (linux, no-default-features)' `
+        -Argv @('check', '--target', $g6Target, '--all-targets', '--no-default-features')
+} else {
+    [Console]::Error.WriteLine('')
+    [Console]::Error.WriteLine("SKIP: G6 cross-target - $g6Target is not installed")
+    [Console]::Error.WriteLine("      rustup target add $g6Target")
+    $script:GatesSkipped++
+}
+
 # --- G5 (live acceptance) ---------------------------------------------------
 if ($Live) {
     [Console]::Error.WriteLine('')
@@ -193,6 +244,7 @@ if ($Live) {
 
 $total = if ($Live) { $script:GatesRun } else { $script:GatesRun + 1 }
 $suffix = if ($Live) { '' } else { ' (G5 live smoke not run - milestone would be `offline-verified`)' }
+$skipped = if ($script:GatesSkipped -gt 0) { ", $($script:GatesSkipped) SKIPPED" } else { '' }
 Write-Host ''
-Write-Host "==> verdict: PASS - $($script:GatesRun)/$total gates green$suffix"
+Write-Host "==> verdict: PASS - $($script:GatesRun)/$total gates green$skipped$suffix"
 exit 0
