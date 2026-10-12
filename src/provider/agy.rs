@@ -552,11 +552,45 @@ impl Provider for Agy {
     }
 
     async fn usage(&self, cfg: &Config) -> Result<UsageReport> {
+        // The probe is free in model tokens but not in time: agy spends roughly ten
+        // seconds of its own initialisation on it, measured 2026-10-12, for an
+        // answer that moves slowly. A cached reading is labelled with its age so it
+        // can never be mistaken for a live one, and `usage_cache_ttl_secs = 0`
+        // disables the cache entirely.
+        let ttl = Duration::from_secs(cfg.agy.usage_cache_ttl_secs);
+
+        if !ttl.is_zero() {
+            if let Some(entry) = crate::cache::read::<UsageReport>(&crate::paths::agy_usage_cache())
+            {
+                let now = crate::session_log::now_millis();
+                if entry.is_fresh(ttl, now) {
+                    // Read the age before moving the payload out of the entry.
+                    let age_secs = entry.age_ms(now) / 1000;
+                    let mut report = entry.value;
+                    report.notes.push(format!(
+                        "cached {age_secs}s ago; set agy.usage_cache_ttl_secs = 0 to probe every time"
+                    ));
+                    return Ok(report);
+                }
+            }
+        }
+
         // `usage_args()` deliberately omits `--disable-slash-commands`: `/usage`
         // is a slash expansion and must stay one (`knowledge/agy.md`).
         let plan = self.probe_plan(cfg, usage_args(), PROBE_TIMEOUT)?;
         let lines = driver::collect_lines(BACKEND, &plan).await?;
-        Ok(parse_usage(&lines))
+        let report = parse_usage(&lines);
+
+        // Only a reading with buckets is cached. Caching an empty payload would
+        // turn a transient failure into five minutes of misleading "no buckets".
+        if !ttl.is_zero() && !report.buckets.is_empty() {
+            if let Err(e) = crate::cache::write_now(&crate::paths::agy_usage_cache(), &report) {
+                // Best effort: failing to cache must never fail the command.
+                tracing::debug!(error = %e, "could not cache the agy quota probe");
+            }
+        }
+
+        Ok(report)
     }
 }
 

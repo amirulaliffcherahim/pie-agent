@@ -43,6 +43,16 @@ pub fn agy_model_cache() -> PathBuf {
     cache_dir().join("agy-models.json")
 }
 
+/// `$PIE_HOME/cache/agy-usage.json`
+///
+/// The quota probe costs agy about ten seconds of its own initialisation for a
+/// free, zero-token answer, and quota moves slowly. Caching it is the single
+/// largest latency win available to pie on the agy path (measured 2026-10-12:
+/// 10.3 s per uncached probe).
+pub fn agy_usage_cache() -> PathBuf {
+    cache_dir().join("agy-usage.json")
+}
+
 /// `$PIE_HOME/cache/codex-models.json`
 pub fn codex_model_cache() -> PathBuf {
     cache_dir().join("codex-models.json")

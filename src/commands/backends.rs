@@ -6,6 +6,7 @@
 //!
 //! Neither command calls a model, so neither spends subscription quota (I7).
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -26,15 +27,28 @@ const AUTH_WIDTH: usize = 15;
 /// A version probe must never hang the table.
 const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// How long a recorded version snapshot is trusted for `--list-backends`.
+///
+/// The three probes cost about 1.5 s in total, and parallelising them does **not**
+/// help: measured 2026-10-12, the probes sum to 1.54 s sequentially and 1.46 s
+/// concurrently, because the cost is Windows process creation plus antivirus
+/// inspection rather than anything pie controls. Not spawning at all is the only
+/// fix, so the snapshot written by `doctor` is reused. Six hours is safe because a
+/// CLI only changes when it updates, and `doctor` always re-probes.
+const VERSION_SNAPSHOT_TTL: Duration = Duration::from_secs(6 * 60 * 60);
+
 /// `pie --list-backends`
 pub async fn list(cfg: &Config) -> Result<()> {
-    let _ = table(cfg).await?;
+    let _ = table(cfg, false).await?;
     Ok(())
 }
 
 /// `pie doctor`
 pub async fn doctor(cfg: &Config) -> Result<()> {
-    let versions = table(cfg).await?;
+    // Always re-probes: this is the command that is *supposed* to be authoritative
+    // about what is installed, and it is the one that refreshes the snapshot
+    // `--list-backends` reads.
+    let versions = table(cfg, true).await?;
     println!();
     report_local_state(cfg);
 
@@ -49,11 +63,28 @@ pub async fn doctor(cfg: &Config) -> Result<()> {
 }
 
 /// Print the backend table and return `(id, version)` pairs.
-async fn table(cfg: &Config) -> Result<Vec<(String, String)>> {
+async fn table(cfg: &Config, refresh: bool) -> Result<Vec<(String, String)>> {
     println!(
         "{:<ID_WIDTH$} {:<BIN_WIDTH$} {:<VERSION_WIDTH$} {:<AUTH_WIDTH$} DETAIL",
         "BACKEND", "BINARY", "VERSION", "AUTH"
     );
+
+    // Prefer the snapshot `doctor` wrote. Spawning three vendor CLIs costs about
+    // 1.5 s (process creation plus antivirus inspection), and parallelising them
+    // does not help, so the only real fix is not to spawn when the answer is
+    // already known.
+    let cached = if refresh {
+        None
+    } else {
+        read_fresh_version_snapshot()
+    };
+    let stale_note = cached.as_ref().map(|(age, _)| *age);
+
+    let probed = if let Some((_, versions)) = cached {
+        versions
+    } else {
+        versions_in_parallel(cfg).await
+    };
 
     let mut versions: Vec<(String, String)> = Vec::new();
 
@@ -65,12 +96,12 @@ async fn table(cfg: &Config) -> Result<Vec<(String, String)>> {
             None => format!("(not found: {})", configured_bin(cfg, id)),
         };
 
-        let version = provider::driver::probe_version(&*p, cfg, VERSION_PROBE_TIMEOUT)
-            .await
-            // Redacted before it is printed or written into the version snapshot:
-            // a CLI whose `--version` echoed a credential would otherwise be
-            // persisted into ~/.pie/cache/versions.json (I10).
-            .map(|raw| process::redact(&raw))
+        // Redacted before it is printed or written into the version snapshot: a
+        // CLI whose `--version` echoed a credential would otherwise be persisted
+        // into ~/.pie/cache/versions.json (I10).
+        let version = probed
+            .get(id)
+            .map(|raw| process::redact(raw))
             .unwrap_or_else(|| "unknown".to_string());
 
         let auth = p.auth_status(cfg).await;
@@ -87,7 +118,91 @@ async fn table(cfg: &Config) -> Result<Vec<(String, String)>> {
         versions.push((id.to_string(), version));
     }
 
+    // Said out loud, so a recorded version is never mistaken for a live probe.
+    // Drift detection (I8) depends on knowing which one you are looking at.
+    if let Some(age_secs) = stale_note {
+        println!();
+        println!(
+            "versions are from a snapshot taken {age_secs}s ago; run `pie doctor` to re-probe"
+        );
+    }
+
     Ok(versions)
+}
+
+/// The recorded version snapshot, if it is still fresh.
+///
+/// Returns `(age_seconds, id → version)`. A missing, stale, unreadable or
+/// wrong-shaped file is simply `None`, which makes the caller re-probe.
+fn read_fresh_version_snapshot() -> Option<(u64, HashMap<String, String>)> {
+    let text = std::fs::read_to_string(paths::version_snapshot()).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+
+    let generated_at = crate::jsonl::u(&value, "generated_at")?;
+    let age_secs = crate::session_log::now_millis().saturating_sub(generated_at) / 1000;
+    if age_secs > VERSION_SNAPSHOT_TTL.as_secs() {
+        return None;
+    }
+
+    // `backends` is a JSON **object** (`{"agy": "1.3.3", …}`), which is what
+    // `write_version_snapshot` produces. Reading it with an array helper silently
+    // yielded nothing, so the snapshot was never used and the command kept
+    // probing — the same class of mistake as B6: a shape assumed rather than
+    // checked.
+    let mut versions = HashMap::new();
+    if let Some(serde_json::Value::Object(map)) = crate::jsonl::at(&value, "backends") {
+        for (id, version) in map {
+            if let Some(text) = version.as_str() {
+                versions.insert(id.clone(), text.to_string());
+            }
+        }
+    }
+
+    // An empty snapshot is not worth trusting over a fresh probe.
+    if versions.is_empty() {
+        return None;
+    }
+
+    Some((age_secs, versions))
+}
+
+/// Every backend's version, probed concurrently.
+///
+/// A probe that fails or is unavailable is simply absent from the map, which the
+/// caller renders as `unknown` — one unresponsive CLI must not break the table.
+async fn versions_in_parallel(cfg: &Config) -> HashMap<String, String> {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let scrub = cfg.scrub_keys(cfg.scrub_enabled());
+
+    let mut jobs = tokio::task::JoinSet::new();
+
+    for p in provider::registry() {
+        let Some((program, args)) = p.version_command(cfg) else {
+            continue;
+        };
+        let id = p.id().to_string();
+        let (cwd, scrub) = (cwd.clone(), scrub.clone());
+
+        jobs.spawn(async move {
+            let version = provider::driver::probe_version_owned(
+                program,
+                args,
+                cwd,
+                scrub,
+                VERSION_PROBE_TIMEOUT,
+            )
+            .await;
+            (id, version)
+        });
+    }
+
+    let mut found = HashMap::new();
+    while let Some(joined) = jobs.join_next().await {
+        if let Ok((id, Some(version))) = joined {
+            found.insert(id, version);
+        }
+    }
+    found
 }
 
 /// The `doctor` footer: local paths, version, and the env scrub in effect.
@@ -192,6 +307,49 @@ fn short_path(path: &str, width: usize) -> String {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
+
+    #[test]
+    fn a_fresh_snapshot_is_used_and_a_stale_or_misshapen_one_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().display().to_string();
+        let _env = crate::testing::EnvGuard::set(&[("PIE_HOME", Some(home.as_str()))]);
+
+        let path = paths::version_snapshot();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        let write = |generated_at: u64| {
+            std::fs::write(
+                &path,
+                format!(
+                    r#"{{"generated_at":{generated_at},"pie_version":"0.1.0","backends":{{"agy":"1.3.3"}}}}"#
+                ),
+            )
+            .unwrap();
+        };
+
+        write(crate::session_log::now_millis());
+        let (age, versions) = read_fresh_version_snapshot().expect("a fresh snapshot is used");
+        assert!(age < 5, "age was {age}s");
+        assert_eq!(versions.get("agy").map(String::as_str), Some("1.3.3"));
+
+        // Stale: re-probing is the whole point of a TTL.
+        write(crate::session_log::now_millis() - (VERSION_SNAPSHOT_TTL.as_secs() + 60) * 1_000);
+        assert!(
+            read_fresh_version_snapshot().is_none(),
+            "a stale snapshot must not be served"
+        );
+
+        // `backends` as an array: the shape this reader originally (and wrongly)
+        // assumed. A miss, never a panic.
+        std::fs::write(&path, r#"{"generated_at":1,"backends":[]}"#).unwrap();
+        assert!(read_fresh_version_snapshot().is_none());
+
+        std::fs::remove_file(&path).unwrap();
+        assert!(
+            read_fresh_version_snapshot().is_none(),
+            "missing file is a miss"
+        );
+    }
 
     #[test]
     fn short_paths_that_fit_are_left_alone() {

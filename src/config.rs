@@ -94,6 +94,15 @@ pub struct Agy {
     pub print_timeout_secs: u64,
     /// How long a cached `agy models` catalog stays fresh.
     pub model_cache_ttl_secs: u64,
+    /// How long a cached `/usage` quota reading stays fresh. `0` disables the
+    /// cache and probes every time.
+    ///
+    /// The probe is free (zero model tokens) but not cheap in *time*: agy spends
+    /// roughly ten seconds of its own initialisation on it, measured 2026-10-12.
+    /// Quota moves slowly, so five minutes is a reasonable default, and the
+    /// report says when it was taken so a cached reading is never mistaken for a
+    /// live one.
+    pub usage_cache_ttl_secs: u64,
 }
 
 impl Default for Agy {
@@ -103,6 +112,7 @@ impl Default for Agy {
             default_effort: Some("medium".to_string()),
             print_timeout_secs: 0,
             model_cache_ttl_secs: 86_400,
+            usage_cache_ttl_secs: 300,
         }
     }
 }

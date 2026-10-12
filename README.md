@@ -105,6 +105,45 @@ credential, and it is switchable off: set `quota_probe = "off"`, or
 `PIE_CODEX_QUOTA_PROBE=off`, and no request is made — session-log totals still
 work. See `knowledge/9router-findings.md` for why that switch exists.
 
+## Speed — where the time actually goes
+
+Measured on the development machine, 2026-10-12:
+
+| | Time | Why |
+|---|---|---|
+| `pie` startup | **0.079 s** | pie's own cost, negligible |
+| `pie auth` | 0.091 s | no subprocess at all |
+| `pie --list-backends` | 0.143 s | served from the version snapshot |
+| `pie usage agy` (cached) | **0.063 s** | agy's quota moves slowly |
+| `pie usage agy` (probe) | 5–10 s | agy's own initialisation, not pie's |
+| a codex turn | ~3.6 s | |
+| an agy turn | ~40 s | ~10 s of it is agy's init, the rest inference |
+
+Two conclusions worth knowing before you try to make it faster:
+
+1. **pie is not the slow part.** Its startup is 79 ms. Everything else is the vendor
+   CLI. Do not micro-optimise pie; the lever is not spawning, or spawning less.
+2. **`agy` is the slow backend by a wide margin** — a real turn is 40 s against
+   codex's 3.6 s, and roughly 10 s of that is agy's fixed per-invocation setup,
+   which pie cannot remove. Prefer codex when latency matters.
+
+Two caches exist for exactly this reason, and both are labelled so a cached value
+is never mistaken for a live one:
+
+- `agy.usage_cache_ttl_secs` (default 300) — the `/usage` probe. Turn it off with
+  `0`.
+- the version snapshot written by `pie doctor`, reused by `pie --list-backends`
+  for up to six hours. `doctor` always re-probes, so run it when you want the
+  truth.
+
+Note that running `cargo run -- …` costs ~0.4 s of cargo overhead on every
+invocation, six times pie's own startup. Use the built binary:
+`./target/release/pie.exe`.
+
+Parallelising the three version probes was tried and **does not help** (1.54 s
+sequential versus 1.46 s concurrent): the cost is Windows process creation plus
+antivirus inspection, not something pie controls. Caching is the fix.
+
 ## Platform support
 
 Built and tested on Windows (`x86_64-pc-windows-msvc`), required to work on Linux

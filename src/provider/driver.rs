@@ -203,13 +203,34 @@ pub async fn probe_version(
     timeout: Duration,
 ) -> Option<String> {
     let (program, args) = provider.version_command(cfg)?;
-
-    let spec = RunSpec {
-        backend: provider.id().to_string(),
+    probe_version_owned(
         program,
         args,
-        cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-        scrub: cfg.scrub_keys(cfg.scrub_enabled()),
+        std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        cfg.scrub_keys(cfg.scrub_enabled()),
+        timeout,
+    )
+    .await
+}
+
+/// The same probe over **owned** inputs, so callers can run several concurrently.
+///
+/// Each probe costs roughly half a second of process startup, so three sequential
+/// probes made `--list-backends` and `doctor` feel sluggish for no reason. Owned
+/// arguments are what let `tokio::task::JoinSet` spawn them in parallel.
+pub async fn probe_version_owned(
+    program: PathBuf,
+    args: Vec<OsString>,
+    cwd: PathBuf,
+    scrub: Vec<String>,
+    timeout: Duration,
+) -> Option<String> {
+    let spec = RunSpec {
+        backend: "version-probe".to_string(),
+        program,
+        args,
+        cwd,
+        scrub,
         timeout,
     };
 
@@ -226,7 +247,7 @@ pub async fn probe_version(
     match process::run_streaming(&spec, &mut capture).await {
         Ok(_) => first,
         Err(e) => {
-            tracing::debug!(backend = provider.id(), error = %e, "version probe failed");
+            tracing::debug!(error = %e, "version probe failed");
             None
         }
     }
