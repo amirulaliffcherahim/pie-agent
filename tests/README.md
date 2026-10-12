@@ -8,6 +8,7 @@ means something specific.
 | `cargo test` | everything except live smoke | free | after **every** code change |
 | `bash scripts/qc.sh` | gates G1→G4 in order, fail-fast | free | before a milestone commit (Linux / WSL / macOS) |
 | `powershell -File scripts/qc.ps1` | the same gates on Windows | free | before a milestone commit (Windows) |
+| `node scripts/check-docs.js` | markdown table shape across `planning/`, `knowledge/` and the READMEs | free | after editing any table |
 | `bash scripts/qc.sh --live` | the above **plus G5** | **real subscription quota** | only at a milestone gate, deliberately |
 
 Rules that keep this honest:

@@ -134,6 +134,15 @@ jobs:
 
           if ($failed) { exit 1 }
 
+      # --- Docs shape ---------------------------------------------------------
+      # The planning docs are part of the contract (ACCEPTANCE.md carries the
+      # frozen gates), so a malformed table is a silent contract defect: it still
+      # renders, just wrong. Two tables in this repo were mangled by hand edits
+      # before this check existed. Stdlib-only Node, which every runner already
+      # has.
+      - name: "Docs: markdown tables are well-formed"
+        run: node scripts/check-docs.js
+
       # --- G1 -----------------------------------------------------------------
       - name: "G1 format: cargo fmt --check"
         run: cargo fmt --check
