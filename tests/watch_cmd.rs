@@ -87,6 +87,15 @@ struct StandIn {
 
 impl StandIn {
     fn new(version: &str, help: &str) -> Self {
+        Self::with_trailing(version, help, "")
+    }
+
+    /// A stand-in whose script carries `trailing` bytes after an early `exit`.
+    ///
+    /// The shell never reads past the `exit`, so the bytes are dead to the probe and alive
+    /// to the artefact reader — which is how a test makes the artefact larger than one read
+    /// chunk without writing a script that executes megabytes.
+    fn with_trailing(version: &str, help: &str, trailing: &str) -> Self {
         let dir = tempfile::tempdir().expect("a scratch directory");
         let calls = dir.path().join("calls.txt");
         let argv_record = dir.path().join("argv.txt");
@@ -124,7 +133,7 @@ impl StandIn {
             help = help_file.display(),
         );
 
-        std::fs::write(&script, body).expect("write the counting stand-in");
+        std::fs::write(&script, format!("{body}{trailing}")).expect("write the counting stand-in");
 
         #[cfg(not(windows))]
         {
@@ -1085,4 +1094,174 @@ async fn a_help_capture_that_arrives_on_stderr_is_still_a_capture() {
         "a stderr capture is not an empty capture: {}",
         outcome.render()
     );
+}
+
+/// `ACCEPTANCE.md` §13 B34, closed: the REA-lite label's third leg has a producer, so the
+/// run no longer describes it as missing and the snapshot carries the strings it found.
+///
+/// The assertion on the *absence* and the assertion on the *content* are deliberately in
+/// one test: either half alone is satisfiable by doing nothing — a run that never mentions
+/// strings, and a snapshot that records an empty list, would each pass one of them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_strings_leg_runs_and_the_snapshot_carries_the_strings_it_found() {
+    let home = tempfile::tempdir().expect("a scratch home");
+    let stand_in = StandIn::new("agy version 9.9.9", HELP);
+    let cfg = config_with(&stand_in.script);
+
+    let outcome = watch::execute(
+        &cfg,
+        home.path(),
+        &Options::default(),
+        &FakeHttp::refusing(),
+        TS,
+    )
+    .await
+    .expect("a real run");
+
+    // The note that announced the leg never runs is gone from the run's own output…
+    let rendered = outcome.render();
+    for gone in ["NOT compared", "inert", "no stage produces"] {
+        assert!(
+            !rendered.contains(gone),
+            "B34: the run must no longer describe its own third leg as missing (`{gone}`):\n{rendered}"
+        );
+    }
+
+    // …and from the report's legend, which is the part a reader skims.
+    let body = read_report(&outcome);
+    assert!(!body.contains("NOT compared"), "{body}");
+    assert!(
+        body.contains("all three diffed"),
+        "the legend must claim the comparison that now happens:\n{body}"
+    );
+
+    // And the snapshot holds what the leg found, read from *this* backend's artefact. The
+    // stand-in is a script whose own bytes contain `--version`, so a flag-like token from
+    // it can only have come from reading that file.
+    let recorded = std::fs::read_to_string(watch::snapshot_path(home.path(), "agy"))
+        .expect("the agy snapshot was written");
+    let file: serde_json::Value = serde_json::from_str(&recorded).expect("a readable snapshot");
+    let strings: Vec<&str> = file["strings"]
+        .as_array()
+        .expect("the snapshot carries a strings array")
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+
+    assert!(
+        !strings.is_empty(),
+        "the third leg produced nothing, so the label's claim is still empty: {recorded}"
+    );
+    assert!(
+        strings.iter().any(|s| s.contains("--version")),
+        "the strings must come from this backend's own artefact: {strings:?}"
+    );
+    // The artefact is a scratch script, far below the read cap, so the read is whole and
+    // there is no caveat to state.
+    assert_eq!(
+        file["strings_note"],
+        serde_json::Value::Null,
+        "a whole read states no caveat: {recorded}"
+    );
+}
+
+/// The read reaches EOF, not the first chunk.
+///
+/// The previous reader took a fixed prefix, and against the real `agy.exe` (~193 MB) that
+/// prefix stopped long before any flag. A fixture smaller than one read chunk cannot tell a
+/// prefix read from a whole one, so this artefact is larger than a chunk and carries the
+/// flag only in its tail: a driver that read one chunk and stopped would record nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_artefact_larger_than_one_read_chunk_is_read_to_eof() {
+    let home = tempfile::tempdir().expect("a scratch home");
+
+    // Larger than the driver's 1 MiB chunk, and the flag is past every boundary but the
+    // last. The pad is one long printable run, so it also exercises the scanner's bounded
+    // state rather than a run the reader could hold whole.
+    let pad = "x".repeat(2 * 1024 * 1024);
+    let trailing = format!("\r\n{pad}\r\n--print-timeout\r\n");
+    let stand_in = StandIn::with_trailing("agy version 9.9.9", HELP, &trailing);
+    let cfg = config_with(&stand_in.script);
+
+    watch::execute(
+        &cfg,
+        home.path(),
+        &Options::default(),
+        &FakeHttp::refusing(),
+        TS,
+    )
+    .await
+    .expect("a real run");
+
+    let recorded = std::fs::read_to_string(watch::snapshot_path(home.path(), "agy"))
+        .expect("the agy snapshot was written");
+    let file: serde_json::Value = serde_json::from_str(&recorded).expect("a readable snapshot");
+    let strings: Vec<&str> = file["strings"]
+        .as_array()
+        .expect("the snapshot carries a strings array")
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+
+    assert!(
+        strings.contains(&"--print-timeout"),
+        "a flag in the artefact's tail must reach the snapshot, so the read reaches EOF: \
+         {strings:?}"
+    );
+
+    // The artefact is under the streaming bound, so the read was whole and there is no
+    // caveat to state; a prefix read would have said so here.
+    assert_eq!(
+        file["strings_note"],
+        serde_json::Value::Null,
+        "a whole read states no caveat: {recorded}"
+    );
+}
+
+/// `ACCEPTANCE.md` §13 B34: codex's leg must read codex's **own** artefact.
+///
+/// codex is `node <codex.js>` on this platform, so its resolved program is node — and the
+/// note that kept the third leg switched off for two milestones said exactly this: reading
+/// the program would record *node's* strings as codex's.
+///
+/// A probe argv that spawns nothing cannot test this, so the two resolved paths are compared
+/// directly. The launcher only resolves when a `node` is on `PATH`; without one,
+/// `program_and_prefix` falls back to the script itself and the two agree for a reason that
+/// has nothing to do with the override — hence the explicit branch rather than an assertion
+/// that could be green for the wrong reason.
+#[test]
+fn codex_names_its_script_as_the_artefact_and_never_the_launcher() {
+    let dir = tempfile::tempdir().expect("a scratch dir");
+    let script = dir.path().join("codex.js");
+    std::fs::write(&script, "// codex, as a fixture\n").expect("write the script fixture");
+
+    let mut cfg = Config::default();
+    cfg.codex.bin = script.display().to_string();
+    cfg.codex.use_node_shim = false;
+
+    let codex = pie::provider::by_id("codex").expect("codex is registered");
+
+    assert_eq!(
+        codex.artefact(&cfg).as_deref(),
+        Some(script.as_path()),
+        "the artefact is the script itself"
+    );
+
+    match codex.binary(&cfg) {
+        Some(program) if program != script => {
+            // The `node <codex.js>` branch — the trap, live.
+            assert_ne!(
+                codex.artefact(&cfg).as_deref(),
+                Some(program.as_path()),
+                "the artefact must never be the launcher: extracting from node's bytes \
+                 would report node's strings as codex's"
+            );
+        }
+        _ => {
+            eprintln!(
+                "note: no `node` resolves here, so codex's launcher branch did not run; the \
+                 assertion above still pins the artefact to the script"
+            );
+        }
+    }
 }

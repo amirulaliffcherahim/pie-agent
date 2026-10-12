@@ -57,12 +57,15 @@
 //!    `jobs.learn_budget_tokens` — the same "one opt-in story, two consumers" the M7/M8
 //!    brief names — while the ledger that records the spend is this job's own file, so a
 //!    probe count can never be added to the learn job's token accounting.
-//! 3. **`CliSnapshot::strings` has no producer in any stage**, so the reports label the
-//!    mode `REA-lite` whose third leg never runs. [`STRINGS_NOTE`] says so on every run
-//!    rather than letting the label claim a comparison that was not made, and the trap
-//!    that made a naive producer wrong is recorded there too.
+//! 3. **The `strings` leg reads the vendor's own artefact, never its launcher.**
+//!    `DESIGN.md` §17 documents the trap: codex is `node <codex.js>` here, so extracting
+//!    from the *resolved program* would record node's strings as codex's
+//!    (`ACCEPTANCE.md` §13 B34). [`crate::provider::Provider::artefact`] names the right
+//!    file, [`crate::watch::strings`] extracts from it, and the read is bounded — a prefix
+//!    read is stated in the snapshot and in the run's output rather than silently compared.
 
 use std::ffi::OsString;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -110,13 +113,6 @@ const MONTH_LEN: usize = 7;
 
 /// Milliseconds in a day, for the civil-date walk.
 const MS_PER_DAY: u64 = 86_400_000;
-
-/// Stated on every run, because the mode label would otherwise claim more than was done.
-pub const STRINGS_NOTE: &str = "binary strings: NOT compared — no stage produces \
-     `CliSnapshot::strings`, and the naive producer is wrong: `help_command` carries the \
-     launcher prefix, so running `strings` on the resolved program would compare *node's* \
-     binary for codex (the exact bug the version/help pair exists to prevent). Version and \
-     `--help` were compared; the REA-lite label's third leg is inert";
 
 /// Which halves of the monthly run to perform (`DESIGN.md` §17's CLI surface).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -282,7 +278,10 @@ pub struct Outcome {
     pub headlines: usize,
     /// The sources that failed, by name.
     pub failed_sources: Vec<String>,
-    /// Things the run did not do, stated rather than implied (see [`STRINGS_NOTE`]).
+    /// Things the run did not do, or did only in part, stated rather than implied — an
+    /// artefact read that stopped at the cap, a dry run, a scope that fetched nothing.
+    /// A note is never decoration: each one exists because the omission it describes would
+    /// otherwise read as a clean result.
     pub notes: Vec<String>,
 }
 
@@ -442,9 +441,6 @@ pub async fn execute(
             ..Outcome::default()
         };
         outcome.sources = options.sources.len();
-        if options.scope.probes() {
-            outcome.notes.push(STRINGS_NOTE.to_string());
-        }
         outcome.notes.push(
             "nothing was probed or fetched: `--dry-run` is free without exception, so it \
              reports what it would do rather than doing it"
@@ -558,8 +554,18 @@ fn finish(
         sources: options.sources.len(),
         ..Outcome::default()
     };
+    // A snapshot whose strings came from a prefix of the artefact has to say so where the
+    // reader is, not only inside the JSON: the report's REA legend otherwise claims a
+    // comparison over the whole file, and the header is the part a reader skims
+    // (`DESIGN.md` §17).
     if options.scope.probes() {
-        outcome.notes.push(STRINGS_NOTE.to_string());
+        for probed in &half.probed {
+            if let Some(note) = &probed.snapshot.strings_note {
+                outcome
+                    .notes
+                    .push(format!("{}: {note}", probed.snapshot.backend));
+            }
+        }
     }
 
     if options.scope.fetches() {
@@ -691,13 +697,17 @@ async fn drift_half(cfg: &Config, home: &Path, now_ms: u64) -> Result<DriftHalf>
         // Read before writing: this is the snapshot the finding is made against.
         let path = snapshot_path(home, &id);
         let previous = read_snapshot(&path)?;
+        // The third leg: read the vendor's **own** artefact and keep the strings a CLI
+        // change could plausibly move. A file read is not a spawn, so the probe count the
+        // budget is enforced against is unchanged by this.
+        let (strings, strings_note) = artefact_strings(&id, provider.artefact(cfg));
+
         let snapshot = CliSnapshot {
             backend: id.clone(),
             version,
             help,
-            // No producer in this build; `STRINGS_NOTE` is printed on every run so the
-            // mode label cannot claim the comparison that would have filled this in.
-            strings: Vec::new(),
+            strings,
+            strings_note,
             taken_ms: now_ms,
         };
 
@@ -793,6 +803,108 @@ async fn capture(
     }
 }
 
+/// Read one backend's artefact and extract the strings a CLI change could plausibly move.
+///
+/// The second value is the stated reason the strings are not a complete picture, when
+/// there is one: a read that stopped at the cap, no artefact at all, or a read that failed.
+/// It travels into the snapshot, because a read that reports nothing is a false "no drift"
+/// — the same failure B35 recorded for an empty `--help`, one leg over.
+///
+/// **Nothing here is fatal**, and that is deliberate. Version and `--help` are valid
+/// evidence on their own, so an artefact that cannot be read degrades this leg and says so
+/// rather than discarding the whole probe; skipping the backend would be over-correcting,
+/// which is the shape `ACCEPTANCE.md` §13 B23 recorded.
+///
+/// The path is taken as an argument rather than resolved from the provider here, so the
+/// method under test is the one the trait names and not a second resolution order that
+/// could drift from it.
+fn artefact_strings(backend: &str, path: Option<PathBuf>) -> (Vec<String>, Option<String>) {
+    let Some(path) = path else {
+        return (
+            Vec::new(),
+            Some(format!(
+                "no artefact resolves for `{backend}`, so the binary-strings leg compared \
+                 nothing"
+            )),
+        );
+    };
+
+    match read_artefact(&path) {
+        Ok((strings, note)) => (strings, note),
+        Err(error) => (
+            Vec::new(),
+            Some(format!(
+                "{} could not be read ({error}), so the binary-strings leg compared nothing; \
+                 version and `--help` still ran",
+                path.display()
+            )),
+        ),
+    }
+}
+
+/// How much of the artefact is read per chunk.
+///
+/// The bound that matters is on **memory**, not on how much is read. A chunk buffer of this
+/// size plus the scanner's constant-sized state is the whole footprint, whatever the file's
+/// size — so the read can go to EOF and still be an allocation pie chose (`ACCEPTANCE.md`
+/// §13 B22). 1 MiB is large enough to keep the syscall count low on a 200 MB binary and
+/// small enough that the buffer is not the memory the scan is trying to avoid.
+const STREAM_CHUNK_BYTES: usize = 1024 * 1024;
+
+/// Stream `path` to EOF in bounded chunks and extract the strings, stating when a genuine
+/// read bound stopped the scan short.
+///
+/// This is the driver half of the leg; the selection itself is
+/// [`watch::strings::StringScanner`], which is pure so every rule is tested against byte
+/// slices. The scanner holds the partial run across chunk boundaries, so a string that
+/// straddles two reads is found whole — the failure a per-chunk scan would produce on every
+/// file, silently, as a missing or split string.
+///
+/// The note is not an apology but evidence: without it, a diff taken over a **prefix** is
+/// indistinguishable from one taken over the whole file. For every real artefact it is
+/// `None`, because [`watch::strings::MAX_ARTEFACT_BYTES`] is far above the vendor sizes and
+/// the read reaches EOF.
+fn read_artefact(path: &Path) -> std::io::Result<(Vec<String>, Option<String>)> {
+    let started = std::time::Instant::now(); // TIMING-TEMP
+    let mut file = std::fs::File::open(path)?;
+    let total = file.metadata()?.len();
+    let bound = watch::strings::MAX_ARTEFACT_BYTES;
+
+    let mut scanner = watch::strings::StringScanner::new(watch::strings::MAX_STRINGS);
+    let mut buffer = vec![0u8; STREAM_CHUNK_BYTES];
+    let mut read: u64 = 0;
+
+    loop {
+        if read >= bound {
+            break;
+        }
+        // Never read past the bound, so the last chunk does not over-read into bytes the
+        // scan would then have to discard.
+        let want = ((bound - read).min(buffer.len() as u64)) as usize;
+        let filled = file.read(&mut buffer[..want])?;
+        if filled == 0 {
+            break;
+        }
+        // The chunk is fed as it arrives; nothing accumulates between chunks but the
+        // scanner's own bounded state.
+        scanner.feed(&buffer[..filled]);
+        read += filled as u64;
+    }
+
+    let strings = scanner.finish();
+    let note = (total > bound).then(|| {
+        format!(
+            "read the first {read} of {total} bytes of {}, because pie stops a scan at \
+             {bound} bytes (the streaming read bound) — so the strings below describe that \
+             prefix and not the whole artefact",
+            path.display()
+        )
+    });
+
+    eprintln!("TIMING read {} in {:?}", path.display(), started.elapsed()); // TIMING-TEMP
+    Ok((strings, note))
+}
+
 // ------------------------------------------------------------------- the news half --
 
 /// What one digest pass produced.
@@ -851,6 +963,10 @@ struct SnapshotFile {
     version: String,
     help: String,
     strings: Vec<String>,
+    /// The read's own caveat, when it has one. `#[serde(default)]` on the struct is what
+    /// lets a snapshot written before this key existed still be read as a baseline: an
+    /// older file simply had a whole-prefix-less read, which is what `None` means.
+    strings_note: Option<String>,
     taken_ms: u64,
 }
 
@@ -862,6 +978,7 @@ impl SnapshotFile {
             version: snapshot.version.clone(),
             help: snapshot.help.clone(),
             strings: snapshot.strings.clone(),
+            strings_note: snapshot.strings_note.clone(),
             taken_ms: snapshot.taken_ms,
         }
     }
@@ -873,6 +990,7 @@ impl SnapshotFile {
             version: self.version,
             help: self.help,
             strings: self.strings,
+            strings_note: self.strings_note,
             taken_ms: self.taken_ms,
         }
     }

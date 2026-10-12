@@ -489,6 +489,21 @@ pub trait Provider: Send + Sync {
         ))
     }
 
+    /// The file whose **own bytes** are the vendor's artefact, for the REA-lite `strings`
+    /// leg of the drift check (`DESIGN.md` §17).
+    ///
+    /// Defaults to the resolved binary, which is right for a CLI pie launches directly:
+    /// agy and claude are native executables, and their own bytes are their own strings.
+    ///
+    /// A backend that cannot be launched directly **must** override it, for the same
+    /// reason [`Provider::version_command`] and [`Provider::help_command`] exist: codex is
+    /// `node <codex.js>` on Windows, so its resolved program is *node*, and reading that
+    /// would record node's strings as codex's (`ACCEPTANCE.md` §13 B34 — the third leg was
+    /// inert for two milestones precisely because the obvious producer is that wrong).
+    fn artefact(&self, cfg: &Config) -> Option<PathBuf> {
+        self.binary(cfg)
+    }
+
     /// Probe credentials without spending model quota.
     async fn auth_status(&self, cfg: &Config) -> AuthState;
 

@@ -134,6 +134,36 @@ impl Provider for Codex {
         Some((program, prefix))
     }
 
+    /// codex's artefact is the **script**, never the launcher that runs it.
+    ///
+    /// This override is the whole reason [`Provider::artefact`] exists: codex is
+    /// `node <codex.js>` on this platform, so the default — the resolved binary — would
+    /// hand the extractor **node's** bytes and record node's strings as codex's. That is
+    /// the mistake `ACCEPTANCE.md` §13 B34 kept the third leg switched off to avoid, and
+    /// reading it off `program_and_prefix` rather than re-deriving the preference order is
+    /// what stops this from drifting from the launcher the other two probes use.
+    fn artefact(&self, cfg: &Config) -> Option<PathBuf> {
+        let (program, prefix) = program_and_prefix(cfg)?;
+        // `prefix` is empty on every native path and holds exactly the script on the
+        // `node <script>` path — so its first element *is* the vendor's file when there is
+        // one, and the program is its own artefact when there is not.
+        match prefix.into_iter().next() {
+            Some(script) => {
+                let script = PathBuf::from(script);
+                // **The platform binary, not the launcher.** `codex.js` is an 8.8 KB
+                // dispatcher that maps a target triple to a platform package and spawns the
+                // real binary; it contains no flags at all (measured: `grep -c -- "--json"`
+                // returns 0), so a snapshot taken from it is empty and can never show a flag
+                // change. That is B39, and it is why `artefact` is not `binary`.
+                //
+                // The script remains the fallback, and the probe records *which* it got — a
+                // launcher-script snapshot must not read as one that compared flags.
+                Some(platform_binary_beside(&script).unwrap_or(script))
+            }
+            None => Some(program),
+        }
+    }
+
     async fn auth_status(&self, cfg: &Config) -> AuthState {
         if self.binary(cfg).is_none() {
             return AuthState::BinaryMissing {
@@ -229,6 +259,62 @@ pub fn program_and_prefix(cfg: &Config) -> Option<(PathBuf, Vec<OsString>)> {
     }
 
     None
+}
+
+/// The vendor's own binary for a node-launched codex.
+///
+/// `codex.js` is a dispatcher: it maps a target triple to a platform package and spawns the
+/// real executable. The npm layout is
+/// `<package>/node_modules/[<scope>/]codex-<platform>/vendor/<triple>/bin/codex[.exe]` — note
+/// the **optional scope directory**, which is not optional in practice on this machine:
+/// `node_modules/@openai/codex-win32-x64`. The first version of this function looked for
+/// `codex-*` directly under `node_modules`, matched the scope directory `@openai`, and
+/// returned `None`, so codex kept reading its launcher and the leg stayed empty.
+///
+/// The triple directory is **discovered** rather than assumed: hardcoding
+/// `x86_64-pc-windows-msvc` would silently return `None` on every other platform and leave the
+/// leg pointing at a script again — the failure mode being fixed here.
+///
+/// Sorted before picking: a machine can carry more than one platform package, and choosing by
+/// directory-enumeration order would make the snapshot depend on the filesystem.
+fn platform_binary_beside(script: &Path) -> Option<PathBuf> {
+    // `bin/codex.js` -> the package root.
+    let package_root = script.parent()?.parent()?;
+    let modules = package_root.join("node_modules");
+
+    let mut packages: Vec<PathBuf> = Vec::new();
+    for entry in std::fs::read_dir(&modules).ok()?.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with("codex-") {
+            packages.push(entry.path());
+        } else if name.starts_with('@') {
+            // A scoped package: `@openai/codex-win32-x64`.
+            let scoped = entry.path();
+            for inner in std::fs::read_dir(&scoped).into_iter().flatten().flatten() {
+                if inner.file_name().to_string_lossy().starts_with("codex-") {
+                    packages.push(inner.path());
+                }
+            }
+        }
+    }
+
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    for package in packages {
+        let Ok(triples) = std::fs::read_dir(package.join("vendor")) else {
+            continue;
+        };
+        for triple in triples.flatten() {
+            let bin = triple.path().join("bin");
+            for candidate in [bin.join("codex.exe"), bin.join("codex")] {
+                if candidate.is_file() {
+                    candidates.push(candidate);
+                }
+            }
+        }
+    }
+
+    candidates.sort();
+    candidates.into_iter().next()
 }
 
 fn is_javascript(path: &Path) -> bool {

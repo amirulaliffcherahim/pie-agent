@@ -1225,19 +1225,34 @@ degrades to version + `--help` + binary-strings diff — "REA-lite". Full struct
 become available only after `rea setup`. The report labels which mode produced it, so a
 "REA-lite" report is never mistaken for a structural one.
 
-**The third leg does not run, and the report says so.** `CliSnapshot::strings` has no
-producer, and the obvious one is *wrong*: probing the resolved program for codex would run
-`strings` over **node's** binary, because codex is `node <codex.js>` here — the same
-trap `help_command` exists to avoid. A wrong comparison is worse than a missing one, so
-stage D reported the leg as inert in the report body rather than filling the field with
-something plausible. Version and `--help` **are** compared, which is the half that catches
-renamed flags.
+**The third leg is real, and it is a *read*, not a command.** The first shape this section
+prescribed was a `strings_command` beside `version_command`/`help_command` — and that was
+wrong twice over, in a way only implementing it showed:
 
-The missing producer has a shape, for whoever picks it up: extract strings from the
-**vendor's own artefact** — the native binary for agy and claude, the `codex.js` script
-for codex, both already resolvable through the launcher-prefix logic — and give
-`Provider` a `strings_command` beside `version_command`/`help_command`, since it is the
-same kind of probe with the same failure mode.
+* **A command spawns, and this leg must not.** The watchtower's budget counts spawns, and its
+  central claim is that with the default config a run reaches no provider. A `strings` probe
+  that spawned would have added a third spawn per backend and quietly falsified that claim
+  (`ACCEPTANCE.md` §16). What the leg needs is the vendor's **artefact as a path**, read
+  directly: `Provider::artefact(&self, cfg) -> Option<PathBuf>`, defaulting to `binary()` and
+  overridden by codex to name the **`codex.js` script** rather than `node`. That override is
+  the whole point — probing the launcher would report node's strings as codex's, which is the
+  same trap `help_command` exists to avoid.
+* **Reading a prefix is not enough to find a flag.** The first implementation bounded the read
+  at 16 MiB of a 193 MB binary, which is the right instinct about *memory* and the wrong bound
+  for *evidence*: measured against the real `agy`, every genuine flag (`--print-timeout`,
+  `--disable-slashes`, `--add-dir`, `--effort`) and every policy word was **absent**, while the
+  window filled with toolchain noise (`-0x`, `-1v`) that changes on every build. A leg that
+  cannot see what it exists to notice, and diffs churn, is worse than one that is inert: it
+  would have reported false drift on every rebuild. The read now streams to EOF in chunks — a
+  monthly job reading 193 MB once costs about a second — carrying a partial run across chunk
+  boundaries so a straddling string is neither lost nor split, and the bound that survives is
+  on what is **kept**, not on what is read.
+
+The selection rule is part of the contract, because it is what makes the leg evidence rather
+than noise: **long flags** (`--` then a letter, then letters/digits/hyphens) and the
+consent/policy/automation vocabulary, and **not** short flags — `-x` in a binary is a format
+verb or a register name, and the thing it would catch (`-h`, `-p`) is the least likely to change
+in a way that matters.
 
 ### CLI surface
 

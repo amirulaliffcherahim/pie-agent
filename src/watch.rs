@@ -12,6 +12,12 @@
 //!   model-written digest is an opt-in extra behind the same budget gate M7 uses — one
 //!   budget mechanism, two consumers.
 //!
+//! The drift job's third leg — the "REA-lite" `strings` comparison — reads each vendor's
+//! **own** artefact (via [`crate::provider::Provider::artefact`], so codex's strings come
+//! from its `codex.js` script rather than from node) and keeps only the runs a CLI change
+//! could plausibly move. That extractor is [`strings`], and it is pure: the bounded read is
+//! the command's job.
+//!
 //! ## Compliance framing is a requirement, not a tone choice
 //!
 //! `PLAN.md` §11a: the watchtower *"flags when a change means pie must change behavior or
@@ -29,6 +35,7 @@
 
 pub mod drift;
 pub mod news;
+pub mod strings;
 
 use std::path::{Path, PathBuf};
 
@@ -77,7 +84,25 @@ pub struct CliSnapshot {
     pub help: String,
     /// Selected binary strings. "REA-lite": no disassembler is installed
     /// (`RISKS.md` §14), so this is the degraded form and the report labels it as such.
+    ///
+    /// Selected, not dumped: only the flag-like tokens and policy-vocabulary runs of
+    /// [`crate::provider::Provider::artefact`]'s file, de-duplicated, sorted and capped
+    /// ([`strings::interesting_strings`]). [`crate::watch::drift::diff`] reads them as a
+    /// set, so the same artefact always yields the same vector and a probe that merely
+    /// reordered its own output is not a finding.
     pub strings: Vec<String>,
+    /// Why `strings` is not a complete picture of the artefact, when it is not.
+    ///
+    /// `None` means the whole artefact was read. `Some` states the reason — the artefact
+    /// was larger than [`strings::MAX_ARTEFACT_BYTES`], so `strings` was taken from a
+    /// **prefix**, or it could not be read at all. Recorded rather than left implicit
+    /// because a prefix read that reports nothing is a false "no drift", the same shape as
+    /// B35's empty `--help` one leg over.
+    ///
+    /// [`crate::watch::drift::diff`] deliberately does **not** compare this field: it
+    /// describes how the strings were taken, and a finding about pie's own read budget is
+    /// not a finding about the CLI.
+    pub strings_note: Option<String>,
     /// When it was taken, in epoch milliseconds. A parameter, never a clock read.
     pub taken_ms: u64,
 }
@@ -124,12 +149,15 @@ pub const REA_MODE: &str = "REA-lite";
 ///
 /// **It says what actually ran.** The first version named "selected binary strings" while
 /// nothing produced them, so the header claimed a comparison the body then contradicted —
-/// and the header is the part a reader skims. The missing leg is named as missing, with
-/// the reason, because a reader who trusts the header is the one who never sees the body.
+/// and the header is the part a reader skims. All three legs now run; the half that still
+/// does not is the structural one, and it is named as missing with its reason.
 pub const REA_MODE_DETAIL: &str =
-    "version + --help diff only; binary strings are NOT compared yet (no producer, and the \
-     naive one would read the launcher's binary) and no structure was decompiled (no \
-     disassembler is installed - `RISKS.md` §14; `rea setup` enables the structural half)";
+    "version + --help + selected binary strings, all three diffed; the strings are the \
+     flag-like tokens and policy-vocabulary runs of each vendor's own artefact (for codex, \
+     its `codex.js` script, never the `node` launcher), read from a bounded prefix when the \
+     artefact is larger than the cap and stated as such in the snapshot; no structure was \
+     decompiled (no disassembler is installed - `RISKS.md` §14; `rea setup` enables the \
+     structural half)";
 
 /// The snapshot line for a run that had **no previous snapshot** to compare against.
 ///

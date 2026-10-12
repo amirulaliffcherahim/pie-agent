@@ -23,6 +23,7 @@
 
 use std::collections::BTreeSet;
 
+use pie::watch::strings::interesting_strings;
 use pie::watch::{classify, diff, CliSnapshot, Drift, DriftClass};
 
 // ---------------------------------------------------------------------------
@@ -98,6 +99,10 @@ fn snapshot(backend: &str, version: &str, help: &str, strings: &[&str]) -> CliSn
         version: version.to_string(),
         help: help.to_string(),
         strings: strings.iter().map(|s| (*s).to_string()).collect(),
+        // Every fixture here stands for a read of the whole artefact. The note that says a
+        // read was a *prefix* is the producer's business (`tests/watch_cmd.rs`), and the
+        // differ deliberately does not compare it.
+        strings_note: None,
         taken_ms: TAKEN_MS,
     }
 }
@@ -442,6 +447,54 @@ fn a_binary_string_that_vanishes_and_one_that_appears_are_separate_findings() {
     assert_eq!(arrived.class, DriftClass::Compatible);
     assert!(
         arrived.detail.contains("turn-timeout"),
+        "{:#?}",
+        arrived.detail
+    );
+}
+
+#[test]
+fn a_change_the_extractor_found_is_reported_as_drift() {
+    // The two surfaces joined: the extractor produces a snapshot's `strings`, and the
+    // differ reports a change in them. Without this the leg could run and still be inert,
+    // which is B34's shape one layer in — a producer with no consumer is as useless as the
+    // consumer with no producer that the third leg shipped for two milestones.
+    let before: Vec<String> = interesting_strings(
+        b"\x00--print-timeout\x00do you consent to telemetry\x00",
+        64,
+    );
+    let after: Vec<String> =
+        interesting_strings(b"\x00--turn-timeout\x00do you consent to telemetry\x00", 64);
+
+    assert!(
+        before.iter().any(|s| s.contains("--print-timeout")),
+        "the extractor has to find the flag before the differ can report it: {before:?}"
+    );
+    assert!(before.iter().any(|s| s.contains("telemetry")), "{before:?}");
+
+    let before_refs: Vec<&str> = before.iter().map(String::as_str).collect();
+    let after_refs: Vec<&str> = after.iter().map(String::as_str).collect();
+    let drifts = diff(
+        &snapshot(BACKEND, VERSION, BASE_HELP, &before_refs),
+        &snapshot(BACKEND, VERSION, BASE_HELP, &after_refs),
+    );
+
+    // Exactly two: the string that went and the one that replaced it are separate set
+    // members (pairing is a `--help` rule and does not apply to strings), and the consent
+    // sentence both sides carry is not a finding.
+    assert_eq!(drifts.len(), 2, "{drifts:#?}");
+
+    let gone = only(&drifts, "binary string removed");
+    assert_eq!(gone.class, DriftClass::PieMustChange);
+    assert!(
+        gone.detail.contains("--print-timeout"),
+        "{:#?}",
+        gone.detail
+    );
+
+    let arrived = only(&drifts, "binary string added");
+    assert_eq!(arrived.class, DriftClass::Compatible);
+    assert!(
+        arrived.detail.contains("--turn-timeout"),
         "{:#?}",
         arrived.detail
     );
