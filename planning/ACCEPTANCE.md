@@ -202,7 +202,9 @@ cargo run -- usage codex
 ```
 
 - `hi` turn prints a reply, exits 0, appends a `provider:"codex"` row to the session log
-- `usage codex` prints the quota window(s) from `wham/usage`
+- `usage codex` prints the quota window(s) from `wham/usage` when the probe is
+  opted in (`codex.quota_probe = "http"`); with the default `"off"` it prints the
+  disabled report and session-log totals instead
 - the token appears in **no** output, error, or log line (I3 — grep the captured output)
 - refusal path: with an API-key-only credential the backend reports
   `NoSubscription`, exit 3, instead of silently billing (I9)
@@ -232,8 +234,13 @@ cargo run -- usage codex
 - [ ] every `exec`-level option precedes the `resume` subcommand
 - [ ] a bucket is labelled from `limit_window_seconds` / the window's real duration,
       and a null `secondary_window` is not an error
-- [ ] `codex.quota_probe = "off"` constructs **no** HTTP request and still lets
-      `pie usage codex` print session-log totals
+- [ ] `codex.quota_probe = "off"` — **the default** — constructs **no** HTTP
+      request, touches neither the credential store nor disk, and still lets
+      `pie usage codex` print session-log totals; the assertion is on the
+      *default* config, not on an explicitly-set `off`, because a switch that
+      defaults to on is not an opt-in
+- [ ] opting in with `codex.quota_probe = "http"` does reach the endpoint path, so
+      the switch is real in both directions rather than a flag with no effect
 - [ ] auth gate reads `auth_mode` from `~/.codex/auth.json` and requires subscription
 - [ ] `~/.pie/auth.json` (legacy, holds extracted tokens) is never read — assert with a test that the path is untouched/no reader exists
 
@@ -536,6 +543,16 @@ prevents it. This is the record the milestone verdicts above rest on.
 | B21 | medium | **Router semantics that could lose or invent an answer.** codex read the answer from the live accumulator, so an agent item arriving after `turn.completed` was appended to it, and a `turn.completed` with no agent message returned success with an empty answer and logged `ok: true`; a trailing `turn.failed` errored a turn that had already delivered. agy assigned terminal usage wholesale, so a partial `usage` zeroed fields already accumulated, accepted a `text_delta` from any step type that was not `tool`, and let a second `result` overwrite the first terminal. Also, codex checked the status string before `exit_code`, so a command that exited non-zero rendered as a completed tool step — contradicting the name of the test asserting it | QC sweep, contract and robustness lenses | codex freezes the answer at `turn.completed` and refuses an empty one as a protocol error; the first terminal wins and a later failure is ignored **with a warning**; agy merges usage field-wise (`Usage::merge`), gates text on `step_type == "agent_response"`, and latches the first terminal; `exit_code` is checked before `status` | `usage_merge_does_not_zero_fields_a_later_event_omits`, `a_failure_after_the_terminal_event_does_not_erase_the_answer`, plus updated `a_malformed_payload_of_any_shape_does_not_abort_the_run` and `a_completed_item_with_a_non_zero_exit_code_is_a_failed_tool_step` |
 | B22 | medium | **Unbounded input from sources pie does not control.** `Instant::now() + spec.timeout` panics on overflow and the timeout is an unvalidated `u64`; `argv_char_len` counted chars where Windows counts UTF-16 code units, under-measuring non-BMP prompts into an opaque `CreateProcessW` failure; `kill_tree` awaited `taskkill` with no deadline, on the timeout path it exists to enforce; `cache::read` read any file whole; and the argv cap measured the configured binary name before `stream` swapped in the resolved path | QC sweep, robustness lens | `checked_add` with a config error; UTF-16 counting on Windows; `kill_tree` bounded by a 5 s timeout; a 16 MiB size guard on cache reads, with the reason in the code | `an_implausibly_large_cache_file_is_a_miss_not_an_allocation`, existing cap tests |
 | B23 | **major** | **The fix for B13 introduced over-redaction that destroyed file paths in diagnostics.** Adding `/` to the opaque-run charset (to catch base64 secrets containing it) meant any unix-style path over 40 characters was redacted: a real config error printed `C:«redacted»\config.toml` instead of naming the file, and an error that cannot name the offending file is close to useless. A path is not a secret, and paths appear in almost every diagnostic | Running the real binary with a long `PIE_HOME` and deliberately invalid TOML — not by a test, which is the point: the security lens that found B13 could not have found this, because over-redaction looks like success | `/` removed from the run charset, with the trade-off written into the code: paths are far more common in diagnostics than unprefixed base64, so the path wins. The precise mechanism is `SECRET_PREFIXES`, which catches known credential shapes regardless of length; the run heuristic is only the backstop for unknown ones. Residual gap recorded rather than hidden: a long base64 secret *containing* `/` can survive in fragments | `a_long_path_in_a_diagnostic_is_not_redacted`, which asserts both a Windows and a unix path survive |
+
+### Test harness
+
+| # | Sev | Symptom | Caught by | Fix | Regression test |
+|---|---|---|---|---|---|
+| B24 | **blocker (process)** | **The gate hung silently instead of failing.** `EnvGuard::set` takes a plain `Mutex`, so a test that took a second guard while the first was still in scope blocked on its own thread forever. `cargo test` has no per-test timeout, so G3 stopped producing output and never returned; the visible symptom was a dozen *unrelated* tests (all the `paths`, `agy` and `config` suites that need the env lock) reporting "has been running for over 60 seconds". The milestone was unverifiable and the only signal was wall clock | Not a gate — the gate was the casualty. Noticed because the run was bounded and produced no verdict after 30 minutes. A second, sharper reading was possible and wrong: the same symptom is what a test making a real network call looks like, and `~/.codex/auth.json` *does* exist on this machine | `src/testing.rs` now tracks the lock per thread and **panics immediately**, naming the fix, when the same thread takes it twice. Another thread holding it is ordinary contention and still waits. A deadlock cannot be asserted, but the panic that replaces it can | `taking_a_second_guard_on_the_same_thread_panics_instead_of_deadlocking` (`#[should_panic]`), plus `scoped_guards_are_reusable_in_sequence` for the half a naive check would break |
+
+**What this one cost, and why it is logged as a process bug.** The defect was introduced by the maintainer while making the `wham/usage` decision, and it was invisible in the working tree: `cargo test --lib config::tests::` would have run the offending test in a *different* filter order and may still have hung. The lesson is the one §1 already states about gates — a check that cannot report is not a check — extended to the harness: **a test binary that hangs is a gate that failed without saying so.** Bounding the run is what turned it into a diagnosis.
+
+**The near-miss worth recording:** the first hypothesis was a live `wham/usage` call from the new opt-in test, because `HomeGuard` sets `HOME`/`USERPROFILE`/`PIE_HOME` to a temp dir while the real `~/.codex/auth.json` exists. That hypothesis was wrong — `require_subscription()` reads the guarded `HOME`, so the credential is genuinely absent and the probe stops at the auth gate — but it was worth checking before the fix, because "a test reached a private vendor endpoint" and "a test deadlocked" produce the same missing output.
 
 ### Findings that are not code bugs
 

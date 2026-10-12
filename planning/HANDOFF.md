@@ -144,9 +144,14 @@ and opt-in, because an unbudgeted summarisation job can silently spend premium q
 
 ## 8. Open items — decisions, not oversights
 
-- **`wham/usage`**: whether `pie usage codex` should call a private vendor endpoint at
-  all. `PLAN.md` §6 says yes; the 9router sweep argues the endpoint class carries
-  risk. Implemented behind `codex.quota_probe = "off"`. **This one is the user's call.**
+- **`wham/usage` — DECIDED 2026-10-12: off by default.** `pie usage codex` does
+  not call the private vendor endpoint unless the user opts in with
+  `codex.quota_probe = "http"` (`PIE_CODEX_QUOTA_PROBE`). The capability is kept,
+  not deleted: the call is read-only using the user's own credential. The
+  earlier `PLAN.md` §6 reading (default `http`) was reversed because "the plan
+  asks for it" is not a reason for the *default* to carry the account risk
+  `knowledge/9router-findings.md` §0 describes. See DESIGN §9, ACCEPTANCE §5,
+  TOKEN-ECONOMICS §10d.
 - **S1–S8** in `ACCEPTANCE.md` §14 — argv measured against the bin *name*; `println!`
   panics on broken pipe; `read_all` reads the whole log; version snapshot is a plain
   write; itsmini is env-only; `agent.compact_after_turns` named in the contract but

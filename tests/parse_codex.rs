@@ -829,18 +829,23 @@ fn epoch_seconds_render_as_utc_timestamps() {
     assert_eq!(iso8601_utc(1_794_102_772), "2026-11-08T01:52:52Z");
 }
 
-/// `codex quota_probe = "off"` must be provably network-free: this test has no
-/// credential on disk at all, so any path that read a token or sent a request
-/// would fail before returning.
+/// The private endpoint is opt-in, and `off` — **the default** — must be
+/// provably network-free: this test has no credential on disk at all, so any
+/// path that read a token or sent a request would fail before returning.
+///
+/// The assertion on the *default* rather than on an explicitly-set `off` is the
+/// point. A probe that defaults to on still calls a vendor endpoint nobody asked
+/// for, and the switch being reachable proves nothing about what a fresh install
+/// does (user decision, 2026-10-12).
 #[tokio::test]
-async fn the_off_switch_makes_no_credential_or_network_call() {
+async fn the_default_probe_is_off_and_makes_no_credential_or_network_call() {
     let dir = tempfile::tempdir().unwrap();
     let _home = HomeGuard::new(dir.path());
 
     assert_eq!(
         CodexQuotaProbe::default(),
-        CodexQuotaProbe::Http,
-        "the endpoint stays the documented default"
+        CodexQuotaProbe::Off,
+        "a fresh install must never call a private vendor endpoint"
     );
     assert!(
         !dir.path().join(".codex").join("auth.json").exists(),
@@ -851,8 +856,10 @@ async fn the_off_switch_makes_no_credential_or_network_call() {
         "with no credential the gate refuses, so the http path could not run"
     );
 
-    let mut cfg = Config::default();
-    cfg.codex.quota_probe = CodexQuotaProbe::Off;
+    // The default config, untouched. If the default ever flips back to `http`,
+    // this stops being the disabled report and the assertions below fail.
+    let cfg = Config::default();
+    assert_eq!(cfg.codex.quota_probe, CodexQuotaProbe::Off);
 
     let report = Codex.usage(&cfg).await.unwrap();
     assert_eq!(report, quota_disabled_report());
@@ -873,5 +880,38 @@ async fn the_off_switch_makes_no_credential_or_network_call() {
     assert!(
         written.is_empty(),
         "the disabled probe must not touch the credential store, the network, or disk: {written:?}"
+    );
+}
+
+/// …and opting in still reaches the endpoint, so the switch is real rather than
+/// a flag with no effect in one direction.
+///
+/// The credential is absent, so the *failure* is the evidence: with `http`,
+/// `usage` gets as far as demanding a subscription and fails there. With `off`
+/// it returns the disabled report without ever looking. That difference is what
+/// `the_default_probe_is_off_and_makes_no_credential_or_network_call` cannot
+/// show on its own, which is exactly why it is asserted separately.
+#[cfg(feature = "http")]
+#[tokio::test]
+async fn opting_in_reaches_the_credential_step_instead_of_returning_disabled() {
+    let dir = tempfile::tempdir().unwrap();
+    let _home = HomeGuard::new(dir.path());
+
+    let mut cfg = Config::default();
+    cfg.codex.quota_probe = CodexQuotaProbe::Http;
+
+    let error = Codex
+        .usage(&cfg)
+        .await
+        .expect_err("no credential on disk, so the probe cannot succeed");
+    assert!(
+        !error.to_string().contains("disabled"),
+        "with `http` the disabled report must not be what comes back: {error}"
+    );
+    assert_eq!(
+        error.exit_code(),
+        3,
+        "a missing subscription is exit 3 (I9), which is how we know the probe got \
+         past the switch and stopped at the auth gate: {error}"
     );
 }

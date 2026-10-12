@@ -109,15 +109,21 @@ than no compression step.
 
 1. **Is `wham/usage` acceptable?** `PLAN.md` §6 plans `pie usage codex` via the
    ChatGPT usage endpoint using the token from `~/.codex/auth.json`. 9router shows
-   the endpoint and the risk. **Decision taken (2026-10-12):** keep it, because
-   the plan asks for it and the call is read-only using the user's own
-   credential — but gate it. `codex.quota_probe = "http" | "off"`
-   (`PIE_CODEX_QUOTA_PROBE`) turns it off with no code change, and with `off` no
-   request is constructed at all. It stays the *only* vendor-endpoint call in
-   pie; any second one should be treated as a design change, not a feature.
+   the endpoint and the risk. **Decision taken (2026-10-12):** keep the
+   capability, because the call is read-only using the user's own credential — but
+   ship it **off**. `codex.quota_probe = "off" | "http"`
+   (`PIE_CODEX_QUOTA_PROBE`); `off` is the **default**, `http` is opt-in, and with
+   `off` no request is constructed at all. The initial reading of §4 made `http`
+   the default on the grounds that `PLAN.md` §6 asks for the endpoint; that was
+   reversed the same day, because "the plan asks for it" is not a reason for the
+   *default* to carry an account risk the user never opted into — the plan asks
+   for the capability, and the capability survives behind the switch.
+   It stays the *only* vendor-endpoint call in pie; any second one should be
+   treated as a design change, not a feature.
    The alternatives that remain open if you later want them: (b) drop the probe
    and report codex quota as unavailable, (c) derive what we can from
-   `turn.completed` usage in the session log.
+   `turn.completed` usage in the session log — (c) is now partly moot, since with
+   `off` the session-log totals are what `pie usage codex` reports anyway.
 2. **Does resume actually beat a fresh turn?** Recommendation 1 is the largest
    claimed saving and the cheapest to test. Once M5 exists, measure
    `input_tokens` for the same task with and without resume using the frozen

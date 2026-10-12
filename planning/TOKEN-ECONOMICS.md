@@ -232,7 +232,8 @@ bundled with holding vendor OAuth tokens in its own database, MITM-proxying
 vendor traffic, renaming tools to impersonate the official client, and pinging
 vendors to warm rate-limit windows. `PLAN.md` sections 5 and 12 forbid all of it.
 
-This is also why the codex quota probe now sits behind `codex.quota_probe =
-"http" | "off"` (`DESIGN.md` section 9): 9router is the demonstration of what that
-endpoint costs in posture, and the switch is what makes it a decision rather than
-a default.
+This is also why the codex quota probe sits behind `codex.quota_probe =
+"off" | "http"` (`DESIGN.md` section 9): 9router is the demonstration of what that
+endpoint costs in posture, and **`off` is the default** — the endpoint is
+reachable only when the user asks for it, so a fresh install never spends that
+posture on a quota figure it did not request.

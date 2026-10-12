@@ -158,18 +158,25 @@ impl Default for Codex {
 /// the ChatGPT usage endpoint using the credential from `~/.codex/auth.json`.
 /// That is the closest thing in pie to calling a vendor endpoint directly, which
 /// is the pattern `PLAN.md` §5 and `knowledge/9router-findings.md` warn about.
-/// It is kept because the plan asks for it, and it is read-only using the
-/// user's own credential — but it is **not unconditional**: a private-endpoint
-/// call needs an off switch that does not require a code change.
+///
+/// **`off` is the default** (user decision, 2026-10-12, reversing the initial
+/// reading of `PLAN.md` §6). The capability is kept and remains one config line
+/// away, but no private vendor endpoint is reached unless the user asks for it:
+/// 9router's own authors mark that endpoint class
+/// `deprecated: true, deprecationNotice: "RISK_NOTICE"` — *"Account may be
+/// restricted or banned"* — and an account risk nobody opted into is not a
+/// reasonable thing for a default to spend. The endpoint is also read-only,
+/// using the user's own credential, which is why it is a switch rather than a
+/// removal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CodexQuotaProbe {
-    /// Query the ChatGPT usage endpoint. Default, per `PLAN.md` §6.
+    /// Never call it. **The default.** `pie usage codex` still reports pie's
+    /// session-log totals; only the quota buckets are unavailable.
     #[default]
-    Http,
-    /// Never call it. `pie usage codex` still reports pie's session-log totals;
-    /// only the quota buckets are unavailable.
     Off,
+    /// Query the ChatGPT usage endpoint. Opt-in, per `PLAN.md` §6.
+    Http,
 }
 
 /// Anthropic Claude Code CLI settings. Disabled: no subscription on this machine.
@@ -379,32 +386,54 @@ mod tests {
         assert!(!Claude::default().enabled, "claude stays off by default");
         assert_eq!(
             Codex::default().quota_probe,
-            CodexQuotaProbe::Http,
-            "PLAN §6 specifies the HTTP probe by default"
+            CodexQuotaProbe::Off,
+            "the private wham/usage endpoint is opt-in, not a default (user decision \
+             2026-10-12)"
         );
     }
 
-    /// A private-endpoint call must be switchable off by the user, in config or
-    /// in the environment, with no code change.
+    /// The private vendor endpoint is reachable, but only when the user asks for
+    /// it, in config or in the environment.
+    ///
+    /// This is the regression guard for the decision that reversed the original
+    /// default: what matters is not merely that `off` exists, but that the
+    /// **default** is `off` — a switch that defaults to on is not an opt-in.
     #[test]
-    fn codex_quota_probe_can_be_turned_off() {
+    fn the_private_codex_endpoint_is_opt_in_not_a_default() {
+        assert_eq!(
+            Config::default().codex.quota_probe,
+            CodexQuotaProbe::Off,
+            "a fresh install must never call a private vendor endpoint"
+        );
+
+        // Opting in works from the file…
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        std::fs::write(&path, "[codex]\nquota_probe = \"off\"\n").unwrap();
+        std::fs::write(&path, "[codex]\nquota_probe = \"http\"\n").unwrap();
 
         let cfg = Config::load_from(&path).unwrap();
-        assert_eq!(cfg.codex.quota_probe, CodexQuotaProbe::Off);
+        assert_eq!(cfg.codex.quota_probe, CodexQuotaProbe::Http);
         // unrelated keys keep their defaults
         assert!(cfg.codex.use_node_shim);
 
-        let _env = EnvGuard::set(&[("PIE_CODEX_QUOTA_PROBE", Some("OFF"))]);
-        let mut cfg = Config::default();
-        cfg.apply_env().unwrap();
-        assert_eq!(
-            cfg.codex.quota_probe,
-            CodexQuotaProbe::Off,
-            "case-insensitive"
-        );
+        // …and from the environment, case-insensitively. Each `EnvGuard` is
+        // scoped: it is not re-entrant, and taking a second one while the first
+        // is alive deadlocks the whole test binary (`src/testing.rs`).
+        {
+            let _env = EnvGuard::set(&[("PIE_CODEX_QUOTA_PROBE", Some("HTTP"))]);
+            let mut cfg = Config::default();
+            cfg.apply_env().unwrap();
+            assert_eq!(cfg.codex.quota_probe, CodexQuotaProbe::Http);
+        }
+
+        // `off` in the environment is still honoured, so the switch works in
+        // both directions rather than only in the one the default now picks.
+        {
+            let _env = EnvGuard::set(&[("PIE_CODEX_QUOTA_PROBE", Some("OFF"))]);
+            let mut cfg = Config::default();
+            cfg.apply_env().unwrap();
+            assert_eq!(cfg.codex.quota_probe, CodexQuotaProbe::Off);
+        }
     }
 
     #[test]
