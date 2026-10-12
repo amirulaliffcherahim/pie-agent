@@ -249,8 +249,8 @@ Non-negotiable for all three CLIs:
 ~/.pie/
 ├── config.toml
 ├── cache/
-│   ├── agy-models.json       # { fetched_at, models:[…] }  TTL 24h
-│   └── codex-models.json     # shaped from ~/.codex/models_cache.json
+│   ├── agy-models.json       # CacheEntry: { fetched_at, value:[…] }  TTL 24h
+│   └── codex-models.json     # same shape, shaped from ~/.codex/models_cache.json
 ├── usage.jsonl               # FROZEN session log — one row per turn
 ├── reports/                  # M8
 └── memory/                   # M3
