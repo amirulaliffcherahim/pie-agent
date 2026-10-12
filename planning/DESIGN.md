@@ -1357,3 +1357,80 @@ the one asked for" is the failure `resolve_target` was written to prevent.
 Not verifiable live without the user's own API keys: the transport is tested against a
 recorded SSE corpus and a stand-in HTTP layer, and the verdict says which half ran.
 
+---
+
+## 20. The tool suite (M11)
+
+M9 built the loop and shipped no tools, so a `tool_use` is answered with a stated error today.
+This milestone adds the tools, and its **first** decision is not about tools at all.
+
+### The constraint that decides everything: there is no user in the loop
+
+M9's loop runs between the model and pie with **no interactive channel**. `agy --print` and
+`codex exec` are one-shot, claude's SDK mode streams, and the TUI is not the only entry point —
+so there is nowhere to ask "may I run this command?" mid-turn. A tool design that assumes an
+approval prompt is one that works in a single front-end and silently blocks in the others.
+
+Therefore: **a tool is either enabled in config with a declared scope, or it is not offered.**
+No per-call confirmation, no "ask the user", no timeout-then-proceed. That is the same shape as
+the rest of pie's safety model — the decision is made once, in config, by a human who is not
+under time pressure, rather than repeatedly by a loop that has no human in it.
+
+### Tiers
+
+| Tier | Tools | Default | Why |
+|---|---|---|---|
+| **Read-only** | `read`, `ls`, `grep`, `find` | enabled once a workspace root is configured | Safe by construction: they observe. The only thing to get right is that they cannot escape the root |
+| **Mutating** | `write`, `edit` | **opt-in** | They change the user's files. Enabled per tool, never by a blanket "tools on" |
+| **Executing** | `bash` | **opt-in, and scoped** | It runs arbitrary commands — see below |
+
+The default with no configuration is **no tools at all**, which is exactly today's behaviour, so
+this milestone cannot make an existing setup suddenly executable. That is deliberate: an
+unbudgeted `bash` is a worse version of the risk `RISKS.md` §13 names for an unbudgeted model
+call, and it must not arrive as a side effect of upgrading.
+
+### `bash`, specifically
+
+```toml
+[tools]
+workspace  = "/home/me/code"    # the ceiling for every tool; absent = no tools
+read       = true               # the read-only tier
+write      = false
+edit       = false
+bash       = false              # turning it on is the decision
+bash_allow = ["cargo", "git", "rg"]   # argv[0] allow-list, checked before the spawn
+```
+
+Four properties, each a check:
+
+1. **`argv[0]` is checked against `bash_allow` *before* the spawn**, so a refused command is a
+   stated error rather than a `PermissionDenied` the model has to interpret. An allow-list on
+   the *command* rather than on the whole string is deliberate: pattern-matching a shell line
+   is the known-unreliable approach, and claiming safety from it would be worse than admitting
+   the boundary is "this executable".
+2. **A deadline, and a killed tree.** A command that outlives its deadline is killed, not
+   waited on (`RISKS.md` §6).
+3. **A bounded output.** A command that prints forever must not fill memory — the reason
+   `read_body` is capped, and `B22`'s lesson applied to a new input.
+4. **The workspace root is a ceiling, not a default.** A path resolving outside it is refused,
+   and the check is on the **resolved** path: `..` and a symlink are the two ways a textual
+   prefix check is wrong.
+
+### One spawn policy, not three
+
+M10 recorded that `ChildTransport::spawn` is a **second** copy of the process policy the provider
+CLIs use, and named the risk: a mirrored invariant (no console window, env scrub, redaction)
+stops holding silently. `bash` would be a third. So M11 **unifies** rather than adds:
+`process.rs` grows the piped-stdin case that made the copy necessary, `ChildTransport` is
+deleted in favour of it, and the tool runner calls the same function. The check is that one test
+asserting the invariant covers all three callers, instead of three tests free to drift.
+
+### The refusal a model receives
+
+A tool that is not enabled is still **answered** — with an error result naming the tool and the
+config key that would enable it. M9 chose that deliberately: a loop that ignored a call would
+leave the model waiting for a result that never comes, which is a conversation that never
+finishes. The message is written for a *model* to read, because that is the reader, and it
+should let the model proceed with what it has rather than retry the same call.
+
+

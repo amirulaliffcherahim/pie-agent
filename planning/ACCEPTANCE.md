@@ -917,6 +917,45 @@ live one spends real credit. The transport is tested against a scripted client a
 against constructed frames, so the verdict says which half ran — and a constructed frame is
 not evidence that a provider's real stream matches it.
 
+---
+
+## 19. M11 — the tool suite for the loop
+
+Contract: `DESIGN.md` §20. New scope — the roadmap ends at M10 — so this section exists
+**before** the code, like every other milestone's.
+
+### The constraint that shapes every criterion
+
+**M9's loop has no user in it.** There is no channel on which to approve a command mid-turn, so
+a tool is enabled in config with a declared scope or it is not offered. Every criterion below
+is downstream of that one: the tests are about *config* deciding, not about a prompt appearing.
+
+**Acceptance, per stage.** Three stages, one test binary each.
+
+| Stage | Command | Shape |
+|---|---|---|
+| A read-only tools | `cargo test --test tools` | `read`/`ls`/`grep`/`find` over a fixture workspace: a file reads; a directory listing is stable; a grep finds a line and reports its path and number; **a path resolving outside the configured workspace is refused**, asserted for `..` and for a symlink, because a textual prefix check passes both; a disabled tool is refused with a message naming the **config key** that would enable it |
+| B bash, scoped | `cargo test --test tools_bash` | `bash` is **off by default**: with no config, a `bash` call is answered with an error result and **no spawn** — asserted by a counting stand-in, because "no error" is what a decorative gate returns; a command whose `argv[0]` is not in `bash_allow` is refused **before** the spawn; a command outliving its deadline is killed rather than waited on; an output that never ends is bounded rather than accumulated |
+| C one spawn policy | `cargo test --test tool_loop` and `cargo test --test process` | `ChildTransport` is **deleted** and `process.rs` grows the piped-stdin case that made it necessary, so there is one spawn path rather than two; the I2 env-scrub assertion that M10 added to the loop's copy now covers the single path, and the count of spawn-policy copies is **one** — asserted, not asserted-by-absence |
+| G5 | **`n/a` — stated, with the reason** | no backend that uses pie's loop has a working credential here: claude has none, and M10's backends need a key. The tool implementations are local, so they need no vendor at all — which is why this milestone's substance is fully testable offline and only the *end-to-end* turn is not |
+
+**Checks**
+
+- [ ] **with an empty config, no tool runs at all** — the default is exactly today's behaviour, so this milestone cannot make an existing setup suddenly executable; asserted by a counting stand-in, not by an error being absent
+- [ ] a disabled tool is **answered**, never ignored: the loop must not leave a model waiting for a result that never comes (M9's rule), and the answer names the config key so the model can proceed with what it has
+- [ ] `bash_allow` is checked on `argv[0]` **before** the spawn, and the refusal is a stated error rather than a `PermissionDenied` the model has to interpret
+- [ ] an escaping path is refused on the **resolved** path, asserted for `..` and a symlink
+- [ ] a command outliving its deadline is killed, not waited on (`RISKS.md` §6)
+- [ ] a runaway output is bounded rather than accumulated (`B22`'s lesson, applied to a new input)
+- [ ] the spawn policy exists **once**: `ChildTransport` is gone, and the test that once guarded its copy now guards the single path
+- [ ] no tool writes outside the workspace, asserted by a fixture tree that is byte-compared before and after a full stage run
+- [ ] nothing in the tool path reads a vendor store, a credential, or the network
+
+**Not verifiable here**: a *live* end-to-end turn that calls a tool, because no backend with a
+working loop has a credential on this machine. The tools themselves need no vendor, so the gap
+is narrower than it looks — but it is a gap, and the verdict says so rather than implying a
+model was driven.
+
 **The two halves that were stubs are now real.** M10 shipped with `list_models` and `usage`
 returning `Unsupported`, because the shared `HttpClient` was POST-only by construction and
 neither vendor exposes a quota window. The follow-up added `get` to that trait (required, not

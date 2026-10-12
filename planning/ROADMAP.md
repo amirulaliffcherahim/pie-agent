@@ -69,6 +69,25 @@ backends are commented out. Neither blocks anything below.
 ## M10 — (optional) re-enable OpenRouter / DeepSeek
 - Uncomment the two HTTP backends (SSE + tool_calls + models + usage).
 
+## M11 — the tool suite for the loop
+
+M9 built the `tool_use` → `tool_result` loop and shipped **no tools**: every call is answered
+with a stated error. `PLAN.md` §2's `agent/tools.rs` (read/bash/edit/write/grep/find/ls) is this
+milestone. It is new scope — the roadmap above ends at M10 — so it gets its own frozen
+contract (`DESIGN.md` §20, `ACCEPTANCE.md` §19) **before** any code, like every other one.
+
+- Read-only tools first: `read`, `ls`, `grep`, `find` are safe by construction.
+- Mutating tools (`bash`, `write`, `edit`) are **opt-in and scoped**, and the decisive
+  constraint is that M9's loop has **no user in it** — there is no channel on which to approve
+  a command mid-turn, so a tool is either enabled in config with a declared scope or not
+  offered at all.
+- The turn's spawn policy (hidden window, env scrub, a deadline, a bounded output, a kill
+  tree) must come from **one** owner, not a third copy: M10 already recorded a second spawn
+  path as a risk to I1/I2/I3.
+- **Done:** with an empty config, no tool runs at all; with a read-only tool enabled, a
+  scripted turn reads a file and answers; with `bash` enabled and scoped, a scripted turn runs
+  one command, and a command that outlives its deadline is killed rather than waited on.
+
 ## Cross-cutting gates (green every milestone)
 - No console popups; latency logged; `pie doctor` health; bounded prompt argv;
   version recorded for drift detection; subscription-only auth (no API keys);
