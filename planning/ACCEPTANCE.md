@@ -17,14 +17,23 @@ Every milestone must pass all five before it is committed as complete.
 | G3 Tests | `cargo test` | all pass, 0 ignored-without-reason |
 | G4 Offline acceptance | the milestone's `Acceptance` commands below | exact expected output |
 | G5 Live acceptance | the milestone's `Live` commands below | exact expected shape, real CLI |
+| G6 Cross-target check | `cargo check --target x86_64-unknown-linux-gnu --all-targets` | compiles |
 
 G5 spends real subscription quota. Approved models only: **`agy/gemini-3.8-flash`**
 and **`codex/gpt-6-luna`** — do not substitute a pricier model. G5 is skippable
 only by explicit user decision, and a skipped G5 marks the milestone
 `offline-verified` in the run log rather than `done`.
 
+G6 exists because the requirement is **Windows + WSL + Linux**. WSL2 is
+installed on the development machine (`FedoraLinux-44`) but cannot boot
+(`HCS_E_SERVICE_NOT_AVAILABLE` — hypervisor feature unavailable), so Linux
+cannot be verified locally by running tests. G6 catches `cfg`-gated compile
+errors without linking; the GitHub Actions matrix is the real Linux evidence.
+See `PLAN.md` companion `PLATFORMS.md` for the per-platform support matrix.
+
 G1–G3 are the standing QC loop: run them after **every** code change, not only at
-the end of a milestone.
+the end of a milestone. `scripts/qc.sh` (unix/WSL) and `scripts/qc.ps1` (Windows)
+run G1–G3 in order and stop at the first failure.
 
 ## 2. Global invariants (checked at every gate, every milestone)
 
@@ -32,14 +41,14 @@ These are cross-cutting gates from `ROADMAP.md`. Each has an assertion somewhere
 
 | # | Invariant | Where proven |
 |---|---|---|
-| I1 | No console window ever appears from a child process | `proc.rs` sets `CREATE_NO_WINDOW`; unit test asserts the flag constant is applied |
-| I2 | API-key env vars never reach a child | `env_hygiene` test: deny-list removed, `GOOGLE_APPLICATION_CREDENTIALS` preserved |
-| I3 | No secret is ever logged or echoed | codex token redaction test; grep the tree for `access_token`/`token` in `println!` |
+| I1 | No console window ever appears from a child process | `proc.rs` sets `CREATE_NO_WINDOW` on Windows (`creation_flags`); on unix the child leads its own process group instead. Unit test asserts the flag constant |
+| I2 | API-key env vars never reach a child | `env_hygiene` test: deny-list removed, `GOOGLE_APPLICATION_CREDENTIALS` and `CLOUD_CODE` preserved |
+| I3 | No secret is ever logged or echoed | `proc::redact` + `redact` regression tests (long opaque runs, `Bearer <token>`); codex token redaction test; a `token=<blob>` leak was a real M0 bug (see §9) |
 | I4 | Prompt argv is bounded | `prompt_cap` test: >20 000 chars for agy ⇒ `PromptTooLong`, exit 2 |
 | I5 | A bad stdout line never aborts a run | tolerant-parse test: padding garbage + unknown events around a valid `result` still succeeds |
-| I6 | No panic on external input | `#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]` outside `#[cfg(test)]` |
-| I7 | `models`/`auth`/`doctor`/`--list-backends` spend zero model quota | code review + no `stream()` call on those paths |
-| I8 | Backend version is recorded for drift detection | `doctor` prints each CLI's `--version`; value written to `~/.pie/cache/versions.json` |
+| I6 | No panic on external input | `#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic))]` in `lib.rs` |
+| I7 | `models`/`auth`/`doctor`/`--list-backends` spend zero model quota | `auth` runs no subprocess; `models`/`usage` never call `stream()`; verified by inspection of those paths |
+| I8 | Backend version is recorded for drift detection | `doctor` prints each CLI's own version and writes `~/.pie/cache/versions.json`; codex's row must name codex, not node (real M0 bug, see §9) |
 | I9 | Subscription-only auth, never an API key | codex `auth_mode` gate + no key injection; `NoSubscription` error path exists |
 
 ## 3. M0 — Scaffold + provider trait
@@ -190,11 +199,35 @@ The reviewer must not be the same agent that wrote the code.
 
 Appended as gates pass. Evidence = command + observed result, not a claim.
 
-| Milestone | G1 | G2 | G3 | G4 | G5 | Verdict | Evidence |
-|---|---|---|---|---|---|---|---|
-| M0 | — | — | — | — | n/a | not started | — |
-| M1 | — | — | — | — | — | not started | — |
-| M2 | — | — | — | — | — | not started | — |
+| Milestone | G1 | G2 | G3 | G4 | G5 | G6 | Verdict | Evidence |
+|---|---|---|---|---|---|---|---|---|
+| M0 | ✅ | ✅ | ✅ | ✅ | n/a | ✅ | **done** | 90 tests pass (`86` lib + `4` bin); `--list-backends` prints agy/codex/claude with agy `1.3.3`, codex `codex-cli 0.162.0`, claude `2.1.296` + `no-subscription`; `cargo check --target x86_64-unknown-linux-gnu` clean |
+| M1 | — | — | — | — | — | — | not started | — |
+| M2 | — | — | — | — | — | — | not started | — |
 
 Verdict values: `done` (all applicable gates) · `offline-verified` (G5 skipped by
 user decision) · `blocked` (a gate fails) · `not started`.
+
+## 9. Bug log
+
+Every bug found, the gate that caught it, and the regression test that now
+prevents it. This is the record the milestone verdicts above rest on.
+
+### M0
+
+| # | Sev | Symptom | Caught by | Fix | Regression test |
+|---|---|---|---|---|---|
+| B1 | major | `redact` failed to redact `token=<80-char blob>`. The `=` broke the token split, so a credential could reach an error message or log line (`RISKS.md` §10) | `proc::tests::redacts_long_opaque_blobs` | Rewrote redaction as two passes: collapse any unbroken 60+ char `[A-Za-z0-9._-]` run, then apply known prefixes. Also redacts the token *after* `Bearer` | `redacts_long_opaque_blobs`, `redacts_the_token_after_bearer`, `short_ordinary_text_is_untouched` |
+| B2 | major | `StreamEvent` used serde internal tagging, which **cannot** represent a newtype variant holding a string — `pie -p --json` would have failed at runtime with `cannot serialize tagged newtype variant` | `provider::tests::events_serialise_with_a_kind_tag` | Switched to adjacent tagging (`{"event":"text","data":…}`), pinned each tag with an explicit `rename`, and asserted the tag equals `StreamEvent::kind()` | `events_serialise_with_a_kind_tag` (round-trips all 7 variants) |
+| B3 | major | codex's version probe reported **node's** version (`v25.9.0`) instead of codex's, because the probe ignored the `node <codex.js>` launcher prefix. Drift detection (I8) would have compared the wrong binary | `--list-backends` acceptance run | Added `Provider::version_command()`, defaulting to `(binary, version_args)`; codex overrides it to carry the script prefix | `version_probe_carries_the_node_script_prefix` |
+| B4 | major | `#[async_trait]` missing on the three `impl Provider` blocks — the crate did not compile at all (E0195) | `cargo check` | Added the attribute to each impl | compile gate |
+| B5 | minor | Env-mutating tests raced on `HOME`/`PIE_HOME` (process-global, parallel threads), producing a nonsense failure in `paths::tests::empty_override_is_ignored` | `cargo test` | Added `src/testenv.rs` with a shared `EnvGuard` that serialises env mutation and restores prior values on drop | whole `paths`/`auth`/`config` env suite |
+| B6 | minor | Table truncated paths with `…[truncated]`, hiding which binary was meant. `agy\bin\agy.exe` was unreadable | `--list-backends` acceptance run | Added `short_path`: keep the last three components, clip to the column width | `long_paths_keep_the_identifying_tail`, `short_path_never_exceeds_the_column_width`, `unix_style_paths_are_shortened_too` |
+
+### Findings that are not code bugs
+
+| # | Observation | Action |
+|---|---|---|
+| F1 | **CLI drift**: agy reports `1.3.3`, but `knowledge/agy.md` documents `1.3.2`. This is precisely what I8 exists to catch | `knowledge/agy.md` and `knowledge/README.md` version updated; the flag/schema notes were left unchanged because nothing in the stream contract is known to have moved |
+| F2 | codex resolves to `node.exe` + `codex.js` on this machine (no native `codex.exe`, and the `codex.cmd` shim cannot be spawned directly). The BINARY column therefore shows node | Documented in `codex.rs` and `PLATFORMS.md`; the launch path is the verified one |
+| F3 | WSL2 is installed but cannot boot (`HCS_E_SERVICE_NOT_AVAILABLE`) | Linux is verified by G6 locally and by the CI matrix; see `PLATFORMS.md` |

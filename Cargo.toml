@@ -1,0 +1,68 @@
+[package]
+name = "pie"
+# VERSIONING.md: 0.0.0 at scaffold; `feat:` commit → MINOR. M0 is a feature.
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Unify the subscription-locked coding-agent CLIs (agy, codex, claude) behind one profile"
+license = "MIT"
+repository = "https://github.com/amirulaliffcherahim/pie-agent"
+readme = "README.md"
+keywords = ["cli", "agent", "llm", "subscription"]
+categories = ["command-line-utilities", "development-tools"]
+
+[lib]
+name = "pie"
+path = "src/lib.rs"
+
+[[bin]]
+name = "pie"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+clap = { version = "4", features = ["derive", "env", "wrap_help"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "process",
+    "io-util",
+    "io-std",
+    "time",
+    "fs",
+    "sync",
+] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Reserved for the codex quota probe (M2) and the commented-out HTTP backends
+# (openrouter/deepseek, M10). Never used to reach a vendor's private API for a
+# subscription backend.
+#
+# Optional on purpose: `rustls` pulls in `ring`, which needs a C compiler for the
+# target. Keeping it behind a default-on feature lets our own code be
+# cross-checked for Linux/WSL locally with `--no-default-features` (gate G6),
+# because a Linux cross C toolchain is not available on the dev machine.
+reqwest = { version = "0.12", optional = true, default-features = false, features = [
+    "json",
+    "rustls-tls",
+    "stream",
+] }
+
+[features]
+default = ["http"]
+# Quota probes that need TLS (codex `wham/usage`). Disable to build pie with a
+# pure-Rust dependency tree only, and to cross-check any target without a C
+# toolchain.
+http = ["dep:reqwest"]
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+strip = true

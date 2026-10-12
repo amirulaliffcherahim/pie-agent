@@ -1,0 +1,248 @@
+//! Shared turn driver for the CLI backends.
+//!
+//! Every vendor CLI is driven the same way: build argv, spawn hidden, parse
+//! stdout line-by-line into normalised events, and derive the outcome from the
+//! terminal event. Backends supply argv and an [`EventRouter`]; they do not
+//! touch process plumbing.
+
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+use crate::error::{PieError, Result};
+use crate::proc::{self, RunSpec};
+use crate::provider::{Capabilities, StreamEvent, TurnOutcome};
+
+/// Everything needed to execute one turn of a CLI backend.
+#[derive(Debug, Clone)]
+pub struct TurnPlan {
+    /// Executable to spawn.
+    pub program: PathBuf,
+    /// argv, in order.
+    pub args: Vec<OsString>,
+    /// Working directory.
+    pub cwd: PathBuf,
+    /// Env vars to strip from the child.
+    pub scrub: Vec<String>,
+    /// Deadline.
+    pub timeout: Duration,
+}
+
+/// Backend-specific stream interpretation.
+///
+/// Implementations accumulate state across `on_line` calls and decide the
+/// outcome in `outcome`. Keeping this a trait means the parsers are testable
+/// from fixtures with no process involved at all.
+pub trait EventRouter: Send {
+    /// Provider id, for errors.
+    fn backend(&self) -> &'static str;
+
+    /// Interpret one stdout line. Return an event to surface, or `None`.
+    fn on_line(&mut self, line: &str) -> Option<StreamEvent>;
+
+    /// Build the outcome once stdout has closed.
+    ///
+    /// `exit_code`/`exit_status`/`stderr_tail` describe the child; a healthy
+    /// terminal event wins over a noisy stderr, and a missing terminal event is
+    /// an error (`DESIGN.md` §6 rule 7).
+    fn outcome(
+        &self,
+        exit_code: Option<i32>,
+        exit_status: &str,
+        stderr_tail: &str,
+    ) -> Result<TurnOutcome>;
+}
+
+/// Run one turn, streaming normalised events into `sink`.
+pub async fn drive(
+    plan: TurnPlan,
+    router: &mut dyn EventRouter,
+    sink: &mut (dyn FnMut(StreamEvent) + Send),
+    started: Instant,
+) -> Result<TurnOutcome> {
+    let backend = router.backend().to_string();
+
+    let spec = RunSpec {
+        backend: backend.clone(),
+        program: plan.program.clone(),
+        args: plan.args.clone(),
+        cwd: plan.cwd.clone(),
+        scrub: plan.scrub.clone(),
+        timeout: plan.timeout,
+    };
+
+    let summary = {
+        let mut on_line = |line: &str| {
+            if let Some(event) = router.on_line(line) {
+                if let StreamEvent::Unparsed(raw) = &event {
+                    tracing::debug!(
+                        backend = %backend,
+                        line = %crate::error::truncate(raw, 200),
+                        "stdout line was not JSON"
+                    );
+                }
+                sink(event);
+            }
+        };
+        proc::run_streaming(&spec, &mut on_line).await?
+    };
+
+    let mut outcome = router.outcome(
+        summary.exit_code,
+        &summary.exit_status,
+        &summary.stderr_tail,
+    )?;
+    outcome.duration = started.elapsed();
+    Ok(outcome)
+}
+
+/// Measure the argv as it will reach `CreateProcess`, approximately.
+///
+/// Windows joins argv into one string; quoting adds a little. Counting
+/// `len + 3` per argument (two quotes plus a separator) over-estimates rather
+/// than under-estimates, which is the safe direction for a hard cap.
+pub fn argv_char_len(program: &Path, args: &[OsString]) -> usize {
+    let mut total = program.to_string_lossy().chars().count();
+    for a in args {
+        total += a.to_string_lossy().chars().count() + 3;
+    }
+    total
+}
+
+/// Refuse a turn whose argv would exceed the cap.
+///
+/// Used only by backends with no stdin prompt path — for those, the prompt is
+/// argv or nothing (`RISKS.md` §5).
+pub fn enforce_argv_cap(
+    backend: &str,
+    program: &Path,
+    args: &[OsString],
+    cap: usize,
+    hint: &str,
+) -> Result<()> {
+    if cap == 0 {
+        return Ok(());
+    }
+    let len = argv_char_len(program, args);
+    if len > cap {
+        return Err(PieError::PromptTooLong {
+            backend: backend.to_string(),
+            len,
+            max: cap,
+            hint: hint.to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Effective cap for a backend, honouring both the capability and the config.
+pub fn cap_for(caps: &Capabilities, cfg: &crate::config::Config) -> usize {
+    cfg.effective_argv_cap(caps)
+}
+
+/// Ask a backend for its version string, with a short deadline.
+///
+/// Used by `--list-backends` and `doctor` for drift detection (`RISKS.md` §3).
+/// Never spends model quota; a failure yields `None` rather than an error, so a
+/// single unresponsive CLI cannot break the table.
+pub async fn probe_version(
+    provider: &dyn crate::provider::Provider,
+    cfg: &crate::config::Config,
+    timeout: Duration,
+) -> Option<String> {
+    let (program, args) = provider.version_command(cfg)?;
+
+    let spec = RunSpec {
+        backend: provider.id().to_string(),
+        program,
+        args,
+        cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        scrub: cfg.scrub_keys(cfg.scrub_enabled()),
+        timeout,
+    };
+
+    let mut first: Option<String> = None;
+    let mut capture = |line: &str| {
+        if first.is_none() {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() {
+                first = Some(trimmed.to_string());
+            }
+        }
+    };
+
+    match proc::run_streaming(&spec, &mut capture).await {
+        Ok(_) => first,
+        Err(e) => {
+            tracing::debug!(backend = provider.id(), error = %e, "version probe failed");
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+    use crate::config::Config;
+
+    fn args(items: &[&str]) -> Vec<OsString> {
+        items.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn argv_len_grows_with_arguments() {
+        let short = argv_char_len(Path::new("agy"), &args(&["--print", "hi"]));
+        let long = argv_char_len(Path::new("agy"), &args(&["--print", &"x".repeat(1_000)]));
+        assert!(long > short + 900);
+    }
+
+    #[test]
+    fn cap_is_enforced_with_a_helpful_error() {
+        let big = "p".repeat(30_000);
+        let argv = args(&["--print", &big]);
+
+        let err =
+            enforce_argv_cap("agy", Path::new("agy"), &argv, 20_000, "shorten it").unwrap_err();
+        assert_eq!(err.exit_code(), 2, "prompt cap is a usage error");
+        match err {
+            PieError::PromptTooLong {
+                backend,
+                len,
+                max,
+                hint,
+            } => {
+                assert_eq!(backend, "agy");
+                assert!(len > max);
+                assert_eq!(max, 20_000);
+                assert_eq!(hint, "shorten it");
+            }
+            other => panic!("wrong error: {other:?}"),
+        }
+
+        // under the cap is fine
+        assert!(enforce_argv_cap(
+            "agy",
+            Path::new("agy"),
+            &args(&["--print", "hi"]),
+            20_000,
+            "h"
+        )
+        .is_ok());
+        // 0 means unlimited
+        assert!(enforce_argv_cap("agy", Path::new("agy"), &argv, 0, "h").is_ok());
+    }
+
+    #[test]
+    fn cap_for_takes_the_stricter_side() {
+        let mut cfg = Config::default();
+        let agy_caps = Capabilities {
+            max_prompt_argv: 20_000,
+            ..Capabilities::default()
+        };
+        assert_eq!(cap_for(&agy_caps, &cfg), 20_000);
+
+        cfg.general.prompt_argv_cap = 100;
+        assert_eq!(cap_for(&agy_caps, &cfg), 100);
+    }
+}

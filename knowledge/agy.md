@@ -1,6 +1,9 @@
 # agy CLI — reverse-engineered
 
-- Version: **1.3.2**
+- Version: **1.3.3** — observed 2026-10-12 by pie's `--list-backends` probe.
+  Originally reverse-engineered at **1.3.2**. The flag surface and stream schema
+  in this file are unchanged as far as the probe can tell; a full contract
+  re-check is the monthly watchtower's job (M8, `ROADMAP.md`).
 - Binary: `C:\Users\amiru\AppData\Local\agy\bin\agy`
 - Kind: Google Antigravity CLI (Rust), sub-locked (no public API key).
 

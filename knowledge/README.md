@@ -9,7 +9,7 @@ print-mode runs. These are the implementation inputs for roadmap M1–M3. Deep i
 
 | CLI | Version | Auth | Print mode | Verified? |
 |---|---|---|---|---|
-| [agy](agy.md) | 1.3.2 | agy OAuth (internal) | `agy --print … --output-format stream-json` | ✅ live run |
+| [agy](agy.md) | 1.3.3 | agy OAuth (internal) | `agy --print … --output-format stream-json` | ✅ live run |
 | [codex](codex.md) | 0.162.0 | `~/.codex/auth.json` | `codex exec … --json` | ✅ live run |
 | [claude](claude.md) | 2.1.296 | `~/.claude/.credentials.json` (not logged in) | `claude -p … --output-format stream-json` | ⚠️ flags only |
 
