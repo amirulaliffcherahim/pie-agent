@@ -1,0 +1,6 @@
+Warning: agy 1.3.3 is available; you are running 1.3.2
+{"event":"mystery_future_event","mystery_future_event":{"phase":"warp","detail":{"n":1}}}
+this line is not JSON at all {{{
+
+{"event":"step_update","step_update":{"step_type":"agent_response","text_delta":"OK\n"}}
+{"event":"result","result":{"conversation_id":"conv-garbage","status":"SUCCESS","response":"OK\n","num_turns":1,"usage":{"input_tokens":20704,"output_tokens":20,"thinking_tokens":19,"cache_read_tokens":0,"total_tokens":20724}}}

@@ -24,7 +24,7 @@ copied from the verified samples rather than made up.
 | `agy_cancelled_result.jsonl` | Documented-valid `result` with `status: "CANCELLED"` (one of the statuses `knowledge/agy.md` lists) and **no** `error` field, so the stderr fallback path is exercised. |
 | `agy_truncated.jsonl` | Documented-valid `init` + `agent_response`, deliberately with no terminal `result` — the truncated-stream case. |
 | `agy_models.txt` | **Verbatim live capture** of `agy models` on 2026-10-12 (zero-token probe, agy 1.3.3): 18 rows = 7 base models × their effort variants, behind a `Fetching available models...` banner. |
-| `agy_usage.json` | **Verbatim live capture** of `agy --print /usage --output-format json --print-timeout 30s` on 2026-10-12 (zero-token probe, agy 1.3.3). Note: it returned the JSON envelope with an **empty `response`** and no quota payload at all — see the M1 report. |
+| `agy_usage.json` | **Verbatim live capture** of `agy --print /usage --output-format json --print-timeout 0` on 2026-10-12 (zero-token probe, agy 1.3.3): `num_turns: 0`, all usage fields zero, and the quota payload under `command.data.groups[].buckets[]` — 2 groups, 4 buckets. See the correction note below: an earlier version of this fixture was captured with the argument corrupted by the shell. |
 
 ### Observations recorded while capturing
 
@@ -47,10 +47,22 @@ copied from the verified samples rather than made up.
   is unsupported (`planning/RISKS.md` §7 — never spend more quota than asked).
   The documented list (`low|medium|high|xhigh|max`) is the fallback when no
   catalog is on disk.
-* The `/usage` probe printed a partial-output warning on **stderr** and the
-  result envelope on **stdout** after hitting its own `--print-timeout 30s`,
-  i.e. the slash expansion did not return quota data in print mode on this
-  machine. `parse_usage` therefore reports the buckets as **missing, not zero**,
+* **Corrected 2026-10-12 (bug B10).** An earlier `agy_usage.json` recorded an
+  empty `response` with no payload, and this file claimed the slash expansion
+  "did not return quota data in print mode". Both were wrong, and the cause was
+  the probe harness, not agy: git-bash/MSYS rewrites a leading-slash argument
+  into a Windows path, so `agy --print /usage` reached agy as the literal prompt
+  text `C:/Program Files/Git/usage`. One such probe burned a real ~20 700-token
+  model turn answering a question about Git's disk usage.
+  `/usage` is in fact free (`num_turns: 0`) and returns a full payload. The
+  capture now in this directory was taken with `MSYS_NO_PATHCONV=1`. The
+  discriminator worth remembering: a mangled probe shows `num_turns: 1` with
+  ~20 700 input tokens, a real expansion shows `num_turns: 0` and all-zero usage.
+  See `knowledge/agy.md` for the rule and `planning/ACCEPTANCE.md` §9 B10.
+* `--print-timeout 0` is required for this probe, not a shorter timeout. With
+  `30s` the expansion returned an envelope with an empty `response` and no
+  payload; with `0` ("wait for the turn to complete") it returns immediately.
+  `parse_usage` still reports genuinely absent buckets as **missing, not zero**,
   so an empty table cannot be misread as either "quota available" or "out of
   quota".
 

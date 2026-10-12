@@ -90,11 +90,18 @@ pub fn render_report(report: &UsageReport) -> String {
         report.backend, report.source
     ));
 
+    // The bucket column must fit a full `"<group> / <window>"` label. It was 14
+    // chars, which truncated `Gemini Models / weekly` to `Gemini Models…` and
+    // threw away the window — the one field that tells two buckets in the same
+    // group apart. Observed on real `pie usage agy` output, where two Gemini rows
+    // rendered identically apart from their percentages.
+    const BUCKET_WIDTH: usize = 32;
+
     if report.buckets.is_empty() {
         out.push_str("  no buckets reported\n");
     } else {
         out.push_str(&format!(
-            "  {:<14} {:>10} {:>22} {:>12}\n",
+            "  {:<BUCKET_WIDTH$} {:>10} {:>22} {:>12}\n",
             "BUCKET", "REMAINING", "RESET", "USED/LIMIT"
         ));
         for b in &report.buckets {
@@ -109,8 +116,8 @@ pub fn render_report(report: &UsageReport) -> String {
                 _ => "—".to_string(),
             };
             out.push_str(&format!(
-                "  {:<14} {:>10} {:>22} {:>12}\n",
-                truncate_cell(&b.label, 14),
+                "  {:<BUCKET_WIDTH$} {:>10} {:>22} {:>12}\n",
+                truncate_cell(&b.label, BUCKET_WIDTH),
                 remaining,
                 truncate_cell(&reset, 22),
                 used
@@ -251,6 +258,54 @@ mod tests {
         assert!(s.contains("87.0%"));
         assert!(s.contains("13/100"));
         assert!(s.contains('—'), "missing values render as a dash");
+    }
+
+    /// Regression: the bucket column was 14 chars, which truncated
+    /// `Gemini Models / weekly` to `Gemini Models…` and dropped the window.
+    /// Two buckets from the same group then rendered identically apart from
+    /// their percentages, defeating the reason the group is in the label at all.
+    ///
+    /// Found by running `pie usage agy` against the real CLI, not by a test: the
+    /// suite asserted values and never that a label survived rendering.
+    #[test]
+    fn a_real_agy_bucket_label_survives_rendering() {
+        let bucket = |label: &str| Bucket {
+            label: label.to_string(),
+            remaining_fraction: Some(0.885),
+            reset_at: Some("2026-10-15T01:32:32Z".to_string()),
+            used: None,
+            limit: None,
+        };
+
+        let rendered = render_report(&UsageReport {
+            backend: "agy".into(),
+            // The exact labels the real probe produces (`knowledge/agy.md`).
+            buckets: vec![
+                bucket("Gemini Models / weekly"),
+                bucket("Gemini Models / 5h"),
+                bucket("Claude and GPT models / weekly"),
+                bucket("Claude and GPT models / 5h"),
+            ],
+            source: "agy --print /usage".into(),
+            notes: vec![],
+        });
+
+        for window in ["weekly", "5h"] {
+            assert!(
+                rendered.contains(window),
+                "the `{window}` window must survive rendering:\n{rendered}"
+            );
+        }
+        for group in ["Gemini Models", "Claude and GPT models"] {
+            assert!(
+                rendered.contains(group),
+                "group `{group}` missing:\n{rendered}"
+            );
+        }
+        assert!(
+            !rendered.contains('…'),
+            "a real bucket label must fit the column; truncation hides the window:\n{rendered}"
+        );
     }
 
     #[test]
