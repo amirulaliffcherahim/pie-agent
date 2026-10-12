@@ -237,7 +237,47 @@ cargo run -- usage codex
 - [ ] auth gate reads `auth_mode` from `~/.codex/auth.json` and requires subscription
 - [ ] `~/.pie/auth.json` (legacy, holds extracted tokens) is never read — assert with a test that the path is untouched/no reader exists
 
-## 6. Bug protocol
+## 6. M4 — unified auth + usage
+
+Closed 2026-10-12. **Its work was built as part of M0–M2 and never given a verdict** —
+a bookkeeping fault, recorded here so the roadmap can tell it is finished. From
+`ROADMAP.md` M4:
+
+> `pie auth`: agy + codex live; claude "no subscription"; API rows commented.
+> `pie usage`: unified weekly/monthly + session-log token/cost totals (no token spend).
+> **Done:** both render without a selected model.
+
+**Acceptance**
+
+```
+cargo run -- auth
+cargo run -- usage
+```
+
+Both must exit 0 **with no `--model` given** — that is the roadmap's Done condition,
+and it is the thing worth asserting, because a command that silently requires a model
+would still "work" if you happened to supply one.
+
+**Deviations, recorded rather than left silent**
+
+| Roadmap wording | What shipped | Why |
+|---|---|---|
+| "weekly/monthly" | "last 7 days" / "last 30 days" | The same windows; the label states the actual range rather than implying a calendar week or month. Satisfied by equivalence, not renamed |
+| "token/cost totals" | token totals only, no cost column | Every backend is subscription-locked, so `cost_usd_micros` is `0` on every real row. A permanent `$0.00` would imply cost is measured when it is not. `TOKEN-ECONOMICS.md` §10c states this for the project: pie optimises tokens, wall clock and quota, never money. Cost renders again if M10's API-key backends land, where it is real |
+
+Also note the quota half of `usage` is cached rather than always probed
+(`agy.usage_cache_ttl_secs`), because the probe costs agy ~5–10 s of its own
+initialisation. A cached reading is labelled with its age.
+
+**Checks**
+
+- [ ] `auth` and `usage` both succeed with **no model selected**
+- [ ] `auth` lists the three CLI backends and nothing else
+- [ ] `usage` prints all three windows and the totals block
+- [ ] neither command writes a session-log row, and neither spends model quota (I7)
+- [ ] `tests/acceptance.rs` asserts the rendered output, not only the exit status
+
+## 7. Bug protocol
 
 A "bug" is any behavior that contradicts `ROADMAP.md`, `DESIGN.md`, or a
 knowledge file. Process, in order:
@@ -269,7 +309,7 @@ Bug categories to actively hunt before marking a milestone done:
 - **Env leak** — API key reaching a child, flipping it to pay-as-you-go (RISKS §10)
 - **Panic** — `unwrap`/`expect`/index-out-of-bounds on external input
 
-## 7. Independent verification
+## 8. Independent verification
 
 Each milestone, after G1–G3 are green and before it is called done, dispatch an
 independent reviewer subagent with **no shared context** and give it: the design
@@ -279,7 +319,7 @@ is either fixed (with a test) or logged as accepted with a written reason.
 
 The reviewer must not be the same agent that wrote the code.
 
-## 8. Run log
+## 9. Run log
 
 Appended as gates pass. Evidence = command + observed result, not a claim.
 
@@ -294,11 +334,12 @@ here. A row is a record of what was verified, not a substitute for verifying.
 | M0 | ✅ | ✅ | ✅ | ✅ | n/a | ✅ | **done** | Snapshot at the M0 commit (`1ee7c18`). 113 tests passed then (100 lib + 6 `no_secrets` + 7 `process`), 5 live-smoke tests correctly ignored; `--list-backends` printed agy/codex/claude with agy `1.3.3`, codex `codex-cli 0.162.0`, claude `2.1.296` + `no-subscription`; `cargo check --target x86_64-unknown-linux-gnu --all-targets --no-default-features` clean. **Not the current total** — see the M1/M2 rows for HEAD, and re-run `scripts/qc.ps1` rather than trusting any number here |
 | M1 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | **done** | G4 `cargo test --test parse_agy` → 31 passed. G5 live: a real `agy/gemini-3.8-flash` turn printed `ok` (exit 0) and logged `{input_tokens:20661, cached_input_tokens:0, output_tokens:23, reasoning_tokens:22, ok:true, stop_reason:"SUCCESS"}`; no key material in stdout or stderr; a second live turn passed `agy_turn_succeeds_and_is_recorded` and the free probe passed `agy_usage_probe_reports_buckets`. `pie usage agy` rendered all 4 real buckets across 2 groups with group **and** window visible, and logged no session row. G6 clean |
 | M2 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | **done** | G4 `cargo test --test parse_codex` → 34 passed. G5 live: a real `codex/gpt-6-luna` turn printed `ok` (exit 0) and logged `{input_tokens:13424, cached_input_tokens:1792, output_tokens:5, reasoning_tokens:0, ok:true, stop_reason:"completed"}` — the full frozen schema, and the first live evidence that the vendor prefix cache actually operates (13.3% on a trivial turn). `pie usage codex` printed `30d 88.0% 2026-11-08T01:52:52Z` and logged **no** session row, proving a probe is not a turn. G6 clean |
+| M4 | ✅ | ✅ | ✅ | ✅ | n/a | ✅ | **done** | Closed out of sequence: its work was built during M0–M2 and had no verdict until now. G4 `cargo run -- auth` and `cargo run -- usage` both exit 0 **with no `--model`**, which is the roadmap's Done condition. `tests/acceptance.rs` asserts the rendered rows, all three usage windows and the totals block, plus that neither command writes a session row. Two deviations recorded in section 6. G5 is `n/a`: neither command spends model tokens |
 
 Verdict values: `done` (all applicable gates) · `offline-verified` (G5 skipped by
 user decision) · `blocked` (a gate fails) · `not started`.
 
-## 9. Bug log
+## 10. Bug log
 
 Every bug found, the gate that caught it, and the regression test that now
 prevents it. This is the record the milestone verdicts above rest on.
@@ -338,7 +379,7 @@ prevents it. This is the record the milestone verdicts above rest on.
 | F2 | codex resolves to `node.exe` + `codex.js` on this machine (no native `codex.exe`, and the `codex.cmd` shim cannot be spawned directly). The BINARY column therefore shows node | Documented in `codex.rs` and `PLATFORMS.md`; the launch path is the verified one |
 | F3 | WSL2 is installed but cannot boot (`HCS_E_SERVICE_NOT_AVAILABLE`) | Linux is verified by G6 locally and by the CI matrix; see `PLATFORMS.md` |
 
-## 10. Open suggestions from the QC sweep
+## 11. Open suggestions from the QC sweep
 
 Accepted as real, deliberately not done yet. Recorded here so they are decisions
 rather than oversights. None affects a milestone verdict.

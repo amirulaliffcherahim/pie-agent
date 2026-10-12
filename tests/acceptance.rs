@@ -118,3 +118,63 @@ fn auth_reports_the_same_backends_as_list_backends() {
         assert!(stdout.contains(id), "`pie auth` omitted {id}:\n{stdout}");
     }
 }
+
+/// M4's Done condition, verbatim from `ROADMAP.md`: *both render without a selected
+/// model*. Worth asserting because a command that silently required one would still
+/// appear to work whenever a `--model` happened to be supplied.
+#[test]
+fn auth_and_usage_render_without_a_selected_model() {
+    let home = tempfile::tempdir().unwrap();
+
+    let auth = run(home.path(), &["auth"]);
+    for id in EXPECTED_ORDER {
+        assert!(auth.contains(id), "`pie auth` omitted {id}:\n{auth}");
+    }
+    for absent in ["openrouter", "deepseek"] {
+        assert!(
+            !auth.contains(absent),
+            "`{absent}` is deferred to M10 and must not be registered:\n{auth}"
+        );
+    }
+    assert!(
+        auth.contains("no-subscription"),
+        "claude has no subscription here and must say so:\n{auth}"
+    );
+
+    let usage = run(home.path(), &["usage"]);
+    for window in ["all time", "last 7 days", "last 30 days"] {
+        assert!(
+            usage.contains(window),
+            "`pie usage` is missing the {window} window:\n{usage}"
+        );
+    }
+    for field in [
+        "turns",
+        "input tokens",
+        "output tokens",
+        "reasoning tokens",
+        "total tokens",
+        "cache hit rate",
+    ] {
+        assert!(
+            usage.contains(field),
+            "`pie usage` is missing `{field}`:\n{usage}"
+        );
+    }
+}
+
+/// I7: `auth` and `usage` are meant to be free, so neither may record a turn.
+#[test]
+fn auth_and_usage_write_no_session_row() {
+    let home = tempfile::tempdir().unwrap();
+
+    let _ = run(home.path(), &["auth"]);
+    let _ = run(home.path(), &["usage"]);
+
+    let log = home.path().join("usage.jsonl");
+    let contents = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        contents.trim().is_empty(),
+        "neither command may log a turn, but the log holds:\n{contents}"
+    );
+}

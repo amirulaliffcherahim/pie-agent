@@ -156,6 +156,8 @@ Write-Host 'PASS: G3b ignore reasons'
 Invoke-Gate -Label 'G4 acceptance (M0)' -Argv @('run', '--', '--list-backends')
 Invoke-Gate -Label 'G4 acceptance (M1)' -Argv @('test', '--test', 'parse_agy')
 Invoke-Gate -Label 'G4 acceptance (M2)' -Argv @('test', '--test', 'parse_codex')
+Invoke-Gate -Label 'G4 acceptance (M4 auth)' -Argv @('run', '--', 'auth')
+Invoke-Gate -Label 'G4 acceptance (M4 usage)' -Argv @('run', '--', 'usage')
 
 # --- G5 (live acceptance) ---------------------------------------------------
 if ($Live) {

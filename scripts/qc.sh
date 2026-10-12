@@ -148,6 +148,8 @@ run_gate 'G3b ignore reasons' check_ignore_reasons
 run_gate 'G4 acceptance (M0)' cargo run -- --list-backends
 run_gate 'G4 acceptance (M1)' cargo test --test parse_agy
 run_gate 'G4 acceptance (M2)' cargo test --test parse_codex
+run_gate 'G4 acceptance (M4 auth)' cargo run -- auth
+run_gate 'G4 acceptance (M4 usage)' cargo run -- usage
 
 # --- G5 (live acceptance) ---------------------------------------------------
 if [ "$LIVE" -eq 1 ]; then
