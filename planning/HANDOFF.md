@@ -10,17 +10,18 @@
 |---|---|
 | Repo | `C:/Users/amiru/Local/Code/pie` |
 | Branch | `feat/m0-m2-subscription-backends` |
-| Last commit | `b91c721` (M8) — **not pushed**; the local tree is ahead of `origin` |
-| Tests | **658 passing**, 7 live correctly ignored, 27 test binaries |
-| Gates | **32/33 offline, 33/33 with `-Live`** — 6 standing checks (G1, G2, G3, G3b, G3c, G3d) + 25 G4 + G6, then G5 |
-| Milestones | **M0–M8 done**, each with a run-log row and per-stage gates |
-| Next | **M9** — claude adapter + the `tool_use`→`tool_result` loop. Contract frozen in `DESIGN.md` §18; **not verifiable live here** (no Claude credential), so its verdict is `offline-verified` |
+| Last commit | M10 — pushed; `origin` in sync |
+| Tests | see the run log (§12) — do not trust a number here, run `scripts/qc.ps1` |
+| Gates | **all green with `-Live`** — 6 standing checks (G1, G2, G3, G3b, G3c, G3d) + 27 G4 + G6, then G5 |
+| Milestones | **M0–M10 done.** M9 is `offline-verified` (no Claude credential) and M10 is `offline-verified` (no API key); every other milestone is `done`. Each has a run-log row in `ACCEPTANCE.md` §12 |
+| Next | nothing on the roadmap. `ACCEPTANCE.md` §14's S1–S16 are the open suggestions, and `DEFERRED-BACKENDS.md` names the two halves M10 left stubbed |
 
-**Gate count changed twice since the handoff was written.** G6 was a required gate with
-*no runner at all* and a command that could not pass as written (B25); G3c (no `mod.rs`)
-and G3d (no test may depend on machine vendor state, B32) are new; and M6–M8 added 14 G4
-rows of their own. If you remember "15/16 gates", that number is two rewrites stale —
-run the runner rather than trusting any count here.
+**Gate count changed three times across M6–M10, and every change was a defect being closed rather
+than a feature being added.** G6 was a required gate with *no runner at all* and a command that
+could not pass as written (B25); G3c (no `mod.rs`) and G3d (no test may depend on machine vendor
+state, B32) are new; and the milestone stages contributed 20 G4 rows of their own. If you remember
+"15/16 gates", that number is three rewrites stale — **run the runner rather than trusting any
+count in any document.**
 
 Build the binary before manual checks: `cargo build --release` →
 `./target/release/pie.exe`.
@@ -139,41 +140,44 @@ bash scripts/qc.sh                                                       # unix/
 Live gate pieces, run separately when a payload changed:
 `PIE_LIVE=1 cargo test --test live_smoke -- --ignored --test-threads=1`
 
-## 6. Next task — M9, the claude adapter and the tool loop
+## 6. Where this stands
 
-Contract: `DESIGN.md` §18, `ACCEPTANCE.md` §17 (added when M9 starts). **No code written.**
+**Every milestone on `ROADMAP.md` is built.** Two of them carry a verdict other than `done`, and
+the reason is a missing credential rather than unfinished work:
 
-**This milestone cannot be verified live here.** `~/.claude/` exists but holds no credential
-and no history (checked 2026-10-12), so there is no Claude subscription: the verdict is
-`offline-verified` and says so, never `done`.
+| | Verdict | Why |
+|---|---|---|
+| M0–M8 | `done` | every applicable gate, including live ones |
+| M9 | `offline-verified` | no Claude credential, so no live turn is possible; the envelope is documented rather than captured |
+| M10 | `offline-verified` | no API key configured, and a live turn spends real credit nobody opted into |
 
-Two halves, and the second is the substance:
+### The open work, in the order I would pick it up
 
-1. **The claude adapter**, to spec in `knowledge/claude.md`. claude is the only backend with
-a real system prompt (`--append-system-prompt`), so it receives the persona through that
-flag rather than folded in front of the prompt — `Capabilities::system_prompt` is already
-`true` only for claude. The bytes must stay identical; only the mechanism differs.
-2. **The `tool_use` → `tool_result` loop.** `RISKS.md` §1 is why M0–M8 are delegate-mode:
-   `agy --print` and `codex exec` run their own tools and cannot accept an injected result.
-   claude in SDK mode can, so M9 is where pie finally owns a loop — and it is the code path
-   M10's HTTP backends reuse (`RISKS.md` §8). One implementation, two consumers.
+1. **`list_models` and `usage` for M10's backends** are honest stubs: the shared `HttpClient`
+is POST-only by construction, so `GET /models` has no route through it. Adding a `get` to that
+trait unlocks `GET /models` and `GET /key` (OpenRouter reports remaining credit there). Neither
+is on the turn path, so nothing is waiting on it.
+2. **A concrete tool suite.** M9 built the loop and ships no tools; every call is answered with
+a stated error. `PLAN.md` §2's `agent/tools.rs` is the follow-up, and the question to settle
+first is what a `bash` tool may do unattended.
+3. **The `strings` leg of the REA-lite drift check.** `DESIGN` §17 documents the shape: a
+`strings_command` beside `version_command`/`help_command`, extracting from the vendor's own
+artefact, because the naive version reads *node's* binary for codex.
+4. **`ACCEPTANCE.md` §14's S1–S16.** Several are one-line tidyings; S15 (three signature
+widenings in `render_report`) is the one worth doing as a single pass.
 
-The loop is only correct if all four hold, and each is a stage check: a `tool_use` is
-matched to its `tool_result` by `tool_use_id` and an unknown id is a stated protocol error;
-the child's stdin is written **without deadlocking on the stdout loop**; the loop is
-**bounded** by an iteration cap whose effect is reported; and it **cannot run against a
-delegate-mode backend** — `capabilities().tool_loop` gates it, so asking for the loop on
-agy or codex is a config error, not a hang.
+### Testing it hands-on
 
-Nothing may spawn a real claude: the SDK protocol is exercised against a **scripted
-stand-in child** that emits recorded `stream-json` frames and reads `tool_result` frames
-back — the same stand-in pattern `tests/cache.rs` and `tests/process.rs` already use. A
-live test exists and is `#[ignore]`d with a stated reason, ready for the day a subscription
-appears.
-
-Then M10 (`DESIGN.md` §19).
+`cargo build --release` then `./target/release/pie.exe`. The TUI is `pie tui`; the interactive
+verdict was left to you by design (`ACCEPTANCE.md` §9 — keystrokes are covered through the
+reducer and rendering through the buffer, but "does this feel usable" is not automatable).
 
 ## 7. Remaining milestones
+
+None. `ROADMAP.md`'s M0–M10 are all implemented; the run log in `ACCEPTANCE.md` §12 records each
+one's verdict and the evidence behind it. New work belongs in `ROADMAP.md` as M11+, with its
+acceptance criteria frozen in `ACCEPTANCE.md` **before** the code — the discipline that produced
+every result below.
 
 | | Scope | Done condition |
 |---|---|---|
