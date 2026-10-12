@@ -58,17 +58,68 @@ Three event shapes, one JSON object per line:
 
 ## Models
 
-`agy models` prints the live catalog (id + name). Cache to disk with a TTL for
-offline startup. Known ids seen locally: `gemini-3.8-flash`, `gemini-3.7-flash`,
-`gemini-3.6-flash`, `gemini-3.1-pro`, `claude-opus-5-5`, `claude-sonnet-5-5`,
-`gpt-oss-120b`.
+`agy models` prints the live catalog: a `Fetching available models...` banner on
+stdout, then `<id>` TAB `<display name>` rows. Cache to disk with a TTL for
+offline startup.
+
+**The id is `{base}-{effort}` — the effort is part of the id, not only a separate
+flag.** Captured 2026-10-12 on agy 1.3.3; verbatim sample in
+`tests/fixtures/agy_models.txt`:
+
+```text
+gemini-3.8-flash-high	Gemini 3.8 Flash (High)
+gemini-3.8-flash-medium	Gemini 3.8 Flash (Medium)
+gemini-3.8-flash-low	Gemini 3.8 Flash (Low)
+gemini-3.1-pro-high	Gemini 3.1 Pro (High)
+gemini-3.1-pro-low	Gemini 3.1 Pro (Low)
+gpt-oss-120b-medium	GPT-OSS 120B (Medium)
+```
+
+**Effort support is per model and is not uniform.** From the captured catalog:
+
+| base id | efforts offered |
+|---|---|
+| `gemini-3.8-flash` · `gemini-3.7-flash` · `gemini-3.6-flash` | low, medium, high |
+| `gemini-3.1-pro` | low, high — **no `medium`** |
+| `claude-opus-5-5` · `claude-sonnet-5-5` | low, medium, high |
+| `gpt-oss-120b` | **only `medium`** |
+
+Consequence for pie: `--effort` must be validated against the chosen model's
+actual set, and a default effort must not be injected blindly — `gemini-3.1-pro`
+offers no `medium`, so a blanket default of `medium` is an invalid combination for
+it. Treat the catalog as the source of truth and a hardcoded list as a fallback
+only. Note also that agy's own settings file stores the display form with the
+effort in parentheses (see `internals.md`), which is what the parenthetical here
+is.
+
+The earlier note in this file listing base ids without an effort suffix
+(`gemini-3.8-flash`, …) was written from a truncated view of the catalog; the
+suffix is always present.
 
 ## Usage / quota
 
 `agy --print /usage --output-format json --print-timeout 30s`
-(slash-command expansion — do **not** pass `--disable-slash-commands`). Returns
-quota groups/buckets (5h + weekly, remaining fraction + reset time), zero model
-tokens.
+(slash-command expansion — do **not** pass `--disable-slash-commands`). Intended
+to return quota groups/buckets (5h + weekly, remaining fraction + reset time) at
+zero model tokens.
+
+**Not reproducible on agy 1.3.3 as of 2026-10-12.** That exact command returned a
+`result` envelope with `status:"SUCCESS"`, `num_turns:0`, `response:""` and an
+all-zero `usage`, plus a partial-output warning on stderr — no quota payload at
+all. Verbatim capture: `tests/fixtures/agy_usage.json`.
+
+So on this version `pie usage agy` cannot obtain buckets this way. Requirements
+that follow:
+
+- "no buckets returned" must be surfaced as a **note**, never as an error and
+  never as an empty table the user could read as "no quota left" or "all fine";
+- the note must say that agy 1.3.3 returned no quota payload for `/usage` in print
+  mode, so the buckets are *missing*, not zero;
+- retry candidates for a later probe: `--output-format text`, dropping
+  `--print-timeout`, or a non-`--print` invocation.
+
+`PLAN.md` §6 assumes this worked; that assumption is now tracked as an open
+question rather than a fact.
 
 ## Caveats
 
