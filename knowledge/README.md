@@ -18,3 +18,14 @@ CLI's own login/OAuth, never an API key.** Spawn hidden (`CREATE_NO_WINDOW`),
 bound the prompt argv (≤ ~20k chars, else stdin where supported), parse
 NDJSON/JSONL line-by-line, enforce a timeout + kill-tree, and never store/echo
 tokens.
+
+## Other reference material
+
+| File | What it is |
+|---|---|
+| [internals.md](internals.md) | packaging, auth stores, config paths, session storage, model catalogs, wire targets, tool protocols — sourced from on-disk state and binary strings |
+| [token_optimization_and_agent_engineering.md](token_optimization_and_agent_engineering.md) | external study on token economics, context optimisation and agent-loop overhead. Distilled for pie in `planning/TOKEN-ECONOMICS.md` |
+| [9router-findings.md](9router-findings.md) | prior-art sweep of `decolua/9router`: the compliance anti-patterns to avoid, and the token-economy techniques that do transfer |
+
+Both non-CLI files are reference, not contract. `planning/DESIGN.md` remains
+authoritative.

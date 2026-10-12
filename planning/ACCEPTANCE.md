@@ -60,16 +60,30 @@ These are cross-cutting gates from `ROADMAP.md`. Each has an assertion somewhere
 ```
 cargo run -- --list-backends
 ```
-Expected — one line per backend, exactly these three, in this order:
+
+A header row, then exactly three backend rows in this order. Captured
+2026-10-12:
 
 ```
-agy     agy      1.3.2      ready          (or needs-login / binary-missing)
-codex   codex    0.162.0    needs-login|ready
-claude  claude   unknown    no-subscription
+BACKEND   BINARY                             VERSION       AUTH            DETAIL
+agy       agy\bin\agy.exe                    1.3.3         ready
+codex     C:\Program Files\nodejs\node.exe   codex-cli 0.1…[truncated]  ready
+claude    Roaming\npm\claude.cmd             2.1.296 (Clau…[truncated]  no-subscription
 ```
 
-- `claude` must appear even though disabled (it is future-proofing).
-- No API/HTTP backend may appear (they are commented out).
+Exact column widths vary; the assertions are:
+
+- `claude` must appear even though it is disabled — it is future-proofing.
+- No API/HTTP backend may appear (neither is in the registry).
+- Every backend resolves to a path and reports an auth state, or reports
+  `binary-missing` — never a panic, never a hang, never an empty table. This is
+  what makes the CI run meaningful: a CI runner has **no** vendor CLI installed,
+  so CI exercises the degraded path for all three rows.
+- The `VERSION` column must name the backend's own version. codex resolving via
+  `node` must report `codex-cli …`, not node's version — that was bug B3.
+
+`agy` reporting `1.3.3` while `knowledge/agy.md` documented `1.3.2` is a CLI-drift
+observation (F1), not a failure: recording it is the point of invariant I8.
 
 **Checks**
 
