@@ -17,6 +17,8 @@
       G4  offline acceptance - M0: cargo run -- --list-backends
           ... one per milestone, and one per M5/M6 stage
       G4  `pie tui` on a pipe refuses with a message and no escape codes
+      G4  bare `pie` on a pipe prints help, exits 0, and emits no escape codes
+          (M12 section 21.1: the default reverses, and the safety property moves)
       G6  cargo check --target x86_64-unknown-linux-gnu --all-targets
           --no-default-features (cross-target; SKIPped loudly when the target
           is not installed). `--no-default-features` is REQUIRED, not a
@@ -310,6 +312,22 @@ Invoke-Gate -Label 'G4 acceptance (M11 bash, scoped)' -Argv @('test', '--test', 
 # because the panic is generated inside the standard library's macro (S2).
 Invoke-Gate -Label 'G4 output safety (S2 closed pipe)' -Argv @('test', '--test', 'output')
 
+# M12 stage C, and its own binary for that stage alone (ACCEPTANCE section 20): the
+# decision to enter the TUI is a pure function, asserted in both directions, because
+# the terminal branch itself cannot be exercised without a pty. This row is the half
+# the built-binary check below cannot reach: the binary check proves a pipe cannot
+# enter the TUI, and this one proves the decision that would let a terminal do it is
+# right for every combination of the two streams. One passing does not imply the
+# other (ACCEPTANCE section 20, Checks).
+# M12's stages, one gate binary each, named after the stage that owns it. Stage A's palette and
+# stage D's /tools are here; stage B is `tui_render` above (M6's row, extended rather than
+# duplicated), and stage C contributes the two rows below - the pure predicate, and the real
+# binary on a pipe. A stage gate that runs another stage's tests is decorative (that happened
+# twice in M5), so each of these names the binary that exists for that stage alone.
+Invoke-Gate -Label 'G4 acceptance (M12 palette)' -Argv @('test', '--test', 'tui_palette')
+Invoke-Gate -Label 'G4 acceptance (M12 tools)' -Argv @('test', '--test', 'tui_tools')
+Invoke-Gate -Label 'G4 acceptance (M12 default predicate)' -Argv @('test', '--test', 'tui_default')
+
 # --- G4 (M6 tui non-TTY) ----------------------------------------------------
 # ACCEPTANCE section 9: `pie tui` on a non-TTY stdin must fail with a clear message
 # rather than emitting escape codes into a pipe.
@@ -381,6 +399,67 @@ if ($null -ne $tuiFailure) {
 }
 $script:GatesRun++
 Write-Host 'PASS: G4 acceptance (M6 tui non-TTY)'
+
+# --- G4 (M12 the default on a pipe) -----------------------------------------
+# DESIGN section 21.1/21.7 and ACCEPTANCE section 20, row C: a bare `pie` now opens
+# the TUI when stdin and stdout are BOTH terminals, and prints help otherwise. The
+# check above guards the explicit request; this one guards the default, and it is the
+# load-bearing half - M6's guarantee was "the TUI is not the default", M12's is "it
+# needs a terminal on both streams", and that second mechanism is weaker unless it is
+# asserted. The terminal branch cannot be exercised here (no pty to allocate), so the
+# pipe branch is asserted against the built binary and the predicate is asserted in
+# the cargo test above.
+#
+# Three assertions, and none of them is sufficient alone. The exit code alone would
+# pass for a run that emitted escape codes into a CI log; "no escape codes" alone
+# would pass for a run that printed NOTHING; and the help is matched on STDOUT rather
+# than on a merged stream, because "prints help to stdout" is what a script consumes -
+# a build that moved the help to stderr would satisfy a merged-stream check and break
+# every pipeline. `2>$null` is what keeps the two streams apart here; `'' |` makes
+# stdin a pipe deterministically, as in the check above.
+$defaultExit = -1
+$defaultOut = ''
+$defaultThrew = $null
+try {
+    $ErrorActionPreference = 'Continue'
+    $defaultOut = ('' | & $tuiExe 2>$null | Out-String)
+    $defaultExit = $LASTEXITCODE
+}
+catch {
+    # Reported rather than swallowed, for the same reason as above: an invocation that
+    # never ran must not be read as "it printed help".
+    $defaultThrew = "$_"
+}
+finally {
+    $ErrorActionPreference = $previousPreference
+}
+
+$defaultFailure = $null
+if ($null -ne $defaultThrew) {
+    $defaultFailure = "the invocation threw: $defaultThrew"
+} elseif ($null -eq $defaultExit) {
+    $defaultFailure = 'no exit code was captured, so the binary may never have run'
+} elseif ($defaultExit -ne 0) {
+    # No backticks in this double-quoted string: PowerShell reads one as an escape
+    # character inside "...", and the message would lose the word it quoted.
+    $defaultFailure = 'a bare pie on a pipe must exit 0; got ' + $defaultExit
+} elseif ($defaultOut.Contains($esc + '[')) {
+    $defaultFailure = 'escape codes reached the pipe: a bare `pie` must not enter a full-screen UI here'
+} elseif ($defaultOut -notmatch 'Usage:') {
+    $defaultFailure = 'the help must be printed to STDOUT, and it was not (an empty stream would mean it went elsewhere)'
+}
+
+if ($null -ne $defaultFailure) {
+    [Console]::Error.WriteLine('')
+    [Console]::Error.WriteLine('FAIL: G4 acceptance (M12 default on a pipe)')
+    [Console]::Error.WriteLine('     command: pie, with stdin and stdout on a pipe')
+    [Console]::Error.WriteLine("     exit: $defaultExit")
+    [Console]::Error.WriteLine("     reason: $defaultFailure")
+    [Console]::Error.WriteLine("     stdout: $defaultOut")
+    exit 1
+}
+$script:GatesRun++
+Write-Host 'PASS: G4 acceptance (M12 default on a pipe)'
 
 # --- G6 (cross-target check) ------------------------------------------------
 # ACCEPTANCE section 1. Linux cannot be *run* locally (WSL2 is installed but

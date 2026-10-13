@@ -31,8 +31,8 @@
 
 use pie::provider::{Model, StreamEvent};
 use pie::tui::app::{
-    apply_event, help_text, reduce, Action, App, BindingState, Entry, Input, KeyBinding, Picker,
-    PickerItem, Status, KEYBINDINGS,
+    apply_event, help_text, reduce, Action, App, BindingState, Entry, Input, KeyBinding, Palette,
+    Picker, PickerItem, Status, KEYBINDINGS,
 };
 use pie::tui::render::{self, render, HELP_ROWS};
 
@@ -125,8 +125,21 @@ fn app_in(state: BindingState) -> App {
     let mut app = app_with_prompt();
     match state {
         BindingState::PromptReady => {}
+        // The `/` row's state: an empty prompt is what makes `/` open the palette rather
+        // than type a slash into a sentence.
+        BindingState::PromptEmpty => {
+            app.prompt.clear();
+            app.cursor = 0;
+        }
         BindingState::Running => app.status = Status::Running,
         BindingState::PickerOpen => app.picker = Some(picker_with_two_backends(0)),
+        // A real registry row rather than a made-up word, so the row's documented action
+        // is the action its own handler names.
+        BindingState::PaletteOpen => {
+            app.prompt = "/watch".to_string();
+            app.cursor = 6;
+            app.palette = Some(Palette::default());
+        }
     }
     app
 }
@@ -176,7 +189,7 @@ fn done(text: &str) -> StreamEvent {
 /// Listed by hand, and checked against an exhaustive match in [`documented_label`] — the
 /// pair is deliberate: the match is what makes a *new* variant a compile error, and this
 /// list is what the coverage assertion below walks.
-const EVERY_ACTION: [Action; 10] = [
+const EVERY_ACTION: [Action; 11] = [
     Action::None,
     Action::Quit,
     Action::Submit,
@@ -187,6 +200,7 @@ const EVERY_ACTION: [Action; 10] = [
     Action::PickerPrev,
     Action::PickerNext,
     Action::PickerAccept,
+    Action::PaletteRun,
 ];
 
 /// The name each variant carries, as an exhaustive match with no wildcard arm.
@@ -208,6 +222,7 @@ fn documented_label(action: Action) -> &'static str {
         Action::PickerPrev => "previous model",
         Action::PickerNext => "next model",
         Action::PickerAccept => "take the model",
+        Action::PaletteRun => "run the palette row",
     }
 }
 

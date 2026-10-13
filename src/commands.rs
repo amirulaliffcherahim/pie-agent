@@ -19,6 +19,8 @@ pub mod tui;
 pub mod usage;
 pub mod watch;
 
+use std::io::IsTerminal;
+
 use crate::cli::{Cli, Command, MemoryAction, ScheduleAction, WatchScope};
 use crate::config::Config;
 use crate::error::{PieError, Result};
@@ -117,11 +119,45 @@ pub async fn dispatch(cli: &Cli, cfg: &Config) -> Result<()> {
         // over this process's own stdin/stdout. It writes nothing to stdout that is
         // not a frame, so nothing may be printed before it starts either.
         Some(Command::Mcp { capability }) => mcp::run(capability).await,
+        // The bare invocation is the one place the default moved (`DESIGN.md` §21.1):
+        // it opens the TUI when **both** streams are terminals, and prints help
+        // otherwise. M6's guarantee was "the TUI is not the default"; M12's is "it
+        // requires a terminal on both streams". Same outcome, different mechanism —
+        // and the mechanism is weaker unless it is asserted, which is why the
+        // decision is a function of the two facts rather than an inline pair of
+        // `is_terminal()` calls: the terminal branch cannot be reached on a machine
+        // with no pty, but the function can (`ACCEPTANCE.md` §20, row C).
         None => match cli.print.as_deref() {
             Some(prompt) => print::run(cfg, cli, prompt).await,
+            None if enters_tui(
+                std::io::stdin().is_terminal(),
+                std::io::stdout().is_terminal(),
+            ) =>
+            {
+                // Deliberately `pie tui`'s own entry point rather than a second one:
+                // `tui::run` re-checks the same two facts before it touches the
+                // terminal and refuses with the message that branch already owns, so
+                // this arm cannot start a screen `pie tui` would have declined.
+                tui::run(cfg).await
+            }
             None => print_help(),
         },
     }
+}
+
+/// Does a **bare** `pie` open the TUI?
+///
+/// Yes in exactly one case: stdin **and** stdout are both terminals. Anything else —
+/// a pipe on either stream, a file, a null device, a CI runner — gets help.
+///
+/// This is a function rather than an expression inside [`dispatch`] for the reason
+/// `ACCEPTANCE.md` §20 records: the terminal branch cannot be exercised on a machine
+/// with no pty to allocate, so the decision is factored out where a test can assert it
+/// in both directions, and only the pipe branch is asserted end-to-end. `pie tui`
+/// keeps its own check (`tui::ensure_terminal`), so an explicit request is still
+/// refused with its existing message; this function governs the default alone.
+pub fn enters_tui(stdin_is_terminal: bool, stdout_is_terminal: bool) -> bool {
+    stdin_is_terminal && stdout_is_terminal
 }
 
 /// Nothing to run: show help instead of failing.

@@ -135,6 +135,15 @@ pub fn local_lines(command: &LocalCommand) -> Vec<String> {
             format!("`/{word}` is not a pie command, and nothing was sent to a backend"),
             "pie-local commands: /memory — what pie learned, with provenance".to_string(),
         ],
+        // A row of the M12 palette that this renderer does not own. Unreachable from
+        // the TUI — `commands::tui::local_lines` dispatches every registry row and routes
+        // only `/memory` here — but stated rather than left to a wildcard, because a
+        // wildcard is what would silently swallow the *next* variant too (I6: no panic on
+        // a value a caller can construct).
+        LocalCommand::Slash { name, .. } => vec![format!(
+            "`/{name}` is not a memory command: `/memory` is the one this prints; the TUI \
+             answers the other palette rows through `commands::tui`"
+        )],
     }
 }
 

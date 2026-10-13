@@ -990,6 +990,45 @@ fn the_tui_sends_the_projection_the_one_shot_path_sends() {
     assert_eq!(request.folded_prompt(), "task");
 }
 
+/// `/effort` sets the one field `--effort` fills on the one-shot path, so a palette row
+/// and a flag reach a backend's argv builder identically instead of through two spellings
+/// of one intent (`DESIGN.md` §21.3).
+///
+/// The falsifier is the second half: an `App::effort` that `/effort` set but
+/// `build_request` did not carry would leave the palette's answer cosmetic, which is the
+/// shape of a row that "works" and changes nothing.
+#[test]
+fn the_effort_a_palette_row_sets_is_the_effort_the_flag_sets() {
+    let scratch = tempfile::tempdir().unwrap();
+    let profile = Profile::load(scratch.path()).unwrap();
+    let mut app = App::new("agy", Some("gemini-3.8-flash".to_string()), "s-1-2");
+
+    // Nothing set: `None`, so the backend's own configured default applies — the same
+    // absence `pie -p` without `--effort` sends (`agy.default_effort` is the backend's).
+    assert!(tui::build_request(&app, "task", &profile).effort.is_none());
+
+    // `/effort high`, through the dispatch the loop calls for a settled command.
+    let lines = pie::commands::tui::local_lines(
+        &Config::default(),
+        &mut app,
+        &pie::tui::LocalCommand::Slash {
+            name: "effort",
+            args: "high".to_string(),
+        },
+    );
+    assert_eq!(
+        app.effort.as_deref(),
+        Some("high"),
+        "the row must set the field, not just say something"
+    );
+    assert!(lines.join(" ").contains("high"), "{lines:?}");
+    assert_eq!(
+        tui::build_request(&app, "task", &profile).effort.as_deref(),
+        Some("high"),
+        "and the request carries it, exactly as `--effort high` would"
+    );
+}
+
 /// A submission whose persona cannot be read fails the turn instead of running one.
 ///
 /// The order matters: `commands/print.rs` loads the projection before anything is

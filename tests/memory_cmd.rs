@@ -846,18 +846,70 @@ async fn a_corrupt_ledger_refuses_rather_than_handing_the_budget_back() {
 
 // ------------------------------------------------------------------- TUI -----
 
-/// `DESIGN.md` §16: `/memory` routes through the ordinary `Submit` path, and M6's
-/// `Input` is not extended.
+/// `DESIGN.md` §21.3: the TUI's slash commands are dispatched by the **registry**, and
+/// M7's hand-written `/memory` branch is absorbed by it rather than kept beside it.
+///
+/// This test replaces the one that asserted *"slash commands route through `submit` and
+/// never through a new key"*, and it is not the same claim weakened. The old one pinned
+/// **one** word against **one** hand-written branch; this one walks every row of
+/// `slash::SLASH_COMMANDS` and asserts each is dispatchable from the text path — so a row
+/// that exists in the menu and nowhere in the dispatch fails, which the old test could
+/// not notice — and it asserts that a word with no row is answered rather than sent to a
+/// backend. `/memory` is then one row among the nineteen, reached by the same lookup, not
+/// a special case: `the_memory_row_is_a_row_of_the_table` in `tests/tui_palette.rs`
+/// completes the pair by asserting the two front-ends reach the same effect for it.
 #[test]
-fn the_tui_routes_slash_commands_through_submit_and_never_through_a_new_key() {
+fn the_tui_dispatches_slash_commands_through_the_registry_table() {
+    // Every row dispatches from the text, so the menu cannot offer a command the
+    // submission path does not recognise.
+    for row in pie::tui::slash::SLASH_COMMANDS {
+        let typed = pie::tui::slash::settled(row, "");
+        let command = tui::local_command(&typed);
+        assert!(
+            command.is_some(),
+            "`{typed}` is a row of the registry and does not dispatch"
+        );
+        assert_ne!(
+            command,
+            Some(LocalCommand::Unknown(row.name.to_string())),
+            "`{typed}` is a row and was answered as a typo"
+        );
+    }
+
+    // …and nothing dispatches that is not a row: a leading slash still means "pie
+    // command", and a word with no row is answered rather than passed to a vendor CLI.
+    assert_eq!(
+        tui::local_command("/hlep"),
+        Some(LocalCommand::Unknown("hlep".to_string())),
+        "an unknown command is recognised rather than sent to a backend"
+    );
+    assert_eq!(tui::local_command("no slash here"), None);
+    assert_eq!(
+        tui::local_command("/"),
+        Some(LocalCommand::Unknown(String::new()))
+    );
+
+    // `/memory` itself: a row of the table, and identical from both front-ends.
+    assert_eq!(
+        pie::tui::slash::find("memory").map(|row| (row.handler)("")),
+        Some(Action::PaletteRun),
+        "the memory row is an ordinary row: the loop answers it from its name"
+    );
+    assert_eq!(
+        tui::local_command("/memory"),
+        Some(LocalCommand::Memory),
+        "the row M7's renderer answers is chosen by the table, not by a word compared here"
+    );
+    assert_eq!(
+        tui::effect_for(Action::PaletteRun, "/memory".to_string()),
+        tui::effect_for(Action::Submit, "/memory".to_string()),
+        "the palette and a typed command are one dispatch"
+    );
+
+    // The neighbours the old test pinned, unchanged in meaning.
     assert_eq!(
         tui::effect_for(Action::Submit, "/memory".to_string()),
         Effect::Local(LocalCommand::Memory)
-    );
-    assert_eq!(
-        tui::effect_for(Action::Submit, "  /memory".to_string()),
-        Effect::Local(LocalCommand::Memory),
-        "leading whitespace is still a command"
     );
     assert_eq!(
         tui::effect_for(Action::Submit, "summarise the log".to_string()),
@@ -868,17 +920,6 @@ fn the_tui_routes_slash_commands_through_submit_and_never_through_a_new_key() {
         tui::effect_for(Action::Quit, "/memory".to_string()),
         Effect::Quit,
         "a slash command must not change what any other action means"
-    );
-
-    assert_eq!(
-        tui::local_command("/hlep"),
-        Some(LocalCommand::Unknown("hlep".to_string())),
-        "an unknown command is recognised rather than sent to a backend"
-    );
-    assert_eq!(tui::local_command("no slash here"), None);
-    assert_eq!(
-        tui::local_command("/"),
-        Some(LocalCommand::Unknown(String::new()))
     );
 }
 

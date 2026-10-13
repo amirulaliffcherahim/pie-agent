@@ -11,6 +11,7 @@
 //! turn lives in [`super`].
 
 use crate::provider::{Model, StreamEvent, ToolState, Usage};
+use crate::tui::slash::{self, SlashCommand};
 
 /// One key, with no terminal behind it.
 ///
@@ -68,6 +69,15 @@ pub enum Action {
     PickerPrev,
     /// Take the highlighted picker row as the new model, and close the picker.
     PickerAccept,
+    /// Run the command the `/` palette settled into the prompt.
+    ///
+    /// Additive, and the palette's only action: opening the overlay, moving its
+    /// highlight and closing it on `Esc` are state changes the loop has nothing to do
+    /// about, which is what [`Action`]'s own definition says an action is not. The one
+    /// thing the loop must do is run the row — and it runs it on the settled prompt
+    /// text, through the same registry lookup a typed command goes through, so the two
+    /// front-ends are one dispatch rather than two (`DESIGN.md` §21.3).
+    PaletteRun,
 }
 
 impl Action {
@@ -92,6 +102,7 @@ impl Action {
             Action::PickerNext => "next model",
             Action::PickerPrev => "previous model",
             Action::PickerAccept => "take the model",
+            Action::PaletteRun => "run the palette row",
         }
     }
 }
@@ -265,6 +276,19 @@ pub struct App {
     pub last_usage: Option<Usage>,
     /// The model picker, when it is open.
     pub picker: Option<Picker>,
+    /// The `/` palette, when it is open.
+    ///
+    /// The overlay's **rows are not stored here**: they are the registry's rows
+    /// filtered by the prompt, derived on demand, because a copy kept in this struct
+    /// is a second list free to disagree with the table (§21.3, and the B26 shape).
+    /// What the overlay owns is the highlight.
+    pub palette: Option<Palette>,
+    /// Reasoning effort for the next turn, or the backend's own default.
+    ///
+    /// The same field `--effort` fills on the one-shot path (`ChatRequest::effort`), so
+    /// `/effort high` and `pie -p --effort high` reach the backend the same way rather
+    /// than through two spellings of the same intent.
+    pub effort: Option<String>,
     /// Set when the user asked to leave.
     pub should_quit: bool,
 }
@@ -289,8 +313,90 @@ impl App {
             scroll: 0,
             last_usage: None,
             picker: None,
+            palette: None,
+            effort: None,
             should_quit: false,
         }
+    }
+
+    /// The overlay's rows for the current prompt, or empty when it is not open.
+    pub fn palette_rows(&self) -> Vec<&'static SlashCommand> {
+        match self.palette {
+            Some(_) => Palette::rows(&self.prompt),
+            None => Vec::new(),
+        }
+    }
+
+    /// Re-derive the overlay from the prompt: clamp the highlight, or close it.
+    ///
+    /// Called after every edit, because both directions matter. A highlight left past
+    /// the end of a narrowed list would run a row the user cannot see, and a prompt
+    /// that no longer begins with `/` is not a command at all — the overlay would be
+    /// showing rows for text it is not about.
+    pub fn refresh_palette(&mut self) {
+        if self.palette.is_none() {
+            return;
+        }
+        match slash::filter_of(&self.prompt) {
+            Some(filter) => {
+                let len = slash::matching(filter).len();
+                if let Some(palette) = self.palette.as_mut() {
+                    palette.clamp(len);
+                }
+            }
+            None => self.palette = None,
+        }
+    }
+
+    /// Run the highlighted palette row, settling it into the prompt.
+    ///
+    /// The settled invocation is **left in `App::prompt`** rather than cleared, and
+    /// that is load-bearing: the loop reads the prompt after [`reduce`] returns
+    /// (`src/tui.rs`, `act_on_key`), which is how the action arrives carrying the same
+    /// text a typed command arrives with. `commands::tui::local_lines` clears it once
+    /// the command has been answered.
+    fn run_palette_row(&mut self) -> Action {
+        let prompt = self.prompt.clone();
+        let row = self.palette.and_then(|palette| palette.highlight(&prompt));
+        let Some(row) = row else {
+            // Nothing matched. `Enter` must not run the first row as a consolation for a
+            // word pie has no command for — a guess that spends quota is the one thing
+            // §21.3's unknown-command rule exists to prevent.
+            self.palette = None;
+            return Action::None;
+        };
+
+        let args = slash::arguments_of(&prompt, row.name).to_string();
+        let handler = row.handler;
+        self.palette = None;
+
+        let action = handler(&args);
+        if action == Action::PaletteRun {
+            let settled = slash::settled(row, &args);
+            self.transcript.push(Entry::User(settled.clone()));
+            self.status = Status::Running;
+            self.prompt = settled;
+            self.cursor = char_count(&self.prompt);
+        } else {
+            // A row the loop answers from the action alone still leaves state behind, and
+            // both halves are the state the key it stands for leaves: `OpenPicker` opens
+            // the picker **empty** for the caller to fill (the loop takes a catalog only
+            // while the picker is open, and `Tab` sets it for the same reason), and
+            // `Quit` is `Ctrl('c')`'s own flag. Without this the palette would return
+            // `OpenPicker` on a closed picker, and the fetched catalog would be dropped.
+            match action {
+                Action::OpenPicker => self.picker = Some(Picker::default()),
+                Action::Quit => self.should_quit = true,
+                _ => {}
+            }
+            // A row the loop answers from the action alone — M6's picker, or the exit —
+            // consumes its invocation instead of leaving it in the composer. `Running`
+            // is deliberately not set here: no local command will arrive to clear it,
+            // which is the spinner that never stopped (B26).
+            self.prompt.clear();
+            self.cursor = 0;
+        }
+        action
     }
 
     /// Whether the prompt has anything to send, ignoring surrounding space.
@@ -308,6 +414,58 @@ impl App {
     }
 }
 
+/// The `/` command palette's state (`DESIGN.md` §21.3).
+///
+/// Only the highlight: the rows are the registry's, filtered by the prompt, so there
+/// is no list here to go stale. `Default` is the state `/` opens it in — the first row
+/// of the whole table, which is the menu.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Palette {
+    /// Index of the highlighted row within the rows the filter currently matches.
+    ///
+    /// Meaningless while nothing matches, which is why the moves clamp rather than
+    /// index, the same rule [`Picker::selected`] follows.
+    pub selected: usize,
+}
+
+impl Palette {
+    /// The registry rows this prompt matches, in table order.
+    pub fn rows(prompt: &str) -> Vec<&'static SlashCommand> {
+        slash::filter_of(prompt)
+            .map(slash::matching)
+            .unwrap_or_default()
+    }
+
+    /// The highlighted row, if the filter matches anything.
+    pub fn highlight(&self, prompt: &str) -> Option<&'static SlashCommand> {
+        Self::rows(prompt).get(self.selected).copied()
+    }
+
+    /// Bring the highlight back inside a list of `len` rows.
+    pub fn clamp(&mut self, len: usize) {
+        self.selected = if len == 0 {
+            0
+        } else {
+            self.selected.min(len - 1)
+        };
+    }
+
+    /// Move the highlight by `delta`, **clamped** rather than wrapped.
+    ///
+    /// §21.3's rule, and its reason: a wrap hides that you have reached the end — the
+    /// highlight reappears at the top and the list looks like it continued. `Picker`
+    /// clamps for the same reason.
+    pub fn move_by(&mut self, delta: isize, len: usize) {
+        if len == 0 {
+            self.selected = 0;
+            return;
+        }
+        let last = len - 1;
+        let next = self.selected as isize + delta;
+        self.selected = next.clamp(0, last as isize) as usize;
+    }
+}
+
 /// The state a keymap row is documented in.
 ///
 /// The keymap is modal — `Enter`, `Tab`, `Up`, `Down` and `Esc` each mean two things —
@@ -319,10 +477,18 @@ impl App {
 pub enum BindingState {
     /// Nothing running, no picker, and text in the prompt.
     PromptReady,
+    /// Nothing running, no picker, and the prompt is **empty**.
+    ///
+    /// Its own state rather than [`BindingState::PromptReady`] because `/` opening the
+    /// palette depends on the prompt being empty, and a row driven in a state its
+    /// documentation does not describe is a row that passes for the wrong reason.
+    PromptEmpty,
     /// A turn is in flight.
     Running,
     /// The model picker is open.
     PickerOpen,
+    /// The `/` palette is open.
+    PaletteOpen,
 }
 
 /// One row of the frozen keymap (`DESIGN.md` §12).
@@ -474,6 +640,27 @@ pub const KEYBINDINGS: &[KeyBinding] = &[
         state: BindingState::PromptReady,
         action: Action::Quit,
     },
+    KeyBinding {
+        keys: "/",
+        description: "open the palette",
+        input: Input::Char('/'),
+        state: BindingState::PromptEmpty,
+        action: Action::None,
+    },
+    KeyBinding {
+        keys: "enter",
+        description: "run the palette row",
+        input: Input::Enter,
+        state: BindingState::PaletteOpen,
+        action: Action::PaletteRun,
+    },
+    KeyBinding {
+        keys: "esc",
+        description: "close the palette",
+        input: Input::Esc,
+        state: BindingState::PaletteOpen,
+        action: Action::None,
+    },
 ];
 
 /// The keymap as the single line of help the footer draws, derived from
@@ -517,6 +704,12 @@ pub fn help_text() -> String {
 /// | `Esc`, nothing to cancel | `Quit` | `should_quit` |
 /// | `Ctrl('c')` | `Quit` | `should_quit` |
 /// | any other `Ctrl(..)` | `None` | nothing |
+/// | `Char('/')`, prompt empty | `None` | palette opened on the whole table |
+/// | `Char` / `Backspace`, palette open | `None` | prompt edited; highlight clamped, or the overlay closed when the text stopped being a slash word |
+/// | `Up` / `Down`, palette open | `None` | highlight moved and **clamped** |
+/// | `Tab`, palette open | `None` | nothing — one overlay at a time |
+/// | `Enter`, palette open | the highlighted row's own action | overlay closed; the invocation settled into the prompt, and the transcript and status set exactly as `Enter` sets them for a typed command when the row is pie-local |
+/// | `Esc`, palette open | `None` | overlay closed; **prompt untouched** |
 ///
 /// Two deliberate choices worth keeping. **`Enter` is refused unless the prompt
 /// has non-whitespace text**, so a turn is never spent on an empty prompt — the
@@ -561,12 +754,19 @@ pub fn reduce(app: &mut App, input: Input) -> Action {
     match input {
         Input::Ctrl(_) => Action::None,
         Input::Char(c) => {
+            // `/` at an **empty** prompt opens the palette (`DESIGN.md` §21.3). Read
+            // before the insert: after it the prompt is never empty again.
+            let opening = c == '/' && app.prompt.is_empty();
             app.prompt = insert_char(&app.prompt, app.cursor, c);
             // Clamped, not `+= 1`: a prompt assigned from outside (a test, a
             // restored draft) can leave the cursor past the end, and an
             // unclamped cursor is the offset the multi-byte editing bug rides in
             // on.
             app.cursor = (app.cursor + 1).min(char_count(&app.prompt));
+            if opening {
+                app.palette = Some(Palette::default());
+            }
+            app.refresh_palette();
             Action::None
         }
         Input::Backspace => {
@@ -574,6 +774,9 @@ pub fn reduce(app: &mut App, input: Input) -> Action {
                 app.prompt = remove_char_before(&app.prompt, app.cursor);
                 app.cursor -= 1;
             }
+            // Deleting the slash leaves a prompt that is not a command, and the overlay
+            // closes rather than offering rows for text it is no longer about.
+            app.refresh_palette();
             Action::None
         }
         Input::Left => {
@@ -585,6 +788,13 @@ pub fn reduce(app: &mut App, input: Input) -> Action {
             Action::None
         }
         Input::Enter => {
+            // The palette is modal, so it takes `Enter` first — the same reason the
+            // picker does: running a command and submitting a prompt on one key would
+            // send a turn the user was still choosing a command for.
+            if app.palette.is_some() {
+                return app.run_palette_row();
+            }
+
             // The picker is modal, so it takes `Enter` first: accepting a row and
             // submitting a prompt on the same key would send a turn the user was
             // still choosing a model for.
@@ -607,6 +817,14 @@ pub fn reduce(app: &mut App, input: Input) -> Action {
             Action::None
         }
         Input::Esc => {
+            // The palette first, and before the picker: closing an overlay is not a
+            // status change and not a quit, and `Esc` quitting with the overlay open
+            // would take the half-typed command with it — §21.3 requires the prompt
+            // text to survive it.
+            if app.palette.take().is_some() {
+                return Action::None;
+            }
+
             // Read both facts before either is changed: one `Cancel` covers the turn and
             // the overlay, but only a running turn may move the status.
             let running = app.status.is_running();
@@ -626,6 +844,12 @@ pub fn reduce(app: &mut App, input: Input) -> Action {
             }
         }
         Input::Tab => {
+            if app.palette.is_some() {
+                // One overlay at a time: opening the picker under the palette would put
+                // two surfaces on the same keys with nothing on screen saying which one
+                // `Enter` would answer.
+                return Action::None;
+            }
             if app.picker.is_some() {
                 // A no-op, not a second `OpenPicker`: the picker is opened **empty** for
                 // the caller to fill from a catalog read asynchronously, so resetting it
@@ -638,7 +862,13 @@ pub fn reduce(app: &mut App, input: Input) -> Action {
             Action::OpenPicker
         }
         Input::Up => {
-            if let Some(picker) = app.picker.as_mut() {
+            if app.palette.is_some() {
+                let len = Palette::rows(&app.prompt).len();
+                if let Some(palette) = app.palette.as_mut() {
+                    palette.move_by(-1, len);
+                }
+                Action::None
+            } else if let Some(picker) = app.picker.as_mut() {
                 picker.move_by(-1);
                 Action::PickerPrev
             } else {
@@ -647,7 +877,13 @@ pub fn reduce(app: &mut App, input: Input) -> Action {
             }
         }
         Input::Down => {
-            if let Some(picker) = app.picker.as_mut() {
+            if app.palette.is_some() {
+                let len = Palette::rows(&app.prompt).len();
+                if let Some(palette) = app.palette.as_mut() {
+                    palette.move_by(1, len);
+                }
+                Action::None
+            } else if let Some(picker) = app.picker.as_mut() {
                 picker.move_by(1);
                 Action::PickerNext
             } else {

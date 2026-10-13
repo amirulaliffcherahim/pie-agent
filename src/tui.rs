@@ -43,6 +43,8 @@
 
 pub mod app;
 pub mod render;
+pub mod slash;
+pub mod tools;
 
 pub use app::VENDOR_TOOL_NOTE;
 pub use app::{apply_event, reduce, Action, App, Entry, Input, Picker, PickerItem, Status};
@@ -221,15 +223,33 @@ pub enum Step {
 }
 
 /// A command pie handles itself, recognised in the text the user submitted
-/// (`DESIGN.md` §16).
+/// (`DESIGN.md` §16, §21.3).
 ///
 /// Deliberately a property of the *submitted text*, not a new [`Input`]: M6's keymap is
 /// frozen, and a slash command is not a keystroke. This is what [`Action::Submit`] was
 /// specified as "the caller decides what a submission means" for.
+///
+/// Which variant a submission becomes is the registry's answer
+/// ([`crate::tui::slash::SLASH_COMMANDS`]), reached through [`local_command`] — the same
+/// lookup the palette's `Enter` goes through, so `/watch` from the menu and `/watch`
+/// typed by hand are one dispatch and not two.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LocalCommand {
     /// `/memory` — what pie learned, with provenance, and the id that undoes it.
+    ///
+    /// The memory row keeps a variant of its own because
+    /// `commands::memory::local_lines` is the renderer M7 froze for it and
+    /// `pie memory show` prints the same bytes; the row that selects it comes from the
+    /// registry, not from a word compared here.
     Memory,
+    /// Any other row of the registry, by the name the table gave it and the arguments
+    /// the user typed after it.
+    Slash {
+        /// The registry row's name, from the table rather than re-parsed from the text.
+        name: &'static str,
+        /// Everything after the name, trimmed.
+        args: String,
+    },
     /// A leading-slash word pie does not implement.
     ///
     /// Recognised rather than passed through on purpose: a leading `/` in this UI means
@@ -242,14 +262,24 @@ pub enum LocalCommand {
 ///
 /// `None` means "not a slash command", which is the ordinary case. Pure: no I/O, no
 /// backend, so what a submission means is asserted without a terminal.
+///
+/// **The registry decides**, and that is the M12 change §21.3 asks for: M7's ad-hoc
+/// `match word { "memory" => … }` is gone, so a word this function answers is a word the
+/// palette menu lists, and a word it does not answer is listed by neither. A test that
+/// walks [`crate::tui::slash::SLASH_COMMANDS`] and asserts every row is dispatchable here
+/// is what keeps the two in step.
 pub fn local_command(text: &str) -> Option<LocalCommand> {
     let rest = text.trim_start().strip_prefix('/')?;
     // Only the first word; `/memory extra` is `/memory`. A command with no name at all
     // (`/` on its own) is answered as unknown rather than as a prompt.
     let word = rest.split_whitespace().next().unwrap_or_default();
-    Some(match word {
-        "memory" => LocalCommand::Memory,
-        other => LocalCommand::Unknown(other.to_string()),
+    Some(match slash::find(word) {
+        Some(row) if row.name == slash::MEMORY => LocalCommand::Memory,
+        Some(row) => LocalCommand::Slash {
+            name: row.name,
+            args: slash::arguments_of(text, row.name).to_string(),
+        },
+        None => LocalCommand::Unknown(word.to_string()),
     })
 }
 
@@ -260,11 +290,43 @@ pub fn local_command(text: &str) -> Option<LocalCommand> {
 /// command — so without this the spinner would run for ever and the only way back would
 /// be an `Esc` that cancels a turn that does not exist.
 ///
+/// The composer is cleared here too, for the same reason one step further on: a typed
+/// command has already had its prompt taken by `reduce`, while the palette **settles**
+/// its invocation into the prompt so the loop can dispatch on the settled text (see
+/// [`act_on_key`]). Clearing here is therefore the one place both front-ends return the
+/// composer to empty once the command has been answered.
+///
 /// The lines are handed in rather than read here so this stays the pure half: the read
-/// lives in [`crate::commands::memory::local_lines`].
+/// lives in [`answer_local`].
 pub fn apply_local_command(app: &mut App, lines: Vec<String>) {
     app.status = Status::Idle;
+    app.prompt.clear();
+    app.cursor = 0;
     app.transcript.extend(lines.into_iter().map(Entry::Notice));
+}
+
+/// The lines a local command answers with.
+///
+/// One dispatch, and one exception to it that is named rather than implied: every
+/// registry row is answered by [`crate::commands::tui::local_lines`] — the `match` that
+/// `tests/tui_palette.rs` walks the whole table against — except `/tools`, which M12
+/// stage D answers from [`tools`], a module that needs the resolved [`Tools`] and
+/// nothing else.
+///
+/// The routing key is the registry row's own name ([`slash::TOOLS`]), read from the
+/// table, so no word is spelled here that the table does not already contain. It is a
+/// function rather than a `match` inside [`run_session`] for the reason every other
+/// decision in this file is: `run_session` is the part no test can drive, and a route
+/// that lived inside it would be a route nothing asserts.
+///
+/// [Tools]: crate::config::Tools
+pub fn answer_local(cfg: &Config, app: &mut App, command: &LocalCommand) -> Vec<String> {
+    match command {
+        LocalCommand::Slash { name, args } if *name == slash::TOOLS => {
+            tools::lines(&cfg.tools, args)
+        }
+        other => crate::commands::tui::local_lines(cfg, app, other),
+    }
 }
 
 /// What the loop must do that [`act`] cannot.
@@ -450,7 +512,19 @@ fn act_on_key(app: &mut App, in_flight: &mut InFlight, input: Input) -> Effect {
         _ => String::new(),
     };
 
-    let effect = effect_for(reduce(app, input), typed);
+    let action = reduce(app, input);
+
+    // The palette **settles** the highlighted row into the prompt and leaves it there
+    // for the loop to dispatch on, so its text is read *after* `reduce`; the ordinary
+    // `Enter` clears the prompt, which is why that one is captured before. Both readings
+    // end in the same `effect_for` arm, which is what makes "one dispatch, two
+    // front-ends" a comparison rather than a claim (`DESIGN.md` §21.3).
+    let submitted = match action {
+        Action::PaletteRun => app.prompt.clone(),
+        _ => typed,
+    };
+
+    let effect = effect_for(action, submitted);
 
     // The clock starts when the turn is dispatched, not when the key was read, and
     // the prompt is kept here as well as carried by the effect because the row is
@@ -475,19 +549,32 @@ fn act_on_key(app: &mut App, in_flight: &mut InFlight, input: Input) -> Effect {
 /// arm into `Continue`, which is the shape in which a new keybinding does nothing and
 /// nothing says so.
 ///
-/// `submitted` is only consulted for [`Action::Submit`]: the reducer has already
-/// cleared the prompt by then, so the caller hands the text over instead.
+/// `submitted` is only consulted for [`Action::Submit`] and [`Action::PaletteRun`]: the
+/// reducer has already cleared the prompt by then, so the caller hands the text over
+/// instead.
 ///
 /// A submission that names a pie-local command becomes [`Effect::Local`] rather than
 /// [`Effect::Run`], which is the branch that keeps `/memory` from being sent to a
 /// vendor CLI as a prompt: routing it through the ordinary submit path is
 /// `DESIGN.md` §16's rule, and recognising it *here* means both the recognition and the
 /// decision are reachable by a test.
+///
+/// The palette's `Enter` reaches **the same arm**, on the text the palette settled into
+/// the prompt, so a row chosen from the menu and the same word typed by hand resolve
+/// through one registry lookup (§21.3: `/watch` and `pie watch` must not become two
+/// implementations). The equality is asserted row by row in `tests/tui_palette.rs`.
 pub fn effect_for(action: Action, submitted: String) -> Effect {
     match action {
         Action::Quit => Effect::Quit,
-        Action::Submit => match local_command(&submitted) {
+        Action::Submit | Action::PaletteRun => match local_command(&submitted) {
             Some(command) => Effect::Local(command),
+            // An ordinary prompt is a turn. A palette row always settles a registry
+            // invocation into the prompt before this runs, so this arm means the settled
+            // text named no row at all — answered rather than dropped, because a key that
+            // does nothing and says so nowhere is the shape B26 recorded.
+            None if action == Action::PaletteRun => Effect::Local(LocalCommand::Unknown(
+                submitted.trim_start_matches('/').trim().to_string(),
+            )),
             None => Effect::Run(submitted),
         },
         Action::Cancel => Effect::Abort,
@@ -545,13 +632,16 @@ fn act_on_catalog(app: &mut App, items: Vec<PickerItem>) -> Effect {
 /// from [`Profile::persona`], the same accessor the one-shot path uses, so "no
 /// persona configured" stays `None` and can never become `Some("")`.
 ///
-/// `effort` and `timeout` are deliberately left unset: the frozen keymap has no key
-/// for either, so a backend that needs an effort value gets its own configured
-/// default from its own argv builder (`agy.default_effort`), and the deadline is the
-/// resolved configuration (`req.timeout.unwrap_or_else(|| cfg.timeout())`).
+/// `effort` comes from [`App::effort`], which `/effort` sets and which `--effort` fills
+/// on the one-shot path (`commands/print.rs`): one field, two front-ends, so `/effort
+/// high` and `pie -p --effort high` reach a backend's argv builder identically. `None`
+/// stays `None`, and a backend that needs an effort value gets its own configured
+/// default (`agy.default_effort`). `timeout` is left unset: the deadline is the resolved
+/// configuration (`req.timeout.unwrap_or_else(|| cfg.timeout())`).
 pub fn build_request(app: &App, prompt: &str, profile: &Profile) -> ChatRequest {
     let mut request = ChatRequest::new(prompt);
     request.model = app.model.clone();
+    request.effort = app.effort.clone();
     request.persona = profile.persona().map(str::to_string);
     request
 }
@@ -903,7 +993,14 @@ pub async fn run_session(app: &mut App, cfg: &Config) -> Result<()> {
             // spent (`DESIGN.md` §16, `RISKS.md` §13). The read is the only I/O, and it
             // is the same rendering `pie memory show` prints.
             Effect::Local(command) => {
-                apply_local_command(app, crate::commands::memory::local_lines(&command));
+                let lines = answer_local(cfg, app, &command);
+                apply_local_command(app, lines);
+                // `/new` mints a session in `App`, so the loop's handle has to follow it:
+                // recording the next turn through the old handle would write it against
+                // the conversation the user just left (`DESIGN.md` §11).
+                if session.id() != app.session {
+                    session = session_for(app);
+                }
             }
             Effect::Abort => {
                 if let Some(handle) = running.take() {

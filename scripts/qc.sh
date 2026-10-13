@@ -16,6 +16,8 @@
 #   G4  offline acceptance - M0: cargo run -- --list-backends
 #       ... one per milestone, and one per M5/M6 stage
 #   G4  `pie tui` on a pipe refuses with a message and no escape codes
+#   G4  bare `pie` on a pipe prints help, exits 0, and emits no escape codes
+#       (M12 section 21.1: the default reverses, and the safety property moves)
 #   G6  cargo check --target x86_64-unknown-linux-gnu --all-targets
 #       --no-default-features  (cross-target; SKIPped loudly if the target is
 #       not installed). `--no-default-features` is required, not optional: the
@@ -284,6 +286,19 @@ run_gate 'G4 acceptance (M11 bash, scoped)' cargo test --test tools_bash
 # S2's guard: the half of I6 that `deny(clippy::panic)` cannot see (S2).
 run_gate 'G4 output safety (S2 closed pipe)' cargo test --test output
 
+# M12 stage C, and its own binary for that stage alone (ACCEPTANCE section 20): the
+# decision to enter the TUI is a pure function, asserted in both directions, because
+# the terminal branch cannot be exercised without a pty. It is the half the
+# built-binary check below cannot reach: that one proves a pipe cannot enter the TUI,
+# this one proves the decision which would let a terminal do it is right for every
+# combination of the two streams. One passing does not imply the other.
+# M12's stages, one gate binary each, named after the stage that owns it: stage A's palette,
+# stage D's /tools, stage C's default predicate and pipe check. Stage B is `tui_render` above
+# (M6's row, extended rather than duplicated).
+run_gate 'G4 acceptance (M12 palette)' cargo test --test tui_palette
+run_gate 'G4 acceptance (M12 tools)' cargo test --test tui_tools
+run_gate 'G4 acceptance (M12 default predicate)' cargo test --test tui_default
+
 # --- G4 (M6 tui non-TTY) ----------------------------------------------------
 # ACCEPTANCE section 9: `pie tui` on a non-TTY stdin must fail with a clear message
 # rather than emitting escape codes into a pipe.
@@ -324,6 +339,39 @@ check_tui_refusal() {
   esac
 }
 run_gate 'G4 acceptance (M6 tui non-TTY)' check_tui_refusal
+
+# --- G4 (M12 the default on a pipe) -----------------------------------------
+# DESIGN section 21.1/21.7 and ACCEPTANCE section 20, row C: a bare `pie` now opens
+# the TUI when stdin and stdout are BOTH terminals, and prints help otherwise. The
+# check above guards the explicit request; this one guards the default, and it is the
+# load-bearing half - M6's guarantee was "the TUI is not the default", M12's is "it
+# needs a terminal on both streams", and that second mechanism is weaker unless it is
+# asserted. The terminal branch cannot be exercised here (no pty to allocate); the pipe
+# branch is asserted against the built binary and the predicate in the cargo test above.
+#
+# Three assertions, and none is sufficient alone: the exit code alone would pass for a
+# run that emitted escape codes into a CI log; "no escape codes" alone would pass for a
+# run that printed NOTHING; and the help is matched on STDOUT rather than on a merged
+# stream, because "prints help to stdout" is what a script consumes - dropping stderr
+# with `2>/dev/null` is what keeps the two apart here.
+check_tui_default_help() {
+  local out status
+  status=0
+  out="$(printf '' | "$PIE_BIN" 2>/dev/null)" || status=$?
+  if [ "$status" -ne 0 ]; then
+    printf 'a bare `pie` on a pipe must exit 0; got %s\n' "$status" >&2
+    return 1
+  fi
+  if printf '%s' "$out" | grep -q $'\033\['; then
+    printf 'escape codes reached the pipe: a bare `pie` must not enter a full-screen UI here\n' >&2
+    return 1
+  fi
+  case "$out" in
+    *Usage:*) return 0 ;;
+    *) printf 'the help must be printed to STDOUT, and it was not; got: %s\n' "$out" >&2; return 1 ;;
+  esac
+}
+run_gate 'G4 acceptance (M12 default on a pipe)' check_tui_default_help
 
 # --- G6 (cross-target check) ------------------------------------------------
 # ACCEPTANCE section 1. Linux cannot be *run* locally (WSL2 is installed but

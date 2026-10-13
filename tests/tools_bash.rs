@@ -219,7 +219,21 @@ fn counting(base: &Base, name: &str) -> PathBuf {
 /// The sleep is [`SLEEP`] because the deadline test's wall-clock assertion is written against
 /// it. See that constant for why the margin is the stand-in's working time rather than a fixed
 /// slack added to the deadline.
-const SLEEP: Duration = Duration::from_secs(4);
+///
+/// Four seconds was too short, and the reason is worth stating: as well as the wall clock, this
+/// test requires the stand-in to have *started*, because a child that never ran makes the
+/// wall-clock assertion vacuous. `bash` arms its deadline at spawn, so the deadline must exceed
+/// **process-creation latency on a loaded machine**, not merely the cost of the kill.
+const SLEEP: Duration = Duration::from_secs(10);
+
+/// The deadline the stand-in must not outlive.
+///
+/// One second was the original value and it was load-sensitive in a second way: under
+/// concurrent load a `CreateProcess` took longer than that, so the deadline fired before the
+/// child existed and the test failed on *the machine*, not on `pie`. Three seconds is headroom
+/// over spawn latency; the discriminating threshold is [`SLEEP`], which stays far above
+/// `DEADLINE_SECS + kill`, so the test still separates "killed" from "waited on".
+const DEADLINE_SECS: u64 = 3;
 fn sleeper(base: &Base, name: &str) -> PathBuf {
     let started = base.mark(&format!("{name}-started.txt"));
     let finished = base.mark(&format!("{name}-finished.txt"));
@@ -862,7 +876,7 @@ fn a_command_outliving_its_deadline_is_killed_not_waited_on() {
     let base = Base::new();
     let stand_in = sleeper(&base, "sleeper");
     let tools = Tools {
-        timeout_secs: 1,
+        timeout_secs: DEADLINE_SECS,
         ..base.tools(&["sleeper"])
     };
 
@@ -875,13 +889,13 @@ fn a_command_outliving_its_deadline_is_killed_not_waited_on() {
         result.output
     );
     assert!(
-        elapsed >= Duration::from_secs(1),
-        "the call returned after {elapsed:?}, before its 1s deadline could have fired, so this \
+        elapsed >= Duration::from_secs(DEADLINE_SECS),
+        "the call returned after {elapsed:?}, before its {DEADLINE_SECS}s deadline could have fired, so this \
          test is not measuring what happens at a deadline"
     );
     assert!(
         elapsed < SLEEP,
-        "a 1s deadline returned after {elapsed:?}, and the stand-in works for {SLEEP:?}: the \
+        "a {DEADLINE_SECS}s deadline returned after {elapsed:?}, and the stand-in works for {SLEEP:?}: the \
          child was waited on rather than killed. **The ceiling is the stand-in's own working \
          time, deliberately, not the deadline plus a fixed slack** — a deadline kill costs a \
          `taskkill` spawn and a process-tree walk, measured at ~1.2 s on a machine under load, \
@@ -891,7 +905,11 @@ fn a_command_outliving_its_deadline_is_killed_not_waited_on() {
     );
     assert!(
         base.mark("sleeper-started.txt").exists(),
-        "the stand-in never ran, so the wall-clock assertion above proves nothing"
+        "the stand-in never ran within its {DEADLINE_SECS}s deadline, so the wall-clock assertion \
+         above proves nothing. **This is a statement about the machine rather than about pie**: the \
+         deadline is armed at spawn, so process creation slower than `DEADLINE_SECS` fires it first. \
+         It fired for real at a 1s deadline under three concurrent agents plus a gate run, which is \
+         why the deadline is 3s."
     );
     assert!(
         !result.output.contains("the-child-outlived-its-deadline"),
