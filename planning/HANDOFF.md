@@ -12,9 +12,9 @@
 | Branch | `feat/m0-m2-subscription-backends` |
 | Last commit | M11 — pushed; `origin` in sync |
 | Tests | see the run log (§12) — do not trust a number here, run `scripts/qc.ps1` |
-| Gates | **38/39 offline green** — 6 standing checks (G1, G2, G3, G3b, G3c, G3d) + **31** G4 + G6. The 39th is G5, which spends real quota. M11's G5 is `n/a` and *stated*, which is why M11's verdict is `offline-verified` rather than `done` |
+| Gates | **39/40 offline green** — 6 standing checks (G1, G2, G3, G3b, G3c, G3d) + **32** G4 + G6. The 40th is G5, which spends real quota. M11's G5 is `n/a` and *stated*, which is why M11's verdict is `offline-verified` rather than `done` |
 | Milestones | **M0–M11 built.** M9, M10 and M11 are `offline-verified` (no Claude credential / no API key / no live turn that could call a tool); every other milestone is `done`. Each has a run-log row in `ACCEPTANCE.md` §12 |
-| Next | `ACCEPTANCE.md` §14's **S1–S22** — S2 is the cheapest remaining panic, S15 and S17 batch, and **S19 + S21 are one follow-up**. Then the release, which needs the user's version decision |
+| Next | `ACCEPTANCE.md` §14's remaining **S-items** — **S2 is closed** (it was an I6 hole, not a papercut); next are S15 + S17, and **S19 + S21 are one follow-up**. Then the release, which needs the user's version decision |
 
 **Delegation works again; `advisor` does not.** The `402 Insufficient Balance` reported at the end of
 the previous session has cleared — the `Agent` tool and the `agy-agent` skill both answer — but
@@ -182,14 +182,15 @@ the reason is a missing credential rather than unfinished work:
 
 ### The open work, in the order I would pick it up
 
-1. **`ACCEPTANCE.md` §14's S1–S22.** S2 is the cheapest remaining panic: `println!`/`print!` panic on
-   a write failure, so `pie -p … | head -1` exits 101. It is 78 sites across 15 files and the fix is
-   one `out::` helper plus a **process-level** test — spawn the real binary, close the read end of
-   its stdout *before* it writes, and assert exit 0 rather than 101. Closing early rather than
-   overfilling the pipe is what makes that test cheap and deterministic. S15 and S17 batch well.
-   **S19 and S21 are one follow-up**: both want the same change — `ToolSet` carrying resolved
-   context (the ceiling, the composed scrub list) — so do them together rather than as the two
-   separate patches each describes.
+1. **`ACCEPTANCE.md` §14's remaining S-items. S2 is done** — `println!`/`print!`/`eprintln!` are gone from
+   every production path (78 sites, routed through `src/out.rs`) and `tests/output.rs` guards it
+   statically *and* against the real binary, with a paired control. What matters next, in order:
+   **S15 + S17** batch well (S15 is three signature widenings in one function, `render_report`; S17
+   is the fused-flag-table duplication), and **S19 + S21 are one follow-up** — both want the same
+   change, `ToolSet` carrying resolved context (the ceiling, the composed scrub list), so do them
+   together rather than as the two separate patches each describes. The rest of the table is
+   explicitly *not* a to-do list: several rows say the current behaviour is correct and to revisit
+   only if something gets large.
 2. **The release**: promote `[Unreleased]`, choose the version, and tag **in the same commit**
    (`VERSIONING.md`). `Cargo.toml` is still `0.1.0` after eleven `feat:` milestones and `git tag` is
    still empty, so the first tag is a deliberate choice rather than an arithmetic one: `0.1.0`
