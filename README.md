@@ -58,12 +58,12 @@ and §14 records the open items (S1–S22) as decisions rather than oversights.
 cargo build --release
 ```
 
-> **There are two different `pie`s on this machine, and `pie` on `PATH` is the other
-> one** — a separate workspace at `C:\Users\amiru\pie` (crate `pie-cli`, installed
-> Oct 10) that has no `tui` subcommand. `pie tui` will therefore fail with
-> `unrecognized subcommand 'tui'`. Run this build by path, or see §0 of the
-> **[user guide](docs/USER-GUIDE.md)** — which also covers the fact that both projects
-> share `~/.pie`, including the `auth.json` this project must never touch.
+> **`pie` on `PATH` is this build** — `cargo install --path .` from this checkout. A bare
+> `pie` prints help on purpose; the TUI is `pie tui`. **Re-run that install after changing
+> the code**, or `pie` and `.\target\release\pie.exe` will drift apart and you will be
+> debugging a stale binary. See §0 of the **[user guide](docs/USER-GUIDE.md)**, which also
+> covers what `~/.pie` still holds from an earlier project that has since been removed —
+> including the `auth.json` this project must never touch (I11).
 
 ```powershell
 # With this checkout's binary:

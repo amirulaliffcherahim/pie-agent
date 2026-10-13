@@ -14,86 +14,61 @@ cargo build --release
 
 ---
 
-## 0. Read this first: there are two different `pie`s on this machine
-
-This is the single most confusing thing about using `pie` here, and it is what stops
-`pie tui` from working.
-
-| | This project | The other one |
-|---|---|---|
-| Source | `C:\Users\amiru\Local\Code\pie` | `C:\Users\amiru\pie` |
-| Crate | `pie` (single crate) | `pie-cli` (10-crate workspace) |
-| On `PATH`? | **no** | **yes** — `~\.cargo\bin\pie.exe` |
-| Installed | never | Oct 10, by `cargo install --path ~/pie/crates/pie-cli` |
-| Has `tui`? | **yes** | **no** |
-| Has `chat`, `login`? | no | yes |
-| Version-controlled? | yes (git) | **no** — not a git repo |
-
-So **a bare `pie` in PowerShell runs the other project.** That is why there is no TUI:
-that binary has no `tui` subcommand at all.
-
-### Tell them apart in one command
+## 0. `pie` on `PATH` is this build
 
 ```powershell
-pie tui --help
+cd C:\Users\amiru\Local\Code\pie
+cargo install --path .
 ```
 
-```
-error: unrecognized subcommand 'tui'     ← you are on the OTHER pie
-```
+`pie` now resolves to `C:\Users\amiru\.cargo\bin\pie.exe`, installed from **this**
+checkout. **Re-run that after changing the code.** `cargo build` updates
+`target\release\` but not the installed copy, so `pie` and `.\target\release\pie.exe`
+can drift apart — and a stale `pie` is how you end up debugging the wrong binary.
+
+Check which one you have:
 
 ```powershell
 pie --help
 ```
 
-The other one lists `chat`, `models`, `doctor`, `auth`, `agy`, `usage`, `login`.
-This one lists `models`, `auth`, `usage`, `doctor`, `profile`, `sessions`, `tui`,
+The right one lists `models`, `auth`, `usage`, `doctor`, `profile`, `sessions`, `tui`,
 `learn`, `memory`, `schedule`, `watch`, `ocr`, `mcp`.
 
-### Run this project's pie
+### There used to be a second `pie`, and it is gone
 
-Always works, no `PATH` changes:
+Until 2026-10-13 this machine also had a separate project at `C:\Users\amiru\pie` (crate
+`pie-cli`), installed over the same binary name. Its command surface was different — it had
+`chat`, `login`, and an `agy` subcommand that called the vendor API directly — and it had
+**no `tui` at all**, which is why `pie tui` answered
+`error: unrecognized subcommand 'tui'`.
+
+That binary was uninstalled, its source directory deleted, and this build installed in its
+place. Two things follow:
+
+- **That project had no git history**, so its source is unrecoverable. The
+  reverse-engineered specifications it was built from survive at `~/rea/` (`codex-cli/`,
+  `agy-cli/`, `pie/`) — which is the better input anyway, because it is the evidence rather
+  than one interpretation of it.
+- If `pie tui` ever says `unrecognized subcommand 'tui'` again, you are running a different
+  or older binary. See §11.
+
+### `~/.pie` still holds leftovers from the removed tool
+
+- **`~/.pie/auth.json`** — that project's own OAuth token store. **This project must never
+  read, write, or recreate it** (invariant I11, enforced by
+  `tests/no_secrets.rs::the_legacy_auth_file_is_left_untouched`). If present it is left
+  byte-identical. It is dead data now that the tool is gone.
+- **`~/.pie/usage.jsonl`** — the row schema is shared, and the file still contains rows the
+  removed tool wrote, so `pie usage` totals can exceed the turns *this* tool took.
+- **`~/.pie/config.toml`** — does not exist yet; §10 is the reference for the keys this
+  project understands.
+
+To keep this build's state entirely separate from anything left behind:
 
 ```powershell
-C:\Users\amiru\Local\Code\pie\target\release\pie.exe tui
-C:\Users\amiru\Local\Code\pie\target\release\pie.exe --list-backends
+$env:PIE_HOME = "C:\Users\amiru\.pie-local"
 ```
-
-Or put a shortcut in your PowerShell profile (`$PROFILE`):
-
-```powershell
-function pie2 { & 'C:\Users\amiru\Local\Code\pie\target\release\pie.exe' @args }
-```
-
-### Two cautions about making it the real `pie`
-
-**`cargo install --path .` will overwrite the other project's binary.** Both install a
-binary named `pie.exe`, so a plain install clobbers it. If you want this one on `PATH`
-without that, use a separate root and put it *before* `~\.cargo\bin`:
-
-```powershell
-cargo install --path . --root .\.install
-# then prepend C:\Users\amiru\Local\Code\pie\.install\bin to PATH
-```
-
-**Both projects share `~\.pie` as their home directory, and they disagree about it.**
-
-- The other project keeps OAuth tokens in `~\.pie\auth.json` (`crates/pie-auth`).
-  **This project must never read, write or recreate that file** — invariant I11, with
-  tests (`tests/no_secrets.rs`). If it is present it is left byte-identical.
-- `~\.pie\usage.jsonl` is shared. The row schema is the frozen one this project also
-  writes, so `pie usage` totals in *either* tool can include rows the other one wrote.
-- Both read `~\.pie\config.toml`, with **overlapping but incompatible** table layouts.
-  The other project uses `[deepseek]`, `[codex] base_url/originator`, `[agy] binary/models`;
-  this one uses `[general]`, `[agy] bin/...`, `[codex] bin/quota_probe`, `[jobs]`, `[tools]`.
-  There is no `config.toml` right now, which is why nothing has broken yet. **Write this
-  project's config to a copy and point `PIE_HOME` at it if you want to be safe:**
-
-  ```powershell
-  $env:PIE_HOME = "C:\Users\amiru\.pie-local"
-  ```
-
----
 
 ## 1. Bare `pie` prints help, on purpose
 
@@ -366,12 +341,12 @@ scrub — it warns on stderr, loudly, because it is a debugging switch for a *ve
 
 | Symptom | Cause and fix |
 |---|---|
-| `pie tui` → `unrecognized subcommand 'tui'` | You are running `~/pie`'s binary, not this repo's. Use the full path — §0. |
+| `pie tui` → `unrecognized subcommand 'tui'` | `pie` is a different or stale binary. Re-run `cargo install --path .` from this checkout — §0. |
 | Bare `pie` prints help, no TUI | By design. The TUI is `pie tui`. |
 | `pie tui` → `needs a terminal on stdin and on stdout, but neither stdin nor stdout is a terminal` | You piped it, or it is running under a captured stdout. Use a real terminal, or use `pie -p <PROMPT>` for a single turn. |
 | `claude` shows `no-subscription` | True: there is no claude credential on this machine. No live claude turn is possible. |
 | `pie -p` says the turn path is not implemented | The backend cannot accept an injected tool result, or has no credential — see the row above. |
-| Totals in `pie usage` look bigger than your turns | `~/.pie/usage.jsonl` is shared with the other `pie`. See §0. |
+| Totals in `pie usage` look bigger than your turns | `~/.pie/usage.jsonl` still holds rows written by an earlier, now-removed `pie`. See §0. |
 | A `/usage` probe from git-bash returns nonsense | Set `MSYS_NO_PATHCONV=1`; git-bash rewrites a leading-slash argument into a Windows path (bug B10). |
 | `PIE_STRIP_ENV is set` warning | Something in your environment set it; API-key vars are **not** being stripped from children. Unset it. |
 | A tool call is refused | The message names the config key. `tools.workspace` absent means no tools at all. |
