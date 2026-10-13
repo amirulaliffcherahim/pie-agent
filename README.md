@@ -38,16 +38,19 @@ Three invariants are enforced by tests, not by good intentions
 
 ## Status
 
-| Milestone | Scope | State |
-|---|---|---|
-| **M0** | scaffold, `Provider` contract, process layer, argv contracts for all three CLIs | **done** — see `planning/ACCEPTANCE.md` §8 |
-| **M1** | agy backend: stream parsing, model catalog, quota probe | in progress |
-| **M2** | codex backend: stream parsing, model catalog, quota probe | in progress |
-| M3–M10 | profile/memory, unified auth+usage, agent loop, TUI, learn, watchtower, claude, HTTP backends | not started |
+**M0–M11 are built.** `scripts/qc.ps1` is the only current number — it reports
+**39/40 gates green** offline, with the 40th being G5, which spends real subscription
+quota. Every count repeated in a document is a snapshot at the commit that recorded it.
 
-Until M1 and M2 land, `pie --list-backends`, `pie auth`, `pie usage` and
-`pie doctor` work and spend no quota; `pie -p …` reports that the backend's turn
-path is not implemented yet rather than pretending otherwise.
+| Milestone | Scope | Verdict |
+|---|---|---|
+| **M0–M8** | scaffold, the three CLI backends, profile/memory, auth+usage, sessions, TUI, learn, watchtower | **done** — every applicable gate, live ones included |
+| **M9** | claude `stream-json` adapter + the `tool_use`→`tool_result` loop | **offline-verified** — no claude credential on this machine |
+| **M10** | OpenRouter / DeepSeek API-key backends | **offline-verified** — no API key configured, and a live turn spends real credit |
+| **M11** | the tool suite: read-only tier, scoped `bash`, one spawn policy | **offline-verified** — the tools need no vendor, but the end-to-end turn does |
+
+`ACCEPTANCE.md` §12 is the run log behind those verdicts, §13 is the bug log (B1–B41),
+and §14 records the open items (S1–S22) as decisions rather than oversights.
 
 ## Build and run
 
@@ -55,20 +58,23 @@ path is not implemented yet rather than pretending otherwise.
 cargo build --release
 ```
 
-```sh
-# What is installed, and is it logged in?
-pie --list-backends
-pie auth
-pie doctor          # adds versions, local paths, and the env scrub in effect
+> **There are two different `pie`s on this machine, and `pie` on `PATH` is the other
+> one** — a separate workspace at `C:\Users\amiru\pie` (crate `pie-cli`, installed
+> Oct 10) that has no `tui` subcommand. `pie tui` will therefore fail with
+> `unrecognized subcommand 'tui'`. Run this build by path, or see §0 of the
+> **[user guide](docs/USER-GUIDE.md)** — which also covers the fact that both projects
+> share `~/.pie`, including the `auth.json` this project must never touch.
 
-# Models and quota (neither spends model tokens)
-pie models
-pie usage agy
-
-# One delegate turn
-pie -p --model agy/gemini-3.8-flash "summarise this repo"
-pie -p --model codex/gpt-6-luna --json "list the TODOs"
+```powershell
+# With this checkout's binary:
+.\target\release\pie.exe tui
+.\target\release\pie.exe --list-backends
 ```
+
+A bare `pie` **prints help on purpose**; the TUI is opt-in as `pie tui`, so no script or
+CI job can enter it by accident. See **[docs/USER-GUIDE.md](docs/USER-GUIDE.md)** for
+the task-by-task guide (sessions, learning, the watchtower, the M11 tools, config
+reference, troubleshooting).
 
 `-p/--print` hands the whole task to the vendor CLI, which runs its own tools and
 returns a final answer. That is **delegate mode**, and it is the only mode these
