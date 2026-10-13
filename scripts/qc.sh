@@ -279,6 +279,7 @@ run_gate 'G4 acceptance (M10 http transport)' cargo test --test http_transport
 # M11's G5 is `n/a`, stated rather than skipped: no backend that uses pie's loop has a
 # working credential here. The tools need no vendor at all, so the substance is offline.
 run_gate 'G4 acceptance (M11 read-only tools)' cargo test --test tools
+run_gate 'G4 acceptance (M11 bash, scoped)' cargo test --test tools_bash
 
 # --- G4 (M6 tui non-TTY) ----------------------------------------------------
 # ACCEPTANCE section 9: `pie tui` on a non-TTY stdin must fail with a clear message

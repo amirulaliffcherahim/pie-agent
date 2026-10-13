@@ -303,6 +303,7 @@ Invoke-Gate -Label 'G4 acceptance (M10 http transport)' -Argv @('test', '--test'
 # are: no backend that uses pie's loop has a working credential here. The tools need no
 # vendor at all, so the substance is offline; only the end-to-end turn is not.
 Invoke-Gate -Label 'G4 acceptance (M11 read-only tools)' -Argv @('test', '--test', 'tools')
+Invoke-Gate -Label 'G4 acceptance (M11 bash, scoped)' -Argv @('test', '--test', 'tools_bash')
 
 # --- G4 (M6 tui non-TTY) ----------------------------------------------------
 # ACCEPTANCE section 9: `pie tui` on a non-TTY stdin must fail with a clear message
