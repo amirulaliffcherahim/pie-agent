@@ -426,6 +426,11 @@ says so rather than implying coverage it does not have.
 
 ## 9. M6 — interactive TUI
 
+> **Superseded for the surface by §20 (M12).** The criteria below describe M6's minimal TUI and
+> its opt-in default (`pie tui`, with a bare `pie` printing help). M12 replaced the surface and
+> reversed that default. **The testability criteria below remain in force** — the pure reducer,
+> the `TestBackend` renderer and the thin loop are what M12 extended.
+
 Contract: `DESIGN.md` §12. Done condition from `ROADMAP.md`: *"interactive parity across
 agy + codex"*.
 
@@ -989,3 +994,56 @@ would render as "nothing left". DeepSeek still reports no bucket, which is the h
 there rather than an invented one. The mapping is **pure** (`models_from_catalog`,
 `credit_bucket`) so the shapes are tested without a network; the transport's own tests cover
 the HTTP half.
+
+## 20. M12 — the TUI shell and the `/` palette
+
+Contract: `DESIGN.md` §21. **This section supersedes §9's surface, keymap and lifecycle
+tables**, which describe M6's minimal TUI and its opt-in default. §9's testability design —
+pure reducer, `TestBackend` renderer, a thin terminal loop — is unchanged and is what M12
+extends rather than replaces.
+
+### The constraint that shapes every criterion
+
+**Bare `pie` opens the TUI only when stdin and stdout are both terminals.** M6's guarantee was
+"the TUI is not the default, so nothing enters it by accident"; M12's is "it requires a
+terminal on both streams, so nothing without one enters it by accident". The second is weaker
+*unless it is asserted*, so the pipe half is a gate rather than an assumption.
+
+### Acceptance, per stage
+
+Four stages, one test binary each. A stage gate that runs another stage's tests is
+decorative — that happened twice in M5 — so each row below names the binary that exists for
+that stage alone.
+
+| Stage | Command | Shape |
+|---|---|---|
+| **A the palette** | `cargo test --test tui_palette` | the const registry itself: every row is reachable and produces its handler through `reduce`; typing filters by prefix and the argument hint is displayed but never matched; Up/Down clamp rather than wrap; Esc closes and leaves the prompt untouched; an unknown command is answered naming what exists and starts **no turn**; `/memory` arrives through the registry, not through a special case beside it |
+| **B the shell** | `cargo test --test tui_render` | the layout, asserted in a `TestBackend` buffer: the composer is fixed at the bottom while the transcript scrolls (the same `App` rendered twice at two scroll offsets and two terminals sizes); the composer border reflects each `Status`; the footer names folder, session, model, usage and cost; a tool block renders collapsed with its name, state and duration, and expanded after `Ctrl+O`; truncation is **stated in the block**; the palette draws above the composer; and none of it panics at a narrow, a tiny or a very tall terminal |
+| **C the default** | `cargo test --test tui_default` | bare `pie` **on a pipe** prints help to stdout, exits 0, and its stdout contains **no `ESC` byte**; and the decision to enter the TUI is a **pure function** asserted in both directions, because the terminal branch itself cannot be exercised without a pty |
+| **D `/tools`** | `cargo test --test tui_tools` | `list` reads the **resolved** `Tools` and reports enabled / disabled / declared-but-unbuilt; `run read {"file_path":…}` works against the same fixture workspace M11's tier uses; `run bash` with no workspace is refused **naming `tools.workspace`**; `run write` is refused as declared-but-unbuilt; and a `run` spawns **no vendor CLI** and writes no session row |
+| G5 | **`n/a` — stated, with the reason** | the palette, the layout and `/tools` are all offline: `/tools run` exercises M11's tier directly, which is the point of it, so this milestone needs no vendor at all. The terminal loop remains non-automatable (§9), which is why it stays thin |
+
+**Checks**
+
+- [ ] **every registry row is a row and not a claim**: the test walks the table and asserts
+      each entry is reachable and dispatches through `reduce` — the B26 rule, which is the
+      only thing that ever caught a frozen table disagreeing with its implementation
+- [ ] the footer and the palette are **generated from** their tables, so a new command cannot
+      exist without appearing in both
+- [ ] `/watch` and `pie watch` reach **one** implementation — asserted, not assumed, because
+      a palette that re-implements its subcommands is a second place for behaviour to drift
+- [ ] a session that runs `/tools`, `/usage` and `/watch` leaves `config.toml`
+      **byte-identical**: §21.4's boundary is that the TUI reads state and runs tools, and
+      never makes the enable-a-tool decision on the user's behalf
+- [ ] `Ctrl+O` toggles exactly the focused block and leaves the others as they were
+- [ ] a transcript longer than the viewport scrolls rather than pushing the composer off the
+      bottom, at 24 rows and at 5
+- [ ] a multi-byte prompt and a wide character still neither panic the renderer nor lose a
+      marker — M6's B29 lesson applied to the new layout
+
+**Not verifiable here**, stated rather than glossed: the terminal loop itself (M6's gap,
+unchanged — only crossterm setup, a select loop and teardown), and the *terminal* branch of
+the new default, because this machine has no pty to allocate. The pipe branch is asserted
+end-to-end against the real binary, and the branch decision is a pure function asserted in
+both directions; the two together are the strongest available evidence, and they are not the
+same evidence as typing into a real terminal.

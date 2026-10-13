@@ -561,6 +561,15 @@ that is incomplete rather than at the end: **A** persistence · **B**
 
 ## 12. Interactive TUI (M6)
 
+> **Superseded for the surface by §21 (M12).** The layout, keymap, lifecycle and default that
+> this section's tables describe were replaced in M12: bare `pie` now opens the TUI when both
+> streams are terminals, the keymap gained the palette rows, and the surface became a shell
+> with a fixed composer, a footer and a `/` palette.
+>
+> **The testability design in the next subsection is NOT superseded** — it is the reason M12
+> extended this code instead of rewriting it. Read §21 for anything about what the TUI looks
+> like, which key does what, or what the `/` palette covers.
+
 Roadmap: *model picker, streaming output, keybindings*; Done: *interactive parity across
 agy + codex*. New dependencies, the first since M0: `ratatui 0.29` + `crossterm 0.29`,
 both verified to leave the G6 cross-target check clean.
@@ -1448,4 +1457,158 @@ leave the model waiting for a result that never comes, which is a conversation t
 finishes. The message is written for a *model* to read, because that is the reader, and it
 should let the model proceed with what it has rather than retry the same call.
 
+## 21. The TUI shell and the `/` palette (M12)
 
+M6 built a working TUI with a deliberately minimal surface, and made it **opt-in**: a bare
+`pie` printed help, so no test and no CI job could enter a full-screen UI by accident. M12
+redesigns the surface — layout, a `/` command palette, and tool-call rendering — and changes
+that default.
+
+**This section supersedes §12's surface, keymap and lifecycle tables. §12's testability
+design still stands, and is the reason M12 is a redesign rather than a rewrite**: the reducer
+stays pure (no crossterm type ever reaches it), the renderer stays assertable through
+`TestBackend`, and only the terminal loop stays non-automatable. Keeping that seam is what
+carries M6's 3,737 lines of tests forward instead of discarding them.
+
+### 21.1 The default reverses, and the safety property moves
+
+Bare `pie` now opens the TUI **when stdin and stdout are both terminals**, and prints help
+otherwise.
+
+The old guarantee was *"the TUI is not the default, so nothing can enter it by accident"*.
+The new one is *"**it requires a terminal on both streams**, so nothing without one can enter
+it by accident"*. Same outcome, different mechanism — and the mechanism must be asserted
+rather than assumed, because it is now the only thing standing between a CI job and a
+full-screen UI. `G4` therefore gains a check that **bare `pie` on a pipe prints help, exits
+0, and emits no escape codes**, and that is the load-bearing half; the terminal branch is
+covered by a pure decision function asserted in both directions.
+
+Two facts make this safe rather than merely convenient: `pie -p`, `--json` and every
+subcommand are unchanged, so no existing script changes meaning; and a process without a
+terminal cannot reach the TUI at all, which is what a CI runner is.
+
+### 21.2 Layout
+
+```
+┌─ transcript (scrolls) ─────────────────────────────────────┐
+│  user prompt                                              │
+│  assistant text (streams live for agy and claude)          │
+│  ▸ tool: read  ok  120ms              <- collapsed         │
+│  ▾ tool: bash  error  3.1s            <- expanded (C-o)    │
+└───────────────────────────────────────────────────────────┘
+  /  palette (overlay, above the composer)
+┌─ composer ──────────────────────────[border = status]─────┐
+│ > the prompt, multi-line, cursor                          │
+└───────────────────────────────────────────────────────────┘
+ folder · session · model · tokens · cost · status
+```
+
+Each of these is a claim a test pins:
+
+- **The composer is fixed at the bottom and the transcript scrolls above it.** pi's
+  documented fullscreen behaviour is the model: *"keeps the editor and status area fixed
+  while the transcript scrolls"*.
+- **The composer's border carries status.** pi uses that border for the thinking level; pie
+  uses it for `Status` (`Idle`/`Running`/`Done`/`Failed`), which already exists as a type
+  with a lifecycle that B26 was about.
+- **The footer shows folder, session, model, last usage and cost.** Every field is already
+  owned by pie (`paths`, `Session`, `App::last_usage`), so this is presentation, not new
+  state.
+- **The palette renders above the composer**, the position agy puts its `/model` argument
+  dropdown and its announcements in.
+
+### 21.3 The palette is a table, not a match arm
+
+One **const registry** row per command, each carrying the name, an argument hint, a one-line
+description and the handler. The menu, the prefix filter, the completion, the help footer and
+the tests all read that one table.
+
+That is the same rule §12 already applies to the keymap, and for the same recorded reason:
+**B26 was a frozen table and its implementation disagreeing**, and the only thing that caught
+it was reading every row against the behaviour. A second list of command names, anywhere,
+would be the same defect waiting.
+
+| Behaviour | Rule |
+|---|---|
+| Open | `/` at the prompt opens it |
+| Filter | typing filters by **prefix on the name**; the argument hint is displayed, never matched |
+| Select | Up/Down move the highlight, and **clamp rather than wrap** — a wrap hides that you have reached the end |
+| Run | Enter runs the highlighted command |
+| Close | Esc closes it and **leaves the prompt text alone** |
+| Unknown | `/nosuchthing` is answered with a sentence naming what does exist, and starts no turn |
+
+**One dispatch serves both front-ends.** `/watch` and `pie watch` must not be two
+implementations: the registry's handler calls the same function the subcommand calls.
+
+**M7's ad-hoc `/memory` branch is absorbed, not kept.** `/memory` becomes a registry row, and
+the test that asserts the TUI routes slash commands through `submit` and never through a new
+key is **rewritten to assert registry dispatch** rather than a special case — otherwise the
+registry would be a second path beside a hidden one.
+
+### 21.4 `/tools` — the reason the palette is worth building
+
+`/tools [list|run]`:
+
+- **`list`** prints every answered tool with its *effective* state — enabled, disabled, or
+  declared-but-unbuilt — read from the resolved `Tools`, never from this document.
+- **`run <name> <json-args>`** invokes one tool **directly, with no model turn**.
+
+The second half is why this is a milestone feature rather than a nicety. M11's tools are
+reachable end-to-end only through a backend with a working loop, and only the API-key
+backends have one — so on a machine with no key the tool tier is otherwise exercisable by the
+test suite alone, which is what M11's `offline-verified` verdict records. A human typing
+`/tools run read {"file_path":"Cargo.toml"}` is the missing interactive path, and it spends no
+quota.
+
+**Enabling stays in `config.toml`.** `/tools` reads state and runs tools; it does **not** write
+configuration. `DESIGN.md` §20's rule is that the decision to offer a tool is made once, by a
+human who is not under time pressure; a TUI that could rewrite that file mid-session would be
+making the decision repeatedly, which is the shape §20 exists to prevent. This is a
+deliberate boundary, not an unfinished feature.
+
+### 21.5 Tool calls as rendered
+
+- One block per call: `name`, state (`running` / `ok` / `error`), duration, and output.
+- **Collapsed by default; `Ctrl+O` toggles the focused block.** pi's rule: *"keep the default
+  view compact and reveal detail through expansion"*.
+- **Truncation is stated in the block, never silent** — the rule I5 and B22 already apply to
+  every other stream in this project.
+- The data is what pie already has: agy's `step_update` carries `tool_name`, `tool_info`,
+  `state` and `duration_seconds`; M11's `ToolResult` carries the loop's output and error flag;
+  and agy's `text_delta` plus claude's SDK stream already arrive live.
+
+### 21.6 What M12 does not build, and why
+
+pie drives one-shot vendor CLIs, so it cannot render what its architecture never receives.
+These are out **deliberately**, and each is out because of a missing capability rather than a
+missing afternoon:
+
+| Not built | Why |
+|---|---|
+| Live tool output while a command runs | `codex exec` and `agy --print` are one-shot, so there is no incremental tool stream to render. agy's `step_update` gives step-level progress, which is what the block shows |
+| Approval prompts that resume a vendor process | there is no user in the loop mid-turn (§20), and no protocol to answer one |
+| `/tree`, `/fork`, `/clone` | the conversation graph belongs to the vendor; pie holds a linear transcript |
+| diff / artifact viewers, subagent trees, plan panels | each needs the vendor's internal tool loop, which delegate mode does not expose |
+| Vim modal editing, custom status-line scripts | surface for its own sake, and neither is a pie capability |
+
+**pi's `Ctrl+C` and `Ctrl+D` semantics are deliberately not adopted.** pi's `Ctrl+C` clears
+then exits and `Ctrl+D` exits; agy's `Ctrl+C` interrupts-or-exits and `Ctrl+D` is
+half-page-down; pie's `Ctrl+C` quits from every state, which is pinned by tests. `Esc` and
+`Ctrl+C` are the two keys a user's fingers know without reading anything, and changing them
+to match another tool is a regression in muscle memory for no capability gained. pi's
+`Ctrl+O` (tool output), `Ctrl+L` (model selector) and `Shift+Tab` (thinking level) are adopted
+where pie has the corresponding state: `Ctrl+O` is new here, `Ctrl+L` becomes an alias of the
+existing picker key, and pie has no thinking level to cycle.
+
+### 21.7 CLI surface
+
+| Invocation | Behaviour |
+|---|---|
+| `pie` on a terminal | the TUI |
+| `pie` on a pipe | help, exit 0, no escape codes |
+| `pie tui` | always the TUI; refuses without a terminal on both streams, message unchanged |
+| everything else | unchanged |
+
+No new flags. pi's `--tui-mode` and codex's `/raw` both exist to solve problems pie does not
+have yet (an inline mode, and a scrollback the vendor owns); adding one now would be surface
+without a use, which is what §21.6 declines for five other features.

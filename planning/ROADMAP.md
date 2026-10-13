@@ -97,6 +97,36 @@ contract (`DESIGN.md` §20, `ACCEPTANCE.md` §19) **before** any code, like ever
   backend with a working loop has a credential here — which is why the verdict is
   `offline-verified` and not `done`.
 
+## M12 — the TUI shell and the `/` palette
+
+M6 shipped a working but deliberately minimal TUI, opt-in so no script or CI job could enter
+it by accident. M12 makes the TUI the default interface and redesigns its surface, following
+how `agy`, `codex` and `pi` look and are operated: a fixed composer with a scrolling
+transcript, a footer carrying folder/session/model/usage/cost, tool calls as collapsed
+blocks, and a `/` command palette.
+
+It is a **surface** change, not a rewrite: the reducer stays pure (no crossterm type reaches
+it), the renderer stays assertable through `TestBackend`, and only the terminal loop stays
+non-automatable. Keeping that seam is what carries M6's tests forward.
+
+- Bare `pie` opens the TUI **when stdin and stdout are both terminals**, and prints help
+  otherwise. M6's guarantee moves from "the TUI is not the default" to "it requires a
+  terminal on both streams" — and the pipe half becomes a gate, because it is now the only
+  thing between a CI job and a full-screen UI.
+- The `/` palette is a **const registry**, one row per command, and the menu, the filter, the
+  completion, the footer and the tests all read that one table (the B26 rule).
+- `/tools [list|run]` reports each answered tool's **effective** state and runs one
+  **directly, with no model turn** — which is the only interactive path to M11's tier on a
+  machine whose loop-capable backends have no credential.
+- Enabling a tool stays in `config.toml`. A TUI that rewrote it would be making the
+  enable-a-tool decision repeatedly, which §20 exists to prevent.
+- **Out deliberately**, because pie's architecture never receives the data: live tool output
+  while a command runs, approval prompts, `/tree`/`/fork`/`/clone`, diff and artifact
+  viewers, subagent trees, Vim mode, custom status-line scripts.
+- **Done:** `pie` with no arguments on a terminal shows the transcript, composer, footer and
+  `/` palette; `/tools run read {"file_path":"Cargo.toml"}` returns the file with no model
+  turn and no quota; `pie` on a pipe prints help and exits 0.
+
 ## Cross-cutting gates (green every milestone)
 - No console popups; latency logged; `pie doctor` health; bounded prompt argv;
   version recorded for drift detection; subscription-only auth (no API keys);
