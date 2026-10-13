@@ -39,6 +39,7 @@ pub mod schedule;
 pub mod session;
 pub mod session_log;
 pub mod tool_loop;
+pub mod tools;
 pub mod tui;
 pub mod watch;
 

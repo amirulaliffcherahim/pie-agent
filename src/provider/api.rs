@@ -20,13 +20,14 @@
 //! parts are data ([`Vendor`]), and the deviation is recorded here rather than taken
 //! silently.
 //!
-//! ## No tools ship with pie, and that is not an oversight
+//! ## The tools come from config, and by default there are none
 //!
-//! [`NoTools`] answers every call with an error result. M9 froze that scope decision: the
-//! loop is the loop, and a concrete tool suite — what a `bash` tool may do unattended — is
-//! a separate concern with its own questions. Answering with an *error* rather than not
-//! answering is what keeps the loop from leaving a model waiting for a result that will
-//! never come.
+//! [`crate::tools::ToolSet`] answers every call. With the default configuration — no
+//! `tools.workspace` — every call is answered with a refusal, which is exactly what M9's
+//! no-tools stand-in did, so M11 changed the author of the answer rather than its shape.
+//! Answering with an *error* rather than not answering is what keeps the loop from leaving
+//! a model waiting for a result that will never come. Enabling a tier is a decision made
+//! in `config.toml`, because the loop has no user in it (`DESIGN.md` §20).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -38,7 +39,8 @@ use crate::provider::http::{self, live_client, HttpSpec, HttpTransport};
 use crate::provider::{
     AuthState, Capabilities, ChatRequest, Model, Provider, StreamEvent, TurnOutcome, UsageReport,
 };
-use crate::tool_loop::{run_loop, ToolCall, ToolResult, ToolRunner};
+use crate::tool_loop::run_loop;
+use crate::tools::ToolSet;
 
 /// How long one read may stall before the turn fails rather than hangs.
 ///
@@ -134,27 +136,12 @@ pub const DEEPSEEK: Vendor = Vendor {
 #[derive(Debug, Clone, Copy)]
 pub struct ApiBackend(pub Vendor);
 
-/// Answers every tool call with a stated error.
+/// Answers every tool call with the suite the configuration enables.
 ///
-/// pie ships no tools (M9's scope decision), and the important half is that it **answers**:
-/// a loop that silently ignored a call would leave the model waiting for a result that
-/// never comes, which is a conversation that never finishes rather than a missing feature.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct NoTools;
-
-impl ToolRunner for NoTools {
-    fn run(&self, call: &ToolCall) -> ToolResult {
-        ToolResult {
-            id: call.id.clone(),
-            output: format!(
-                "pie has no tools configured, so `{}` was not run. M9 builds the loop; the \
-                 tool suite (read/bash/edit/write/grep/find/ls) is a separate milestone.",
-                call.name
-            ),
-            is_error: true,
-        }
-    }
-}
+/// With the default configuration that is a refusal for every tool — see
+/// [`crate::tools::ToolSet`]. Replaced M9's `NoTools` stand-in: the refusal moved from
+/// "pie ships no tools" to "this configuration enables no tool", which is the same
+/// behaviour with a reason a model can act on.
 
 #[async_trait]
 impl Provider for ApiBackend {
@@ -216,7 +203,7 @@ impl Provider for ApiBackend {
 
     async fn stream(
         &self,
-        _cfg: &crate::config::Config,
+        cfg: &crate::config::Config,
         req: &ChatRequest,
         sink: &mut (dyn FnMut(StreamEvent) + Send),
     ) -> Result<TurnOutcome> {
@@ -266,7 +253,11 @@ impl Provider for ApiBackend {
         // the same operation and the transport owns the distinction.
         transport.start()?;
 
-        let outcome = run_loop(&mut transport, &NoTools, MAX_TOOL_ROUNDS, sink)?;
+        // Built once per turn from the resolved configuration. With no `tools.workspace`
+        // this refuses every call, so a setup that had no tools before the upgrade still
+        // has none after it (`DESIGN.md` §20).
+        let tools = ToolSet::new(cfg.tools.clone());
+        let outcome = run_loop(&mut transport, &tools, MAX_TOOL_ROUNDS, sink)?;
 
         Ok(TurnOutcome {
             text: outcome.text,

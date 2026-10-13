@@ -3,7 +3,7 @@
 //! Precedence, highest first (`planning/DESIGN.md` §8):
 //! CLI flag → `PIE_*` env → `config.toml` → built-in default.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -41,6 +41,9 @@ pub struct Config {
     pub claude: Claude,
     /// Background-job settings (M7/M8). Opt-in: nothing runs by default.
     pub jobs: Jobs,
+    /// The tool suite the loop may offer a model (M11). Opt-in, and off entirely by
+    /// default — see [`Tools`].
+    pub tools: Tools,
 }
 
 /// Settings that are not backend-specific.
@@ -266,6 +269,95 @@ pub struct Jobs {
     /// opaque — it exposes a projection, not fields — and inventing a persona key to
     /// feed a ranking would couple the persona to one consumer.
     pub watch_stack: Vec<String>,
+}
+
+/// The tool suite the loop may offer a model (M11, `DESIGN.md` §20).
+///
+/// **The default is no tools at all**, which is exactly the behaviour before M11 — so
+/// upgrading cannot turn an existing setup into one that executes commands. That is not a
+/// cosmetic default: an unbudgeted `bash` is a worse version of the risk `RISKS.md` §13
+/// names for an unbudgeted model call, and it must not arrive as a side effect of an
+/// upgrade.
+///
+/// The shape follows from one constraint rather than from taste. M9's loop runs between
+/// the model and pie with **no interactive channel**: `agy --print` and `codex exec` are
+/// one-shot, claude's SDK mode streams, and the TUI is not the only entry point. There is
+/// nowhere to ask "may I run this command?" mid-turn, so a tool design that assumed an
+/// approval prompt would work in one front-end and silently block in the others.
+/// Therefore a tool is **enabled in config with a declared scope, or it is not offered**.
+/// The decision is made once, by a human who is not under time pressure, instead of
+/// repeatedly by a loop that has no human in it.
+///
+/// Note what that rules out, because it is the tempting alternative: no per-call
+/// confirmation, no "ask the user", and **no timeout-then-proceed**. A tool that became
+/// available because a prompt went unanswered is a tool nobody approved.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Tools {
+    /// The ceiling for every tool: no path a tool resolves may leave it.
+    ///
+    /// **Absent means no tool is offered at all**, and that is the single enabling
+    /// decision. Without a root there is nothing to scope a read to, and the refusal a
+    /// model receives names this key.
+    ///
+    /// A ceiling rather than a default, and checked on the **resolved** path: `..` and a
+    /// symlink are the two ways a textual prefix check is wrong, so neither can be the
+    /// check (`ACCEPTANCE.md` §19).
+    pub workspace: Option<PathBuf>,
+    /// The read-only tier: `read`, `ls`, `grep`, `find`.
+    ///
+    /// Defaults to `true` because `DESIGN.md` §20's tier table says the tier is
+    /// *"enabled once a workspace root is configured"* — configuring
+    /// [`workspace`](Self::workspace) is the decision, and this key exists so a setup that
+    /// wants a workspace for a later tier can decline the read tier explicitly. With no
+    /// workspace it is inert.
+    pub read: bool,
+    /// `write` — declared by `DESIGN.md` §20's tier table, **not built by M11**.
+    ///
+    /// `ACCEPTANCE.md` §19 freezes three stages (read-only, `bash`, the spawn
+    /// unification) and gives this tier no criterion, so a call is answered with a stated
+    /// refusal naming this key rather than with an unknown tool. See the S-item recorded
+    /// against §19: it must not become a key that merely *looks* like it does something.
+    pub write: bool,
+    /// `edit` — declared by `DESIGN.md` §20's tier table, **not built by M11**. See
+    /// [`write`](Self::write).
+    pub edit: bool,
+    /// `bash`. Turning this on **is** the decision, so it is opt-in twice over.
+    pub bash: bool,
+    /// `argv[0]` allow-list for `bash`, checked **before** the spawn.
+    ///
+    /// An allow-list on the *executable* rather than on the whole command string is
+    /// deliberate: pattern-matching a shell line is the known-unreliable approach, and
+    /// claiming safety from it would be worse than admitting the boundary is "this
+    /// executable". A refused command is therefore a stated error rather than a
+    /// `PermissionDenied` a model has to interpret.
+    ///
+    /// Empty means `bash` refuses everything, which is the honest reading of "no command
+    /// is allowed" — not "all commands are allowed".
+    pub bash_allow: Vec<String>,
+    /// Deadline for one `bash` command, in seconds. A command that outlives it is
+    /// **killed**, not waited on (`RISKS.md` §6).
+    pub timeout_secs: u64,
+    /// Cap on the output one tool call may return.
+    ///
+    /// A command that prints forever must not fill memory — the reason `read_body` is
+    /// capped, and `B22`'s lesson applied to a new input.
+    pub max_output_bytes: usize,
+}
+
+impl Default for Tools {
+    fn default() -> Self {
+        Self {
+            workspace: None,
+            read: true,
+            write: false,
+            edit: false,
+            bash: false,
+            bash_allow: Vec::new(),
+            timeout_secs: 30,
+            max_output_bytes: 1 << 20,
+        }
+    }
 }
 
 /// Anthropic Claude Code CLI settings. Disabled: no subscription on this machine.
