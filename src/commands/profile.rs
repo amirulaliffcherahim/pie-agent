@@ -13,6 +13,7 @@
 //! never be invoked, and a static check that this file cannot spawn anything.
 
 use crate::error::Result;
+use crate::out::{errln, outln};
 use crate::profile::Profile;
 use crate::provider;
 use crate::provider::agy;
@@ -24,10 +25,10 @@ const LABEL_WIDTH: usize = 12;
 pub fn run() -> Result<()> {
     let profile = Profile::from_home()?;
 
-    println!("{:<LABEL_WIDTH$} {}", "home", profile.root().display());
+    outln!("{:<LABEL_WIDTH$} {}", "home", profile.root().display());
 
     if profile.is_empty() {
-        println!(
+        outln!(
             "{:<LABEL_WIDTH$} empty (no {}, {} or {}/ is configured)",
             "projection",
             crate::paths::PROFILE_FILE,
@@ -35,7 +36,7 @@ pub fn run() -> Result<()> {
             crate::paths::MEMORY_DIR
         );
     } else {
-        println!(
+        outln!(
             "{:<LABEL_WIDTH$} {} bytes from {} source(s)",
             "projection",
             profile.bytes(),
@@ -43,13 +44,13 @@ pub fn run() -> Result<()> {
         );
     }
 
-    println!();
-    println!("{:<LABEL_WIDTH$} {:>7}  SOURCE", "KIND", "BYTES");
+    outln!();
+    outln!("{:<LABEL_WIDTH$} {:>7}  SOURCE", "KIND", "BYTES");
     if profile.contributions().is_empty() {
-        println!("{:<LABEL_WIDTH$} {:>7}  -", "none", 0);
+        outln!("{:<LABEL_WIDTH$} {:>7}  -", "none", 0);
     }
     for contribution in profile.contributions() {
-        println!(
+        outln!(
             "{:<LABEL_WIDTH$} {:>7}  {}",
             contribution.kind.label(),
             contribution.bytes,
@@ -58,21 +59,21 @@ pub fn run() -> Result<()> {
     }
 
     // The mechanism is the other half of M3: the same bytes, three ways in.
-    println!();
-    println!("MECHANISM (DESIGN §10)");
+    outln!();
+    outln!("MECHANISM (DESIGN §10)");
     for backend in provider::registry() {
         let how = if backend.capabilities().system_prompt {
             "--append-system-prompt <projection>"
         } else {
             "folded before the prompt text"
         };
-        println!("{:<LABEL_WIDTH$} {how}", backend.id());
+        outln!("{:<LABEL_WIDTH$} {how}", backend.id());
     }
 
-    println!();
-    println!("--- projection ({} bytes) ---", profile.bytes());
+    outln!();
+    outln!("--- projection ({} bytes) ---", profile.bytes());
     if let Some(persona) = profile.persona() {
-        println!("{persona}");
+        outln!("{persona}");
     }
 
     // Reported here because this is the moment the user can act on it: on agy
@@ -82,7 +83,7 @@ pub fn run() -> Result<()> {
     // saying so is the only useful thing it can do. stderr, because stdout is
     // the report.
     if profile.bytes() > agy::PROMPT_ARGV_CAP {
-        eprintln!(
+        errln!(
             "pie: WARNING: the projection is {} bytes and agy's prompt argv cap is {} chars, so \
              no agy turn can fit it. Shorten `{}`/`{}`/`{}/`; pie never truncates a persona.",
             profile.bytes(),

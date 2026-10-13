@@ -36,6 +36,7 @@
 //! rebuild is the only place an outgoing prompt is rebuilt, which is the seam
 //! stage B left and stage C filled.
 
+use crate::out::{errln, outfrag, outln};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -96,7 +97,7 @@ pub async fn run(cfg: &Config, cli: &Cli, prompt: &str) -> Result<()> {
             .continuation()
             .map(|continuation| continuation.summary.provider.as_str())
             .unwrap_or_default();
-        eprintln!("{}", switch_notice(from, &backend, &rebuilt));
+        errln!("{}", switch_notice(from, &backend, &rebuilt));
     }
 
     let started = Instant::now();
@@ -146,9 +147,9 @@ pub async fn run(cfg: &Config, cli: &Cli, prompt: &str) -> Result<()> {
             if !cli.json {
                 if streamed.load(Ordering::Relaxed) {
                     // Deltas already reached stdout; just close the line.
-                    println!();
+                    outln!();
                 } else {
-                    println!("{}", turn.text);
+                    outln!("{}", turn.text);
                 }
             }
 
@@ -219,9 +220,9 @@ pub async fn run(cfg: &Config, cli: &Cli, prompt: &str) -> Result<()> {
 /// `[resume] <vendor-id>` is unchanged: it is the id a backend issued, and pie's
 /// own id is not one the vendor would accept.
 fn announce(session: &Session, vendor_id: Option<&str>) {
-    eprintln!("[session] {}", session.id());
+    errln!("[session] {}", session.id());
     if let Some(id) = vendor_id {
-        eprintln!("[resume] {id}");
+        errln!("[resume] {id}");
     }
 }
 
@@ -927,7 +928,7 @@ fn make_sink(
                 streamed.store(true, Ordering::Relaxed);
             }
             if let Some(line) = json_line(&event, &session_id) {
-                println!("{line}");
+                outln!("{line}");
             }
             return;
         }
@@ -936,11 +937,11 @@ fn make_sink(
             StreamEvent::TextDelta(text) => {
                 use std::io::Write;
                 streamed.store(true, Ordering::Relaxed);
-                print!("{text}");
+                outfrag!("{text}");
                 let _ = std::io::stdout().flush();
             }
             StreamEvent::ToolStep { name, state, .. } => {
-                eprintln!("[tool] {name} {state:?}");
+                errln!("[tool] {name} {state:?}");
             }
             // Init and Usage are folded into the outcome; Done would duplicate
             // the text we have already streamed.

@@ -8,6 +8,7 @@
 
 use crate::config::Config;
 use crate::error::Result;
+use crate::out::outln;
 use crate::provider;
 
 const ID_WIDTH: usize = 9;
@@ -15,11 +16,11 @@ const AUTH_WIDTH: usize = 15;
 
 /// `pie auth`
 pub async fn run(cfg: &Config) -> Result<()> {
-    println!("{:<ID_WIDTH$} {:<AUTH_WIDTH$} DETAIL", "BACKEND", "AUTH");
+    outln!("{:<ID_WIDTH$} {:<AUTH_WIDTH$} DETAIL", "BACKEND", "AUTH");
 
     for p in provider::registry() {
         let auth = p.auth_status(cfg).await;
-        println!(
+        outln!(
             "{:<ID_WIDTH$} {:<AUTH_WIDTH$} {}",
             p.id(),
             auth.label(),
@@ -27,8 +28,8 @@ pub async fn run(cfg: &Config) -> Result<()> {
         );
     }
 
-    println!();
-    println!("pie never stores tokens; auth comes from each CLI's own login.");
-    println!("Run `codex login`, or launch `agy` / `claude`, to authenticate.");
+    outln!();
+    outln!("pie never stores tokens; auth comes from each CLI's own login.");
+    outln!("Run `codex login`, or launch `agy` / `claude`, to authenticate.");
     Ok(())
 }

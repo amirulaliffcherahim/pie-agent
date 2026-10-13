@@ -9,6 +9,7 @@
 //! nothing else, so `pie ocr scan.png > scan.txt` is the whole story and no note
 //! can be piped into the file by accident.
 
+use crate::out::{outfrag, outln};
 use std::path::Path;
 
 use crate::error::Result;
@@ -42,13 +43,13 @@ pub async fn run(
     if json {
         // One JSON object per line, like every other `--json` path (`DESIGN.md`
         // §12), so a caller can parse the result without a second format.
-        println!("{}", serde_json::to_string(&result)?);
+        outln!("{}", serde_json::to_string(&result)?);
         return Ok(());
     }
 
-    print!("{}", result.text);
+    outfrag!("{}", result.text);
     if !result.text.ends_with('\n') {
-        println!();
+        outln!();
     }
     Ok(())
 }

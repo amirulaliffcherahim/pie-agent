@@ -3,6 +3,7 @@
 //! Catalogs come from the CLI's own listing command and are cached on disk
 //! (`cache.rs`), so `--refresh` is the only path that spends a subprocess.
 
+use crate::out::outln;
 use std::path::PathBuf;
 
 use crate::config::Config;
@@ -17,10 +18,10 @@ pub async fn run(cfg: &Config, backend: Option<&str>, refresh: bool) -> Result<(
     if refresh {
         let evicted = evict_model_caches(&targets);
         if evicted.is_empty() {
-            println!("note: nothing cached to refresh for this selection.");
+            outln!("note: nothing cached to refresh for this selection.");
         } else {
             for path in evicted {
-                println!("refreshed: {path}");
+                outln!("refreshed: {path}");
             }
         }
     }
@@ -29,22 +30,22 @@ pub async fn run(cfg: &Config, backend: Option<&str>, refresh: bool) -> Result<(
         let id = p.id();
 
         match p.list_models(cfg).await {
-            Ok(models) if models.is_empty() => println!("{id}: no models reported"),
+            Ok(models) if models.is_empty() => outln!("{id}: no models reported"),
             Ok(models) => {
-                println!("{id}:");
+                outln!("{id}:");
                 for model in models {
                     let efforts = if model.efforts.is_empty() {
                         String::new()
                     } else {
                         format!("  efforts: {}", model.efforts.join("|"))
                     };
-                    println!("  {:<28} {}{}", model.id, model.display, efforts);
+                    outln!("  {:<28} {}{}", model.id, model.display, efforts);
                 }
             }
             // A backend that has not implemented its catalog yet says so
             // instead of failing the whole command.
             Err(PieError::Unsupported { feature, .. }) => {
-                println!("{id}: not implemented yet — {feature}");
+                outln!("{id}: not implemented yet — {feature}");
             }
             Err(e) => return Err(e),
         }

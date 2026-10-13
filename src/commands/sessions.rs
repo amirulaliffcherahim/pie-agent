@@ -8,6 +8,7 @@
 //! no path to a spawn and no path to a transcript write.
 
 use crate::error::Result;
+use crate::out::outln;
 use crate::paths;
 use crate::session;
 use crate::session_log::now_millis;
@@ -26,19 +27,22 @@ pub fn run() -> Result<()> {
     if sessions.is_empty() {
         // Not an error and not an empty table: the useful thing to say is how a
         // session gets recorded in the first place, and where the store is.
-        println!("no sessions recorded yet — `pie -p <PROMPT>` records one");
-        println!("store: {}", store.display());
+        outln!("no sessions recorded yet — `pie -p <PROMPT>` records one");
+        outln!("store: {}", store.display());
         return Ok(());
     }
 
-    println!(
+    outln!(
         "{:<ID_WIDTH$} {:<PROVIDER_WIDTH$} {:>TURNS_WIDTH$} {:>AGE_WIDTH$} PREVIEW",
-        "SESSION", "PROVIDER", "TURNS", "UPDATED"
+        "SESSION",
+        "PROVIDER",
+        "TURNS",
+        "UPDATED"
     );
 
     let now = now_millis();
     for summary in &sessions {
-        println!(
+        outln!(
             "{:<ID_WIDTH$} {:<PROVIDER_WIDTH$} {:>TURNS_WIDTH$} {:>AGE_WIDTH$} {}",
             fit(&summary.id, ID_WIDTH),
             fit(&summary.provider, PROVIDER_WIDTH),
@@ -48,8 +52,8 @@ pub fn run() -> Result<()> {
         );
     }
 
-    println!();
-    println!("{} session(s) in {}", sessions.len(), store.display());
+    outln!();
+    outln!("{} session(s) in {}", sessions.len(), store.display());
     Ok(())
 }
 

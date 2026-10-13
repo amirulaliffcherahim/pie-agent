@@ -30,6 +30,7 @@ pub mod logging;
 pub mod mcp;
 pub mod memory;
 pub mod ocr;
+pub mod out;
 pub mod paths;
 pub mod process;
 pub mod profile;

@@ -6,6 +6,7 @@
 //!
 //! Neither command calls a model, so neither spends subscription quota (I7).
 
+use crate::out::outln;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -49,14 +50,14 @@ pub async fn doctor(cfg: &Config) -> Result<()> {
     // about what is installed, and it is the one that refreshes the snapshot
     // `--list-backends` reads.
     let versions = table(cfg, true).await?;
-    println!();
+    outln!();
     report_local_state(cfg);
 
     match write_version_snapshot(&versions) {
-        Ok(path) => println!("snapshot       {}", path.display()),
+        Ok(path) => outln!("snapshot       {}", path.display()),
         // A failed snapshot must not fail `doctor`; the table above is the
         // part that matters.
-        Err(e) => println!("snapshot       failed: {e}"),
+        Err(e) => outln!("snapshot       failed: {e}"),
     }
 
     Ok(())
@@ -64,9 +65,12 @@ pub async fn doctor(cfg: &Config) -> Result<()> {
 
 /// Print the backend table and return `(id, version)` pairs.
 async fn table(cfg: &Config, refresh: bool) -> Result<Vec<(String, String)>> {
-    println!(
+    outln!(
         "{:<ID_WIDTH$} {:<BIN_WIDTH$} {:<VERSION_WIDTH$} {:<AUTH_WIDTH$} DETAIL",
-        "BACKEND", "BINARY", "VERSION", "AUTH"
+        "BACKEND",
+        "BINARY",
+        "VERSION",
+        "AUTH"
     );
 
     // Prefer the snapshot `doctor` wrote. Spawning three vendor CLIs costs about
@@ -114,7 +118,7 @@ async fn table(cfg: &Config, refresh: bool) -> Result<Vec<(String, String)>> {
 
         let auth = p.auth_status(cfg).await;
 
-        println!(
+        outln!(
             "{:<ID_WIDTH$} {:<BIN_WIDTH$} {:<VERSION_WIDTH$} {:<AUTH_WIDTH$} {}",
             id,
             binary,
@@ -129,10 +133,8 @@ async fn table(cfg: &Config, refresh: bool) -> Result<Vec<(String, String)>> {
     // Said out loud, so a recorded version is never mistaken for a live probe.
     // Drift detection (I8) depends on knowing which one you are looking at.
     if let Some(age_secs) = stale_note {
-        println!();
-        println!(
-            "versions are from a snapshot taken {age_secs}s ago; run `pie doctor` to re-probe"
-        );
+        outln!();
+        outln!("versions are from a snapshot taken {age_secs}s ago; run `pie doctor` to re-probe");
     }
 
     Ok(versions)
@@ -216,8 +218,8 @@ async fn versions_in_parallel(cfg: &Config) -> HashMap<String, String> {
 /// The `doctor` footer: local paths, version, and the env scrub in effect.
 fn report_local_state(cfg: &Config) {
     let config_path = paths::config_file();
-    println!("state dir      {}", paths::pie_home().display());
-    println!(
+    outln!("state dir      {}", paths::pie_home().display());
+    outln!(
         "config         {}{}",
         config_path.display(),
         if config_path.is_file() {
@@ -226,16 +228,16 @@ fn report_local_state(cfg: &Config) {
             " (absent — defaults in use)"
         }
     );
-    println!("session log    {}", paths::usage_log().display());
-    println!("pie version    {VERSION}");
+    outln!("session log    {}", paths::usage_log().display());
+    outln!("pie version    {VERSION}");
 
     if cfg.scrub_enabled() {
-        println!("stripped env   {}", cfg.scrub_keys(true).join(", "));
+        outln!("stripped env   {}", cfg.scrub_keys(true).join(", "));
     } else {
         // Loud on purpose: this is the one switch that can silently move a
         // subscription onto pay-as-you-go billing.
-        println!();
-        println!(
+        outln!();
+        outln!(
             "WARNING: PIE_STRIP_ENV is set, so API-key variables are NOT stripped \
              from child processes. A vendor CLI may switch to pay-as-you-go billing."
         );

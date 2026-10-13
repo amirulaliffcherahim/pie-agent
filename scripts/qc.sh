@@ -281,6 +281,9 @@ run_gate 'G4 acceptance (M10 http transport)' cargo test --test http_transport
 run_gate 'G4 acceptance (M11 read-only tools)' cargo test --test tools
 run_gate 'G4 acceptance (M11 bash, scoped)' cargo test --test tools_bash
 
+# S2's guard: the half of I6 that `deny(clippy::panic)` cannot see (S2).
+run_gate 'G4 output safety (S2 closed pipe)' cargo test --test output
+
 # --- G4 (M6 tui non-TTY) ----------------------------------------------------
 # ACCEPTANCE section 9: `pie tui` on a non-TTY stdin must fail with a clear message
 # rather than emitting escape codes into a pipe.

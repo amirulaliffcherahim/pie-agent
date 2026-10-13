@@ -22,6 +22,7 @@
 //! `DefaultHasher`'s algorithm is explicitly not stable across releases — an id that
 //! stopped matching after a Rust upgrade would make the undo handle useless.
 
+use crate::out::{outfrag, outln};
 use std::path::Path;
 
 use crate::error::{PieError, Result};
@@ -31,7 +32,7 @@ use crate::tui::LocalCommand;
 
 /// `pie memory show` — render what was learned, with provenance.
 pub fn show() -> Result<()> {
-    print!("{}", render(&paths::pie_home())?);
+    outfrag!("{}", render(&paths::pie_home())?);
     Ok(())
 }
 
@@ -39,7 +40,7 @@ pub fn show() -> Result<()> {
 pub fn revert(id: &str) -> Result<()> {
     let home = paths::pie_home();
     revert_at(&home, id)?;
-    println!(
+    outln!(
         "reverted: {} restored to the bytes the last `pie learn` apply found",
         memory::doc_path(&home).display()
     );

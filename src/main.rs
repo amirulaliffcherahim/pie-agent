@@ -10,6 +10,7 @@
 )]
 
 use clap::Parser;
+use pie::out::write_err;
 
 use pie::cli::Cli;
 use pie::commands;
@@ -41,10 +42,10 @@ async fn run() -> i32 {
     // someone who happened to run `pie doctor`. stderr, so stdout stays a
     // protocol channel.
     if !cfg.scrub_enabled() {
-        eprintln!(
+        write_err(
             "pie: WARNING: PIE_STRIP_ENV is set, so API-key variables are NOT stripped from \
              child processes. A vendor CLI may switch from your subscription to \
-             pay-as-you-go billing. Unset PIE_STRIP_ENV to restore the scrub."
+             pay-as-you-go billing. Unset PIE_STRIP_ENV to restore the scrub.\n",
         );
     }
 
@@ -59,6 +60,6 @@ async fn run() -> i32 {
 /// The message is redacted on the way out: a vendor CLI's stderr can echo a
 /// credential, and `pie` must never be the thing that prints it (`RISKS.md` §10).
 fn fail(error: &PieError) -> i32 {
-    eprintln!("pie: {}", process::redact(&error.to_string()));
+    write_err(&format!("pie: {}\n", process::redact(&error.to_string())));
     error.exit_code()
 }

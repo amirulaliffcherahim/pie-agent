@@ -305,6 +305,11 @@ Invoke-Gate -Label 'G4 acceptance (M10 http transport)' -Argv @('test', '--test'
 Invoke-Gate -Label 'G4 acceptance (M11 read-only tools)' -Argv @('test', '--test', 'tools')
 Invoke-Gate -Label 'G4 acceptance (M11 bash, scoped)' -Argv @('test', '--test', 'tools_bash')
 
+# S2's guard, and deliberately a named gate rather than a bare `cargo test`: I6 says no
+# panic on external input, and this is the half of I6 that `deny(clippy::panic)` cannot see
+# because the panic is generated inside the standard library's macro (S2).
+Invoke-Gate -Label 'G4 output safety (S2 closed pipe)' -Argv @('test', '--test', 'output')
+
 # --- G4 (M6 tui non-TTY) ----------------------------------------------------
 # ACCEPTANCE section 9: `pie tui` on a non-TTY stdin must fail with a clear message
 # rather than emitting escape codes into a pipe.

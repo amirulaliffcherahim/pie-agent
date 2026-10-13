@@ -10,6 +10,7 @@
 
 use crate::config::Config;
 use crate::error::{PieError, Result};
+use crate::out::outln;
 use crate::paths;
 use crate::provider;
 use crate::report;
@@ -22,7 +23,7 @@ const DAY_MS: u64 = 24 * 60 * 60 * 1_000;
 pub async fn run(cfg: &Config, backend: Option<&str>) -> Result<()> {
     if let Some(id) = backend {
         print_quota(cfg, id).await?;
-        println!();
+        outln!();
     }
 
     print_session_totals(backend)
@@ -36,10 +37,10 @@ async fn print_quota(cfg: &Config, id: &str) -> Result<()> {
     })?;
 
     match provider.usage(cfg).await {
-        Ok(report) => println!("{}", report::render_report(&report)),
+        Ok(report) => outln!("{}", report::render_report(&report)),
         // Not implemented yet is not an error for a pre-M1/M2 backend.
         Err(PieError::Unsupported { feature, .. }) => {
-            println!(
+            outln!(
                 "{}: quota probe not implemented yet — {feature}",
                 provider.id()
             );
@@ -68,12 +69,12 @@ fn print_session_totals(backend: Option<&str>) -> Result<()> {
             report::rows_since(&rows, now.saturating_sub(30 * DAY_MS)),
         ),
     ] {
-        println!("{}", report::render_totals(label, &report::totals(&window)));
-        println!();
+        outln!("{}", report::render_totals(label, &report::totals(&window)));
+        outln!();
     }
 
     if backend.is_none() {
-        println!("pass a backend (`pie usage agy`) for its quota buckets.");
+        outln!("pass a backend (`pie usage agy`) for its quota buckets.");
     }
 
     Ok(())

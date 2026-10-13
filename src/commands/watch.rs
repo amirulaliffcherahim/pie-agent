@@ -64,6 +64,7 @@
 //!    file, [`crate::watch::strings`] extracts from it, and the read is bounded — a prefix
 //!    read is stated in the snapshot and in the run's output rather than silently compared.
 
+use crate::out::{errln, outfrag};
 use std::ffi::OsString;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -408,7 +409,7 @@ pub fn incomplete_digest(outcome: &Outcome) -> Result<()> {
 /// network are resolved here and passed down.
 pub async fn run(cfg: &Config, options: &Options) -> Result<()> {
     let outcome = execute(cfg, &paths::pie_home(), options, &NetworkHttp, now_millis()).await?;
-    print!("{}", outcome.render());
+    outfrag!("{}", outcome.render());
     incomplete_digest(&outcome)
 }
 
@@ -901,7 +902,7 @@ fn read_artefact(path: &Path) -> std::io::Result<(Vec<String>, Option<String>)> 
         )
     });
 
-    eprintln!("TIMING read {} in {:?}", path.display(), started.elapsed()); // TIMING-TEMP
+    errln!("TIMING read {} in {:?}", path.display(), started.elapsed()); // TIMING-TEMP
     Ok((strings, note))
 }
 

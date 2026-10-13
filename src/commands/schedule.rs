@@ -27,6 +27,7 @@
 //! corrupt ledger as "nothing spent" would hand the whole window's budget back, which is
 //! the silent spend `RISKS.md` §13 names.
 
+use crate::out::{outfrag, outln};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -174,7 +175,7 @@ pub fn status_text(cfg: &Config, home: &Path, now_ms: u64) -> Result<String> {
 
 /// `pie schedule status`
 pub fn status(cfg: &Config) -> Result<()> {
-    print!("{}", status_text(cfg, &paths::pie_home(), now_millis())?);
+    outfrag!("{}", status_text(cfg, &paths::pie_home(), now_millis())?);
     Ok(())
 }
 
@@ -203,13 +204,13 @@ async fn manual_run(cfg: &Config, id: &str) -> Result<()> {
     let plan = super::learn::plan(&home, now_millis())?;
     let spend = super::learn::review(cfg, None, &plan, &home).await?;
 
-    println!(
+    outln!(
         "{LEARN_JOB} ran: {} candidate(s) reviewed, {} token(s) reported",
         plan.candidates.len(),
         spend.tokens
     );
-    println!("{}", spend.output.trim_end());
-    println!(
+    outln!("{}", spend.output.trim_end());
+    outln!(
         "the review is reported, not merged: `learned.md` is written only by the rule-based \
          pass (`pie learn`)"
     );

@@ -25,6 +25,7 @@
 //! A scheduled job therefore cannot pollute the persona with model prose, and the user
 //! can read exactly what the quota bought.
 
+use crate::out::outfrag;
 use std::path::Path;
 
 use crate::config::Config;
@@ -227,7 +228,7 @@ pub async fn run(cfg: &Config, options: &Options) -> Result<()> {
         options,
         home: &home,
     };
-    print!("{}", report.render());
+    outfrag!("{}", report.render());
     Ok(())
 }
 

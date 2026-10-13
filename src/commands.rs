@@ -22,6 +22,7 @@ pub mod watch;
 use crate::cli::{Cli, Command, MemoryAction, ScheduleAction, WatchScope};
 use crate::config::Config;
 use crate::error::{PieError, Result};
+use crate::out::outln;
 
 /// Route a parsed command line to its implementation.
 pub async fn dispatch(cli: &Cli, cfg: &Config) -> Result<()> {
@@ -130,6 +131,6 @@ fn print_help() -> Result<()> {
     Cli::command()
         .print_help()
         .map_err(|e| PieError::Config(format!("could not print help: {e}")))?;
-    println!();
+    outln!();
     Ok(())
 }
