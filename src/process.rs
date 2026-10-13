@@ -8,11 +8,25 @@
 //! 2. stderr is drained concurrently and kept bounded,
 //! 3. a deadline always fires and kills the whole process tree,
 //! 4. stdout is delivered line-by-line, tolerantly.
+//!
+//! # One spawn policy, in one place (`DESIGN.md` §20)
+//!
+//! Every child pie runs is spawned by [`configured_command`] below — the vendor CLIs
+//! through [`run_streaming`], the tool loop's child through [`ChildSession`], stage B's
+//! `bash` tool through whichever of the two fits. That is deliberate rather than tidy:
+//! the policy (hidden window for I1, an env scrub for I2, an own process group so a kill
+//! reaches the tree) is an invariant, and M10 recorded what a *copy* of an invariant does
+//! — it stops holding silently, because nothing fails when the second copy drifts.
+//! `tests/process.rs::src_spawns_children_in_exactly_one_module` is what asserts the count
+//! instead of leaving it asserted by absence.
 
 use std::ffi::OsString;
+use std::io::{BufRead, BufReader as BlockingBufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
-use std::time::Duration;
+use std::process::{Child, Stdio};
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::Command;
@@ -63,33 +77,64 @@ impl RunSummary {
     }
 }
 
-/// Spawn `spec`, deliver each stdout line to `on_line`, and enforce the deadline.
+/// Configure a child exactly the way every child pie runs is configured.
 ///
-/// On deadline expiry the process **tree** is killed and
-/// [`PieError::Timeout`] is returned — a hung vendor CLI must never outlive us.
-pub async fn run_streaming(
-    spec: &RunSpec,
-    on_line: &mut (dyn FnMut(&str) + Send),
-) -> Result<RunSummary> {
-    let mut cmd = Command::new(&spec.program);
+/// **The one copy of the spawn policy.** Callers differ in a single argument — the `stdin`
+/// they hand the child — and that difference is the whole reason [`ChildSession`] exists:
+/// a delegate turn wants `Stdio::null()` (nothing more to say), a session wants
+/// `Stdio::piped()` (a `tool_result` is still to come). Everything else lives here, once:
+///
+/// - `CREATE_NO_WINDOW` on Windows, so I1 holds for every child rather than for the ones
+///   whose author remembered the flag;
+/// - its own process group on unix, so a kill reaches the whole tree rather than the direct
+///   child — the equivalent of Windows' `taskkill /T` (`planning/DESIGN.md` §1);
+/// - the caller's scrub list, removed from the child's copy of our environment (I2).
+fn configured_command(spec: &RunSpec, stdin: Stdio) -> std::process::Command {
+    let mut cmd = std::process::Command::new(&spec.program);
     cmd.args(&spec.args)
         .current_dir(&spec.cwd)
-        .stdin(Stdio::null())
+        .stdin(stdin)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+        .stderr(Stdio::piped());
 
     #[cfg(windows)]
-    cmd.creation_flags(CREATE_NO_WINDOW);
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
 
-    // On unix the child leads its own process group, so a kill reaches the whole
-    // tree — the equivalent of Windows' `taskkill /T` (`planning/DESIGN.md` §1).
     #[cfg(unix)]
-    cmd.process_group(0);
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
 
     for key in &spec.scrub {
         cmd.env_remove(key);
     }
+
+    cmd
+}
+
+/// Spawn `spec`, deliver each stdout line to `on_line`, and enforce the deadline.
+///
+/// On deadline expiry the process **tree** is killed and
+/// [`PieError::Timeout`] is returned — a hung vendor CLI must never outlive us.
+///
+/// One-way by construction, and that is the point rather than an oversight: the child's
+/// stdin is `null`, because a delegate-mode turn (`agy --print`, `codex exec`) is told
+/// everything it needs up front and has nothing to be told afterwards. A caller that needs
+/// to *keep talking* uses [`ChildSession`] below, which is the same policy with a pipe on
+/// stdin — not a second policy.
+pub async fn run_streaming(
+    spec: &RunSpec,
+    on_line: &mut (dyn FnMut(&str) + Send),
+) -> Result<RunSummary> {
+    // `kill_on_drop` is tokio's flag rather than the OS's, so it is set after the
+    // conversion; the policy itself (`configured_command`) is `std`'s and is shared with the
+    // blocking session, which is what keeps this a conversion rather than a copy.
+    let mut cmd = Command::from(configured_command(spec, Stdio::null()));
+    cmd.kill_on_drop(true);
 
     let mut child = cmd.spawn().map_err(|source| PieError::Spawn {
         backend: spec.backend.clone(),
@@ -207,7 +252,312 @@ pub async fn run_streaming(
     })
 }
 
-/// Resolve a binary name (or path) the way a shell would.///
+/// A **duplex** session with a child: frames in on stdin, lines out on stdout.
+///
+/// ## Why this exists next to [`run_streaming`] rather than instead of it
+///
+/// [`run_streaming`] is one-way by construction: it hands the child `stdin(null)` and only
+/// delivers stdout, because a delegate-mode turn (`agy --print`, `codex exec`) says
+/// everything it has to say up front. The tool loop is the opposite — it *injects* a
+/// `tool_result` mid-turn, and the child has to still be reading to receive it. That single
+/// difference (`Stdio::piped()` instead of `Stdio::null()`) is why M9 wrote a **second**
+/// copy of the spawn policy inside `tool_loop.rs`, and why M11 found it there: a copy of an
+/// invariant stops holding silently (`planning/ACCEPTANCE.md` §19, `planning/DESIGN.md` §20).
+/// The pipe is the whole difference, so the pipe is all this adds.
+///
+/// ## What it owns
+///
+/// Everything the copy owned, once: the child, a **writer thread** for stdin, a **reader
+/// thread** for stdout, a **detached** stderr drain, a whole-turn **deadline**, and the
+/// **kill tree** on the way out. What it does *not* own is any framing: it moves bytes and
+/// lines, so claude's `stream-json`, a `bash` tool's output, and a test's stand-in all use
+/// it unchanged.
+///
+/// ## The two-pipe deadlock, and why it is unreachable here
+///
+/// The deadlock is: the caller blocks writing a frame into the child's stdin while the
+/// child blocks writing into a full stdout pipe nobody is draining. It needs a frame larger
+/// than the OS pipe buffer, which a real `tool_result` (a `read` of a large file) is. Three
+/// structural choices make it unreachable:
+///
+/// 1. **[`ChildSession::send_bytes`] never touches the pipe.** It hands the bytes to the
+///    writer thread and returns, so the read path can always keep draining stdout — which
+///    is what unblocks the child.
+/// 2. **A reader thread owns the blocking read**, pushing lines into a channel that
+///    [`ChildSession::next_line`] drains. That is what makes the deadline possible at all:
+///    a blocking read on a pipe cannot be cancelled, but `recv_timeout` on a channel can.
+/// 3. **The frame queue is not drained by anyone but the writer thread**, so a caller cannot
+///    block on it. The *caller* bounds how many frames it queues — the loop queues one per
+///    answered call and waits for the reply — which is why an unbounded channel is safe
+///    here and a bounded one would only add a way to block the read path.
+///
+/// ```no_run
+/// # async fn demo(spec: &pie::process::RunSpec) -> pie::error::Result<()> {
+/// use pie::process::ChildSession;
+///
+/// let mut session = ChildSession::spawn(spec)?;
+/// session.send_bytes("{\"type\":\"user\"}\n")?; // queued; the writer thread owns the pipe
+/// while let Some(line) = session.next_line()? {
+///     println!("{}", line.text);
+/// }
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug)]
+pub struct ChildSession {
+    backend: String,
+    timeout: Duration,
+    child: Child,
+    /// Dropped to end the writer thread, which then drops the child's stdin (EOF).
+    frames: Option<mpsc::Sender<Vec<u8>>>,
+    incoming: Mutex<mpsc::Receiver<Incoming>>,
+    /// The first failed write to the child's stdin, recorded by the writer thread.
+    writer_error: Arc<Mutex<Option<std::io::Error>>>,
+    /// Last bytes of the child's stderr, for a caller that wants to explain a failure.
+    stderr_tail: Arc<Mutex<String>>,
+    deadline: Instant,
+    killed: bool,
+}
+
+impl ChildSession {
+    /// Spawn `spec` and wire its stdin, stdout and stderr into a session.
+    ///
+    /// The child is configured by [`configured_command`], which is the one spawn policy —
+    /// so the window is hidden, the env is scrubbed, and the process group is the child's
+    /// own, exactly as for a delegate turn.
+    pub fn spawn(spec: &RunSpec) -> Result<Self> {
+        let mut child = configured_command(spec, Stdio::piped())
+            .spawn()
+            .map_err(|source| PieError::Spawn {
+                backend: spec.backend.clone(),
+                source,
+            })?;
+
+        let stdin = child.stdin.take().ok_or_else(|| {
+            PieError::protocol(
+                &spec.backend,
+                "child produced no stdin handle to write frames to",
+            )
+        })?;
+        let stdout = child.stdout.take().ok_or_else(|| {
+            PieError::protocol(
+                &spec.backend,
+                "child produced no stdout handle to read events from",
+            )
+        })?;
+        let stderr = child.stderr.take().ok_or_else(|| {
+            PieError::protocol(&spec.backend, "child produced no stderr handle to drain")
+        })?;
+
+        // `Instant + Duration` panics on overflow and the timeout is an unvalidated `u64`
+        // from `--timeout` / `PIE_TIMEOUT_SECS`, so a nonsense value must become a config
+        // error (`run_streaming` above turns it into the same one).
+        let deadline = Instant::now().checked_add(spec.timeout).ok_or_else(|| {
+            PieError::Config(format!(
+                "timeout of {}s is too large to schedule",
+                spec.timeout.as_secs()
+            ))
+        })?;
+
+        let writer_error: Arc<Mutex<Option<std::io::Error>>> = Arc::new(Mutex::new(None));
+        let stderr_tail: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+
+        // stderr must be drained even though nothing reads it: a child that fills a full
+        // stderr pipe blocks, and the caller would then wait for stdout that can never come.
+        // **Deliberately detached** — joining it in `Drop` would hang on a grandchild that
+        // inherited the handle, and a hung drop is worse than a thread that ends when the
+        // pipe closes.
+        {
+            let tail = Arc::clone(&stderr_tail);
+            let _ = std::thread::spawn(move || drain_tail_blocking(stderr, tail));
+        }
+
+        let (frame_tx, frame_rx) = mpsc::channel::<Vec<u8>>();
+        {
+            let errors = Arc::clone(&writer_error);
+            let mut stdin = stdin;
+            let _ = std::thread::spawn(move || {
+                while let Ok(bytes) = frame_rx.recv() {
+                    if let Err(error) = stdin.write_all(&bytes).and_then(|()| stdin.flush()) {
+                        // Recorded, not returned: `send_bytes` has already told the caller
+                        // the frame was accepted, so the failure has to be reported from
+                        // there — a result the child never read must not be followed by a
+                        // cheerful end of stream.
+                        if let Ok(mut slot) = errors.lock() {
+                            *slot = Some(error);
+                        }
+                        break;
+                    }
+                }
+                // Dropping `stdin` here closes the child's stdin.
+            });
+        }
+
+        let (line_tx, line_rx) = mpsc::channel::<Incoming>();
+        {
+            let backend = spec.backend.clone();
+            let mut reader = BlockingBufReader::new(stdout);
+            let _ = std::thread::spawn(move || loop {
+                match read_capped_line(&mut reader) {
+                    Ok(Some(line)) => {
+                        if line.truncated {
+                            // A line this long signals a broken or hostile stream rather
+                            // than a big answer, and staying quiet would make the truncation
+                            // look like a short frame (`run_streaming` warns for the same
+                            // reason).
+                            tracing::warn!(
+                                backend = %backend,
+                                cap_bytes = MAX_LINE_BYTES,
+                                "truncated an oversized stdout line from the child; a line \
+                                 longer than the cap cannot be buffered without bound"
+                            );
+                        }
+                        if line_tx.send(Incoming::Line(line)).is_err() {
+                            break; // the session is gone
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(error) => {
+                        let _ = line_tx.send(Incoming::Failed(error));
+                        break;
+                    }
+                }
+            });
+        }
+
+        Ok(Self {
+            backend: spec.backend.clone(),
+            timeout: spec.timeout,
+            child,
+            frames: Some(frame_tx),
+            incoming: Mutex::new(line_rx),
+            writer_error,
+            stderr_tail,
+            deadline,
+            killed: false,
+        })
+    }
+
+    /// Queue `bytes` for the child's stdin.
+    ///
+    /// Returns as soon as the bytes are **queued**, never after they are written — the
+    /// writer thread owns the pipe, and that is what keeps this off the read path. The
+    /// consequence a caller must know: a failure is reported late, by
+    /// [`ChildSession::take_write_error`] on the next send or at end of stream, never as a
+    /// blocked call here. A caller that treats "queued" as "delivered" will report a
+    /// cheerful success for a conversation the child abandoned.
+    pub fn send_bytes(&mut self, bytes: impl Into<Vec<u8>>) -> Result<()> {
+        let Some(frames) = &self.frames else {
+            return Err(PieError::protocol(
+                &self.backend,
+                "the child's stdin is already closed, so nothing more can be delivered to it",
+            ));
+        };
+
+        frames.send(bytes.into()).map_err(|_| {
+            PieError::protocol(
+                &self.backend,
+                "the child's stdin writer stopped before this frame was queued",
+            )
+        })
+    }
+
+    /// The first failed write to the child's stdin, taken once.
+    ///
+    /// Asked for rather than returned from [`ChildSession::send_bytes`], because the failure
+    /// is asynchronous: the writer thread discovers it after the bytes were accepted, so the
+    /// caller has to be able to ask later — on the next send, and at end of stream.
+    pub fn take_write_error(&self) -> Option<std::io::Error> {
+        lock(&self.writer_error).take()
+    }
+
+    /// The last bytes of the child's stderr, for a diagnostic.
+    pub fn stderr_tail(&self) -> String {
+        lock(&self.stderr_tail).clone()
+    }
+
+    /// The child's process id, for a diagnostic (`kill_tree` takes the tree from here).
+    pub fn pid(&self) -> Option<u32> {
+        Some(self.child.id())
+    }
+
+    /// The child's exit status, if it has already exited, without blocking.
+    ///
+    /// `Ok(None)` means "still running", which is the normal answer right after
+    /// [`ChildSession::next_line`] reports end of stream: a closed stdout pipe is not an exit
+    /// — a child can close it and keep working — so a caller that needs the code polls here
+    /// rather than assuming one.
+    pub fn try_wait(&mut self) -> Result<Option<std::process::ExitStatus>> {
+        self.child.try_wait().map_err(PieError::Io)
+    }
+
+    /// The next line from the child, or `None` at end of stream.
+    ///
+    /// Fails with [`PieError::Timeout`] once the whole-turn deadline passes — and kills the
+    /// tree before returning, so a hung child cannot outlive the caller's patience
+    /// (`RISKS.md` §6). The stderr tail is logged, redacted (I10), because a timeout with no
+    /// explanation is the least actionable failure pie has.
+    pub fn next_line(&mut self) -> Result<Option<ChildLine>> {
+        // A zero-length `recv_timeout` returns `Timeout` immediately, which would turn a
+        // child that exited right at the deadline into a spurious timeout, so the last
+        // instant is spent on `try_recv` instead.
+        let remaining = self.deadline.checked_duration_since(Instant::now());
+        let received = match remaining {
+            Some(remaining) if !remaining.is_zero() => lock(&self.incoming).recv_timeout(remaining),
+            _ => lock(&self.incoming)
+                .try_recv()
+                .map_err(|error| match error {
+                    mpsc::TryRecvError::Empty => mpsc::RecvTimeoutError::Timeout,
+                    mpsc::TryRecvError::Disconnected => mpsc::RecvTimeoutError::Disconnected,
+                }),
+        };
+
+        match received {
+            Ok(Incoming::Line(line)) => Ok(Some(line)),
+            Ok(Incoming::Failed(error)) => Err(PieError::Io(error)),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Ok(None),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let tail = self.stderr_tail();
+                let trimmed = tail.trim();
+                if !trimmed.is_empty() {
+                    tracing::warn!(
+                        backend = %self.backend,
+                        secs = self.timeout.as_secs(),
+                        stderr = %truncate(&redact(trimmed), 400),
+                        "the child went quiet until its deadline"
+                    );
+                }
+                self.kill();
+                Err(PieError::Timeout {
+                    backend: self.backend.clone(),
+                    secs: self.timeout.as_secs(),
+                })
+            }
+        }
+    }
+
+    /// Kill the child and everything it spawned, once.
+    fn kill(&mut self) {
+        if self.killed {
+            return;
+        }
+        self.killed = true;
+        kill_tree_blocking(Some(self.child.id()));
+        let _ = self.child.wait();
+    }
+}
+
+impl Drop for ChildSession {
+    fn drop(&mut self) {
+        // Closing the frame channel ends the writer thread, which drops the child's stdin.
+        // Then the tree is killed: a child that outlives its parent keeps a subscription
+        // turn running with nobody reading it (`RISKS.md` §6).
+        self.frames = None;
+        self.kill();
+    }
+}
+
+/// Resolve a binary name (or path) the way a shell would.
 /// A path with separators is used as-is. Otherwise every `PATH` entry is probed
 /// with each `PATHEXT` suffix on Windows. Returns `None` rather than guessing —
 /// callers turn that into [`PieError::BinaryMissing`].
@@ -333,51 +683,140 @@ fn finish_line(mut bytes: Vec<u8>, truncated: bool) -> ChildLine {
     }
 }
 
-/// Kill a process and everything it spawned.
+/// How long a kill helper may take before it is abandoned.
 ///
-/// `Child::kill` only signals the direct child; vendor CLIs spawn node,
-/// subagents, and shells, so we must take the whole tree.
-pub async fn kill_tree(pid: Option<u32>) {
-    let Some(pid) = pid else { return };
+/// The kill runs on the timeout path, so it must not itself block past the deadline: a hung
+/// `taskkill` would defeat the timeout it exists to enforce. Both executors of
+/// [`kill_plan`] apply it, which is what keeps them one policy rather than two.
+const KILL_HELPER_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long the tree is given to exit on the polite signal before the brutal one.
+const KILL_GRACE: Duration = Duration::from_millis(250);
+
+/// The argv of a tree-kill, per platform.
+///
+/// `Child::kill` only signals the direct child; vendor CLIs spawn node, subagents, and
+/// shells, so we must take the whole tree. The plan is data rather than two functions, so
+/// [`kill_tree`] (async, for `run_streaming`) and [`kill_tree_blocking`] (for
+/// [`ChildSession`], whose callers are synchronous) cannot drift: a third flag on
+/// Windows' `taskkill` reaches both or neither.
+///
+/// The `bool` is "pause after this step", which only unix uses: a `TERM` gives the tree a
+/// chance to exit cleanly before the `KILL` escalates.
+///
+/// **Deliberately not `#[cfg]`-gated as a whole**, and that is a fix rather than a style
+/// choice: the first version carried an outer `#[cfg(windows)]` *and* an inner
+/// `#[cfg(not(windows))]` arm, so the function did not exist on unix while both callers
+/// below referenced it unconditionally. Windows could not see it (`G1`-`G3` green), the
+/// unix cross-check `G6` could, and it went red the first time it was run.
+fn kill_plan(pid: u32) -> Vec<(&'static str, Vec<OsString>, bool)> {
     #[cfg(windows)]
     {
-        let mut cmd = Command::new("taskkill");
-        cmd.args(["/PID", &pid.to_string(), "/T", "/F"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .creation_flags(CREATE_NO_WINDOW);
-        // Even a trusted OS helper gets the scrub. The invariant is about what
-        // any child can observe, not about which children we happen to trust.
-        for key in crate::config::BUILTIN_SCRUB {
-            cmd.env_remove(key);
-        }
-        // Bounded: `kill_tree` runs on the timeout path, so it must not itself
-        // block past the deadline. A hung `taskkill` would defeat the timeout it
-        // exists to enforce.
-        let _ = tokio::time::timeout(Duration::from_secs(5), cmd.status()).await;
+        vec![(
+            "taskkill",
+            vec![
+                OsString::from("/PID"),
+                OsString::from(pid.to_string()),
+                OsString::from("/T"),
+                OsString::from("/F"),
+            ],
+            false,
+        )]
     }
 
     #[cfg(not(windows))]
     {
-        // The child leads its own process group (see `process_group(0)` above),
-        // so a negative pid signals the whole tree, not just the direct child.
+        // The child leads its own process group (`process_group(0)` in
+        // `configured_command`), so a negative pid signals the whole tree, not just the
+        // direct child.
         let group = format!("-{pid}");
-        for signal in ["-TERM", "-KILL"] {
-            let mut cmd = Command::new("kill");
-            cmd.args([signal, &group])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null());
-            for key in crate::config::BUILTIN_SCRUB {
-                cmd.env_remove(key);
+        vec![
+            (
+                "kill",
+                vec![OsString::from("-TERM"), OsString::from(group.clone())],
+                true,
+            ),
+            (
+                "kill",
+                vec![OsString::from("-KILL"), OsString::from(group)],
+                false,
+            ),
+        ]
+    }
+}
+
+/// A kill helper, configured the way every child is: hidden, and without our credentials.
+///
+/// Even a trusted OS helper gets the scrub (`planning/DESIGN.md` §20's I2): the invariant is
+/// about what any child can observe, not about which children we happen to trust.
+fn kill_helper(program: &str, args: &[OsString]) -> std::process::Command {
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    for key in crate::config::BUILTIN_SCRUB {
+        cmd.env_remove(key);
+    }
+
+    cmd
+}
+
+/// Kill a process and everything it spawned.
+pub async fn kill_tree(pid: Option<u32>) {
+    let Some(pid) = pid else { return };
+
+    for (program, args, pause_after) in kill_plan(pid) {
+        // Bounded: `kill_tree` runs on the timeout path, so it must not itself block past
+        // the deadline. A hung `taskkill` would defeat the timeout it exists to enforce.
+        let _ = tokio::time::timeout(
+            KILL_HELPER_TIMEOUT,
+            Command::from(kill_helper(program, &args)).status(),
+        )
+        .await;
+
+        if pause_after {
+            // Give the tree a moment to exit cleanly before escalating.
+            tokio::time::sleep(KILL_GRACE).await;
+        }
+    }
+}
+
+/// The same kill without a runtime, for a caller that has none.
+///
+/// [`ChildSession`] is synchronous ([`Transport`](crate::tool_loop::Transport) is), so it
+/// cannot `await` the async version — and a `taskkill` that never returns must not hang the
+/// drop that runs it, so the helper is polled to [`KILL_HELPER_TIMEOUT`] and then abandoned.
+/// Same plan, same bound, same scrub; only the executor differs.
+fn kill_tree_blocking(pid: Option<u32>) {
+    let Some(pid) = pid else { return };
+
+    for (program, args, pause_after) in kill_plan(pid) {
+        if let Ok(mut helper) = kill_helper(program, &args).spawn() {
+            let deadline = Instant::now().checked_add(KILL_HELPER_TIMEOUT);
+            loop {
+                match helper.try_wait() {
+                    Ok(Some(_)) | Err(_) => break,
+                    Ok(None) => {
+                        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                            let _ = helper.kill();
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                }
             }
-            let _ = tokio::time::timeout(Duration::from_secs(5), cmd.status()).await;
-            if signal == "-TERM" {
-                // Give the tree a moment to exit cleanly before escalating.
-                tokio::time::sleep(Duration::from_millis(250)).await;
-            }
+        }
+
+        if pause_after {
+            std::thread::sleep(KILL_GRACE);
         }
     }
 }
@@ -406,6 +845,89 @@ async fn drain_tail<R: AsyncRead + Unpin>(reader: R, cap: usize) -> String {
     // A byte-cap can land mid-character; lossy conversion keeps the tail useful
     // instead of discarding it.
     String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// One line of a session child's stdout, or the read that failed.
+#[derive(Debug)]
+enum Incoming {
+    /// A complete line, lossily decoded.
+    Line(ChildLine),
+    /// The reader stopped. Reported rather than treated as a clean end of stream: a read
+    /// that failed is not the child saying it is done.
+    Failed(std::io::Error),
+}
+
+/// Read one line, retaining at most [`MAX_LINE_BYTES`] bytes, lossily — the blocking twin
+/// of [`read_line_capped`], for [`ChildSession`]'s reader thread.
+///
+/// The same two reasons as the async reader, which is why it is not a `lines()` call: a
+/// line with no newline must not grow the buffer without bound, and one byte that is not
+/// valid UTF-8 must not abort a healthy turn (I5).
+fn read_capped_line<R: BufRead>(reader: &mut R) -> std::io::Result<Option<ChildLine>> {
+    let cap = MAX_LINE_BYTES;
+    let mut out: Vec<u8> = Vec::new();
+    let mut saw_any = false;
+    let mut truncated = false;
+
+    loop {
+        let (mut chunk, consume, newline) = {
+            let available = reader.fill_buf()?;
+            if available.is_empty() {
+                if !saw_any {
+                    return Ok(None);
+                }
+                break; // end of stream: what we have is the last line
+            }
+            match available.iter().position(|&byte| byte == b'\n') {
+                Some(at) => (available[..at].to_vec(), at + 1, true),
+                None => (available.to_vec(), available.len(), false),
+            }
+        };
+
+        saw_any = true;
+        let room = cap.saturating_sub(out.len());
+        if chunk.len() <= room {
+            out.append(&mut chunk);
+        } else {
+            out.extend_from_slice(&chunk[..room]);
+            truncated = true;
+        }
+        reader.consume(consume);
+
+        if newline {
+            break;
+        }
+    }
+
+    Ok(Some(finish_line(out, truncated)))
+}
+
+/// Keep the last [`STDERR_TAIL_BYTES`] of a child's stderr, blocking — the twin of
+/// [`drain_tail`] for [`ChildSession`]'s detached stderr thread, for the same reason:
+/// stderr must be drained even though nothing reads it, or a child that fills the pipe
+/// blocks and the stdout we *are* waiting for can never come.
+fn drain_tail_blocking<R: Read>(reader: R, tail: Arc<Mutex<String>>) {
+    let mut reader = BlockingBufReader::new(reader);
+    let mut kept: Vec<u8> = Vec::new();
+
+    while let Ok(Some(line)) = read_capped_line(&mut reader) {
+        kept.extend_from_slice(line.text.as_bytes());
+        kept.push(b'\n');
+        if kept.len() > STDERR_TAIL_BYTES {
+            let excess = kept.len() - STDERR_TAIL_BYTES;
+            kept.drain(..excess);
+        }
+    }
+
+    *lock(&tail) = String::from_utf8_lossy(&kept).into_owned();
+}
+
+/// Lock without `unwrap`: a poisoned mutex means another thread panicked, and the data on
+/// the other side of these locks is a diagnostics tail, not a broken invariant.
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn describe_status(status: &std::process::ExitStatus) -> String {

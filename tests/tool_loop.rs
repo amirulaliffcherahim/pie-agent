@@ -28,8 +28,8 @@ use pie::error::PieError;
 use pie::process::RunSpec;
 use pie::provider::{by_id, Capabilities, StreamEvent};
 use pie::tool_loop::{
-    check_supported, run_loop, tool_result_frame, ChildTransport, LoopOutcome, ToolCall,
-    ToolResult, ToolRunner, Transport,
+    check_supported, run_loop, tool_result_frame, LoopOutcome, SdkTransport, ToolCall, ToolResult,
+    ToolRunner, Transport,
 };
 
 /// Lock without `unwrap` noise: a poisoned lock only means another test panicked.
@@ -630,7 +630,7 @@ fn the_loop_finishes_against_a_child_that_will_not_read_its_stdin_until_it_has_w
     let started = Instant::now();
     let deadline = Duration::from_secs(15);
     let seen: Arc<Mutex<Vec<StreamEvent>>> = Arc::new(Mutex::new(Vec::new()));
-    let transport = ChildTransport::spawn(&spec_for(&stand_in, dir.path(), deadline))
+    let transport = SdkTransport::spawn(&spec_for(&stand_in, dir.path(), deadline))
         .expect("the stand-in spawns");
 
     let outcome = run_watched(
@@ -691,7 +691,7 @@ fn a_child_that_never_reads_its_stdin_cannot_stall_the_loop() {
 
     let deadline = Duration::from_secs(2);
     let seen: Arc<Mutex<Vec<StreamEvent>>> = Arc::new(Mutex::new(Vec::new()));
-    let transport = ChildTransport::spawn(&spec_for(&stand_in, dir.path(), deadline))
+    let transport = SdkTransport::spawn(&spec_for(&stand_in, dir.path(), deadline))
         .expect("the stand-in spawns");
 
     let started = Instant::now();
@@ -852,7 +852,7 @@ fn a_child_that_never_answers_fails_the_run_instead_of_hanging() {
 
     let started = Instant::now();
     let mut transport =
-        ChildTransport::spawn(&spec_for(&stand_in, dir.path(), Duration::from_secs(2)))
+        SdkTransport::spawn(&spec_for(&stand_in, dir.path(), Duration::from_secs(2)))
             .expect("the stand-in spawns");
     let error =
         run_loop(&mut transport, &EchoRunner, 4, &mut |_| {}).expect_err("a stall is a failure");
@@ -893,9 +893,8 @@ fn a_malformed_frame_from_a_child_is_a_stated_error_and_the_child_is_not_left_ru
     }
 
     let started = Instant::now();
-    let mut transport =
-        ChildTransport::spawn(&spec_for(&path, dir.path(), Duration::from_secs(30)))
-            .expect("the stand-in spawns");
+    let mut transport = SdkTransport::spawn(&spec_for(&path, dir.path(), Duration::from_secs(30)))
+        .expect("the stand-in spawns");
     let error = run_loop(&mut transport, &EchoRunner, 4, &mut |_| {})
         .expect_err("a frame that claims a shape it does not have is an error");
 
@@ -950,7 +949,7 @@ fn gated_run(
     transport: &mut dyn Transport,
 ) -> Result<LoopOutcome, PieError> {
     check_supported(backend, caps)?;
-    let _child = ChildTransport::spawn(spec)?;
+    let _child = SdkTransport::spawn(spec)?;
     run_loop(transport, &EchoRunner, 4, &mut |_| {})
 }
 
@@ -1010,22 +1009,28 @@ fn a_frame_for_a_tool_result_is_what_the_child_reads() {
     assert_eq!(frame["content"], "the output");
 }
 
-/// **I2 is about every child, and M9 added a second spawn path.**
+/// **I2 is about every child, and there is now exactly one spawn path.**
 ///
-/// `ChildTransport::spawn` *mirrors* `process.rs`'s policy — hidden window, scrubbed env, a
-/// deadline, a kill tree — rather than reusing it, because `run_streaming` hands the child
-/// `stdin(null)` and the loop needs a pipe. A mirrored invariant is one that can stop
-/// holding without anything failing, and I2 is the invariant that decides whether a vendor
-/// CLI bills a subscription or an API key (`RISKS.md` §10).
+/// M9 wrote `ChildTransport::spawn` as a *copy* of `process.rs`'s policy — hidden window,
+/// scrubbed env, a deadline, a kill tree — because `run_streaming` hands the child
+/// `stdin(null)` and the loop needs a pipe. M10 recorded why that was a risk
+/// (`ACCEPTANCE.md` §19): a mirrored invariant is one that can stop holding without
+/// anything failing, and I2 is the invariant that decides whether a vendor CLI bills a
+/// subscription or an API key (`RISKS.md` §10).
 ///
-/// So this asserts the behaviour rather than reading the code: a stand-in writes the value
-/// of a scrubbed variable to a file, and the file must not contain it. It would fail if the
-/// mirror ever lost the loop that applies the scrub, which is exactly the drift a comment
-/// cannot catch.
+/// `DESIGN.md` §20 removed the copy, so this test is retargeted rather than rewritten: it
+/// still enters through the **loop's** transport (which is what the loop actually uses), and
+/// that transport now delegates every byte of spawn policy to `process::ChildSession`.
+/// There is no second path left to drift, and
+/// `tests/process.rs::src_spawns_children_in_exactly_one_module` asserts that.
+///
+/// It asserts the behaviour rather than reading the code: a stand-in writes the value of a
+/// scrubbed variable to a file, and the file must not contain it. It fails if the scrub loop
+/// is lost from the one path, which is exactly the drift a comment cannot catch.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_loops_own_spawn_path_scrubs_the_environment_too() {
     use pie::process::RunSpec;
-    use pie::tool_loop::ChildTransport;
+    use pie::tool_loop::SdkTransport;
 
     const SECRET_VAR: &str = "PIE_TEST_TOOL_LOOP_SECRET";
     let dir = tempfile::tempdir().expect("a scratch dir");
@@ -1066,7 +1071,7 @@ async fn the_loops_own_spawn_path_scrubs_the_environment_too() {
     };
 
     {
-        let _transport = ChildTransport::spawn(&spec).expect("the stand-in spawns");
+        let _transport = SdkTransport::spawn(&spec).expect("the stand-in spawns");
         // The stand-in writes and exits; give it a moment on a loaded CI box.
         for _ in 0..100 {
             if written.exists() {
@@ -1080,7 +1085,7 @@ async fn the_loops_own_spawn_path_scrubs_the_environment_too() {
     let content = std::fs::read_to_string(&written).unwrap_or_default();
     assert!(
         !content.contains("sk-must-not-reach-the-child"),
-        "the child inherited `{SECRET_VAR}`: the loop's second spawn path did not scrub it \
-         (I2, RISKS.md section 10). Got: {content:?}"
+        "the child inherited `{SECRET_VAR}`: the loop's spawn path did not scrub it (I2, \
+         RISKS.md section 10). Got: {content:?}"
     );
 }

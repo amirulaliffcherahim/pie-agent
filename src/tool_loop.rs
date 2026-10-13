@@ -37,15 +37,10 @@
 //! claude's own envelope. `claude`'s stream-json input is a *user message* wrapping that
 //! block, an HTTP backend's is a `{"role":"tool","tool_call_id":…}` object, and a
 //! scripted test transport's is whatever the test asserts on. The loop therefore carries
-//! no vendor knowledge, and [`ChildTransport`] does the one translation claude needs —
+//! no vendor knowledge, and [`SdkTransport`] does the one translation claude needs —
 //! which is also how M10 reuses this loop instead of writing a second one.
 
 use std::collections::VecDeque;
-use std::io::{BufRead, BufReader, Write};
-use std::process::{Child, Command, Stdio};
-use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
@@ -395,277 +390,58 @@ fn parse_sdk_line(backend: &str, line: &str) -> Result<Vec<StreamEvent>> {
     }
 }
 
-/// One line of the child's stdout, or the read that failed.
+/// A [`Transport`] over a [`process::ChildSession`], speaking claude's `stream-json`.
+///
+/// **It carries no spawn policy of its own, and that is the point.** M9 wrote it as a
+/// second copy of `process.rs`'s policy — hidden window, process group, env scrub, a
+/// whole-turn deadline, a kill tree — because `run_streaming` hands the child
+/// `stdin(null)` and the loop needs a pipe. `DESIGN.md` §20 ("One spawn policy, not
+/// three") removed the copy: all of that is now
+/// [`ChildSession`](process::ChildSession)'s, and what is left here is the two pieces that
+/// are genuinely the loop's — claude's wire shape ([`frame_line`]) and the mapping from a
+/// line to [`StreamEvent`]s ([`parse_sdk_line`]).
+///
+/// The one consequence worth knowing when reading a failure: `send` returns as soon as the
+/// frame is handed to the session's writer thread, so a child that has stopped reading its
+/// stdin is reported on the *next* `send` or at end of stream ([`deaf_child`]), never as a
+/// blocked call here.
 #[derive(Debug)]
-enum Incoming {
-    /// A complete line, lossily decoded.
-    Line(String),
-    /// The reader stopped; the loop reports this instead of a silent end of stream.
-    Failed(std::io::Error),
-}
-
-/// A [`Transport`] over a spawned child: frames in on stdin, events out on stdout.
-///
-/// ## How it avoids the two-pipe deadlock, and why that is structural
-///
-/// The deadlock is: pie blocks writing a frame into the child's stdin while the child
-/// blocks writing into a full stdout pipe that pie has stopped draining. Both are then
-/// waiting on the other. It needs a frame larger than the OS pipe buffer, and it is
-/// reachable with a real tool result — a `read` of a large file is exactly that.
-///
-/// Three structural choices make it unreachable here:
-///
-/// 1. **`send` never touches the pipe.** It serialises the frame and hands the line to a
-///    writer thread, then returns. The read path can therefore always keep draining
-///    stdout, which is what unblocks the child.
-/// 2. **A reader thread owns the blocking read**, pushing lines into a channel that
-///    `recv` drains. That is what makes the deadline possible at all: a blocking read on
-///    a pipe cannot be cancelled, but `recv_timeout` on a channel can — so a child that
-///    stops talking fails the run with [`PieError::Timeout`] instead of hanging it.
-/// 3. **The frame queue is bounded by the iteration cap.** One frame is queued per
-///    answered call and the loop does not answer another until the child has replied, so
-///    the queue cannot grow without bound — which is why an unbounded channel is safe
-///    here and a bounded one would only add a way to block the read path.
-///
-/// Spawning follows `process.rs` (`DESIGN.md` §6): hidden window, scrubbed env, a
-/// whole-turn deadline, a bounded stderr drain, and a kill tree on the way out. It cannot
-/// *use* `process::run_streaming`, because that closes the child's stdin and only
-/// delivers stdout — one-way by construction, which is the whole point of a delegate-mode
-/// turn and the opposite of what a loop needs.
-#[derive(Debug)]
-pub struct ChildTransport {
+pub struct SdkTransport {
     backend: String,
-    timeout: Duration,
-    child: Child,
-    /// Dropped to end the writer thread, which then drops the child's stdin (EOF).
-    frames: Option<mpsc::Sender<String>>,
-    incoming: Mutex<mpsc::Receiver<Incoming>>,
+    session: process::ChildSession,
     /// Events parsed from a line, waiting to be returned one at a time.
     pending: VecDeque<StreamEvent>,
-    /// The first failed write to the child's stdin, surfaced on the next `send`/at EOF.
-    writer_error: Arc<Mutex<Option<std::io::Error>>>,
-    /// Last bytes of stderr, for a caller that wants to explain a failure.
-    stderr_tail: Arc<Mutex<String>>,
-    deadline: Instant,
-    killed: bool,
 }
 
-impl ChildTransport {
+impl SdkTransport {
     /// Spawn `spec` and wire its stdin/stdout into a transport.
     pub fn spawn(spec: &RunSpec) -> Result<Self> {
-        let mut cmd = Command::new(&spec.program);
-        cmd.args(&spec.args)
-            .current_dir(&spec.cwd)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            cmd.creation_flags(process::CREATE_NO_WINDOW);
-        }
-
-        // Own process group on unix, so the kill below reaches the whole tree rather
-        // than the direct child (`process.rs`, `DESIGN.md` §1).
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            cmd.process_group(0);
-        }
-
-        for key in &spec.scrub {
-            cmd.env_remove(key);
-        }
-
-        let mut child = cmd.spawn().map_err(|source| PieError::Spawn {
-            backend: spec.backend.clone(),
-            source,
-        })?;
-
-        let stdin = child.stdin.take().ok_or_else(|| {
-            PieError::protocol(
-                &spec.backend,
-                "child produced no stdin handle to write frames to",
-            )
-        })?;
-        let stdout = child.stdout.take().ok_or_else(|| {
-            PieError::protocol(
-                &spec.backend,
-                "child produced no stdout handle to read events from",
-            )
-        })?;
-        let stderr = child.stderr.take().ok_or_else(|| {
-            PieError::protocol(&spec.backend, "child produced no stderr handle to drain")
-        })?;
-
-        // `Instant + Duration` panics on overflow and the timeout is an unvalidated u64
-        // from `--timeout` / `PIE_TIMEOUT_SECS`, so a nonsense value must become a config
-        // error (`process.rs` does the same).
-        let deadline = Instant::now().checked_add(spec.timeout).ok_or_else(|| {
-            PieError::Config(format!(
-                "timeout of {}s is too large to schedule",
-                spec.timeout.as_secs()
-            ))
-        })?;
-
-        let writer_error: Arc<Mutex<Option<std::io::Error>>> = Arc::new(Mutex::new(None));
-        let stderr_tail: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
-
-        // stderr must be drained even though the loop never reads it: a child that fills a
-        // full stderr pipe blocks, and the loop would then wait for stdout that can never
-        // come (`process.rs`'s reason for draining it too). Detached: joining it in `Drop`
-        // would hang on a grandchild that inherited the handle, and a hung drop is worse
-        // than a thread that ends when the pipe closes.
-        {
-            let tail = Arc::clone(&stderr_tail);
-            let _ = std::thread::spawn(move || drain_tail(stderr, tail));
-        }
-
-        let (frame_tx, frame_rx) = mpsc::channel::<String>();
-        {
-            let errors = Arc::clone(&writer_error);
-            let mut stdin = stdin;
-            let _ = std::thread::spawn(move || {
-                while let Ok(line) = frame_rx.recv() {
-                    if let Err(error) = stdin
-                        .write_all(line.as_bytes())
-                        .and_then(|()| stdin.flush())
-                    {
-                        // Recorded, not returned: `send` has already told the loop the
-                        // frame was accepted, so the failure has to be reported from
-                        // there — a result the child never read must not be followed by a
-                        // cheerful end of stream.
-                        if let Ok(mut slot) = errors.lock() {
-                            *slot = Some(error);
-                        }
-                        break;
-                    }
-                }
-                // Dropping `stdin` here closes the child's stdin.
-            });
-        }
-
-        let (line_tx, line_rx) = mpsc::channel::<Incoming>();
-        {
-            let mut reader = BufReader::new(stdout);
-            let _ = std::thread::spawn(move || loop {
-                match read_capped_line(&mut reader) {
-                    Ok(Some(line)) => {
-                        if line_tx.send(Incoming::Line(line)).is_err() {
-                            break; // the transport is gone
-                        }
-                    }
-                    Ok(None) => break,
-                    Err(error) => {
-                        let _ = line_tx.send(Incoming::Failed(error));
-                        break;
-                    }
-                }
-            });
-        }
-
+        // All of it is `process.rs`'s: the hidden window (I1), the process group, the env
+        // scrub (I2), the `Instant + Duration` overflow rule, the stdin writer thread, the
+        // stdout reader thread, the detached stderr drain, the deadline and the kill tree.
         Ok(Self {
             backend: spec.backend.clone(),
-            timeout: spec.timeout,
-            child,
-            frames: Some(frame_tx),
-            incoming: Mutex::new(line_rx),
+            session: process::ChildSession::spawn(spec)?,
             pending: VecDeque::new(),
-            writer_error,
-            stderr_tail,
-            deadline,
-            killed: false,
         })
     }
 
     /// The last bytes of the child's stderr, for a diagnostic.
     pub fn stderr_tail(&self) -> String {
-        lock(&self.stderr_tail).clone()
-    }
-
-    /// The first failed write to the child's stdin, taken once.
-    fn take_writer_error(&self) -> Option<std::io::Error> {
-        lock(&self.writer_error).take()
-    }
-
-    /// Next line from the child, or `None` at end of stream.
-    fn next_line(&mut self) -> Result<Option<String>> {
-        // A zero-length `recv_timeout` returns `Timeout` immediately, which would turn a
-        // child that exited right at the deadline into a spurious timeout, so the last
-        // instant is spent on `try_recv` instead.
-        let remaining = self.deadline.checked_duration_since(Instant::now());
-        let received = match remaining {
-            Some(remaining) if !remaining.is_zero() => lock(&self.incoming).recv_timeout(remaining),
-            _ => lock(&self.incoming)
-                .try_recv()
-                .map_err(|error| match error {
-                    mpsc::TryRecvError::Empty => mpsc::RecvTimeoutError::Timeout,
-                    mpsc::TryRecvError::Disconnected => mpsc::RecvTimeoutError::Disconnected,
-                }),
-        };
-
-        match received {
-            Ok(Incoming::Line(line)) => Ok(Some(line)),
-            Ok(Incoming::Failed(error)) => Err(PieError::Io(error)),
-            Err(mpsc::RecvTimeoutError::Disconnected) => Ok(None),
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                // The bounded tail is what makes a timeout explainable, and it is a vendor's
-                // own stderr, so it is redacted on the way out (I10) and truncated before
-                // it can become the log line.
-                let tail = self.stderr_tail();
-                let trimmed = tail.trim();
-                if !trimmed.is_empty() {
-                    tracing::warn!(
-                        backend = %self.backend,
-                        secs = self.timeout.as_secs(),
-                        stderr = %truncate(&process::redact(trimmed), 400),
-                        "the tool-loop child went quiet until its deadline"
-                    );
-                }
-                self.kill();
-                Err(PieError::Timeout {
-                    backend: self.backend.clone(),
-                    secs: self.timeout.as_secs(),
-                })
-            }
-        }
-    }
-
-    /// Kill the child and everything it spawned, once.
-    fn kill(&mut self) {
-        if self.killed {
-            return;
-        }
-        self.killed = true;
-        kill_tree(Some(self.child.id()));
-        let _ = self.child.wait();
+        self.session.stderr_tail()
     }
 }
 
-impl Transport for ChildTransport {
+impl Transport for SdkTransport {
     fn send(&mut self, frame: Value) -> Result<()> {
-        if let Some(error) = self.take_writer_error() {
+        if let Some(error) = self.session.take_write_error() {
             return Err(deaf_child(&self.backend, &error));
         }
 
-        let line = frame_line(&frame);
-        let Some(frames) = &self.frames else {
-            return Err(PieError::protocol(
-                &self.backend,
-                "the child's stdin is already closed, so a tool result cannot be delivered",
-            ));
-        };
-
-        // Handing the bytes to the writer thread is what keeps this call off the pipe:
-        // a synchronous write of a frame larger than the pipe buffer would block here,
-        // with the child blocked on the stdout nobody is draining any more.
-        frames.send(line).map_err(|_| {
-            PieError::protocol(
-                &self.backend,
-                "the child's stdin writer stopped before this tool result was queued",
-            )
-        })
+        // The frame's *shape* is claude's and is decided here; getting the bytes onto the
+        // pipe — and keeping this call off it, so the read path never stops draining — is
+        // the session's.
+        self.session.send_bytes(frame_line(&frame))
     }
 
     fn recv(&mut self) -> Result<Option<StreamEvent>> {
@@ -674,28 +450,19 @@ impl Transport for ChildTransport {
                 return Ok(Some(event));
             }
 
-            let Some(line) = self.next_line()? else {
+            let Some(line) = self.session.next_line()? else {
                 // End of stream. A frame that was queued but never landed is reported
                 // here rather than swallowed: the loop would otherwise return a
                 // successful outcome for a conversation the model abandoned.
-                if let Some(error) = self.take_writer_error() {
+                if let Some(error) = self.session.take_write_error() {
                     return Err(deaf_child(&self.backend, &error));
                 }
                 return Ok(None);
             };
 
-            self.pending.extend(parse_sdk_line(&self.backend, &line)?);
+            self.pending
+                .extend(parse_sdk_line(&self.backend, &line.text)?);
         }
-    }
-}
-
-impl Drop for ChildTransport {
-    fn drop(&mut self) {
-        // Closing the frame channel ends the writer thread, which drops the child's
-        // stdin. Then the tree is killed: a child that outlives its parent keeps a
-        // subscription turn running with nobody reading it (`RISKS.md` §6).
-        self.frames = None;
-        self.kill();
     }
 }
 
@@ -737,143 +504,6 @@ fn frame_line(frame: &Value) -> String {
     };
     line.push('\n');
     line
-}
-
-/// Read one line, retaining at most [`process::MAX_LINE_BYTES`] bytes, lossily.
-///
-/// The synchronous twin of `process::read_line_capped`, for the same reasons: a line with
-/// no newline must not grow the buffer without bound, and one byte that is not valid
-/// UTF-8 must not abort a healthy turn (I5). Written here rather than in `process.rs`
-/// because that reader is async and a [`Transport`] is not — see the note in the M9
-/// report about folding the two together.
-fn read_capped_line<R: BufRead>(reader: &mut R) -> std::io::Result<Option<String>> {
-    let cap = process::MAX_LINE_BYTES;
-    let mut out: Vec<u8> = Vec::new();
-    let mut saw_any = false;
-    let mut truncated = false;
-
-    loop {
-        let (mut chunk, consume, newline) = {
-            let available = reader.fill_buf()?;
-            if available.is_empty() {
-                if !saw_any {
-                    return Ok(None);
-                }
-                break; // end of stream: what we have is the last line
-            }
-            match available.iter().position(|&byte| byte == b'\n') {
-                Some(at) => (available[..at].to_vec(), at + 1, true),
-                None => (available.to_vec(), available.len(), false),
-            }
-        };
-
-        saw_any = true;
-        let room = cap.saturating_sub(out.len());
-        if chunk.len() <= room {
-            out.append(&mut chunk);
-        } else {
-            out.extend_from_slice(&chunk[..room]);
-            truncated = true;
-        }
-        reader.consume(consume);
-
-        if newline {
-            break;
-        }
-    }
-
-    if truncated {
-        // A line this long signals a broken or hostile stream rather than a big answer, and
-        // staying quiet would make the truncation look like a short frame (`process.rs`
-        // warns for the same reason).
-        tracing::warn!(
-            cap_bytes = cap,
-            "truncated an oversized stdout line from the tool-loop child; a vendor line longer \
-             than the cap cannot be buffered without bound"
-        );
-    }
-
-    Ok(Some(finish_line(out)))
-}
-
-/// Trim a trailing CR and interpret the bytes lossily.
-fn finish_line(mut bytes: Vec<u8>) -> String {
-    if bytes.last() == Some(&b'\r') {
-        bytes.pop();
-    }
-    String::from_utf8_lossy(&bytes).into_owned()
-}
-
-/// Keep the last [`process::STDERR_TAIL_BYTES`] of the child's stderr.
-fn drain_tail<R: std::io::Read>(reader: R, tail: Arc<Mutex<String>>) {
-    let mut reader = BufReader::new(reader);
-    let mut kept: Vec<u8> = Vec::new();
-
-    while let Ok(Some(line)) = read_capped_line(&mut reader) {
-        kept.extend_from_slice(line.as_bytes());
-        kept.push(b'\n');
-        if kept.len() > process::STDERR_TAIL_BYTES {
-            let excess = kept.len() - process::STDERR_TAIL_BYTES;
-            kept.drain(..excess);
-        }
-    }
-
-    *lock(&tail) = String::from_utf8_lossy(&kept).into_owned();
-}
-
-/// Kill a process and everything it spawned, without a runtime.
-///
-/// The synchronous twin of `process::kill_tree`, and deliberately the same policy:
-/// `taskkill /T /F` on Windows, a negative-pid signal to the child's own process group
-/// elsewhere, with the env scrub applied to the helper too. The other twin lives in
-/// `process.rs` because that one is async and a [`Transport`] is not.
-fn kill_tree(pid: Option<u32>) {
-    let Some(pid) = pid else { return };
-
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        let mut cmd = Command::new("taskkill");
-        cmd.args(["/PID", &pid.to_string(), "/T", "/F"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .creation_flags(process::CREATE_NO_WINDOW);
-        // Even a trusted OS helper gets the scrub: the invariant is about what any
-        // child can observe, not about which children we happen to trust.
-        for key in crate::config::BUILTIN_SCRUB {
-            cmd.env_remove(key);
-        }
-        let _ = cmd.status();
-    }
-
-    #[cfg(not(windows))]
-    {
-        let group = format!("-{pid}");
-        for signal in ["-TERM", "-KILL"] {
-            let mut cmd = Command::new("kill");
-            cmd.args([signal, &group])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null());
-            for key in crate::config::BUILTIN_SCRUB {
-                cmd.env_remove(key);
-            }
-            let _ = cmd.status();
-            if signal == "-TERM" {
-                // Give the tree a moment to exit cleanly before escalating.
-                std::thread::sleep(Duration::from_millis(250));
-            }
-        }
-    }
-}
-
-/// Lock without `unwrap`: a poisoned mutex means another thread panicked, and the data
-/// on the other side of these locks is a diagnostics tail, not a broken invariant.
-fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[cfg(test)]

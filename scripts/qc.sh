@@ -272,6 +272,14 @@ run_gate 'G4 acceptance (M9 tool loop)' cargo test --test tool_loop
 run_gate 'G4 acceptance (M10 sse)' cargo test --test sse
 run_gate 'G4 acceptance (M10 http transport)' cargo test --test http_transport
 
+# M11's stages, one gate binary each, named after the stage that owns it. Stage A's tier
+# is here now; stage B's `tools_bash` row lands with stage B, because a G4 row naming a
+# test binary that does not exist yet would make a verified tree red.
+#
+# M11's G5 is `n/a`, stated rather than skipped: no backend that uses pie's loop has a
+# working credential here. The tools need no vendor at all, so the substance is offline.
+run_gate 'G4 acceptance (M11 read-only tools)' cargo test --test tools
+
 # --- G4 (M6 tui non-TTY) ----------------------------------------------------
 # ACCEPTANCE section 9: `pie tui` on a non-TTY stdin must fail with a clear message
 # rather than emitting escape codes into a pipe.

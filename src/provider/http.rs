@@ -3,7 +3,7 @@
 //!
 //! [`crate::tool_loop`] speaks to the model through a [`Transport`]: some frames go in,
 //! `StreamEvent`s come out, and the loop neither knows nor cares what is on the other side.
-//! [`ChildTransport`](crate::tool_loop::ChildTransport) puts a vendor CLI there; this puts a
+//! [`SdkTransport`](crate::tool_loop::SdkTransport) puts a vendor CLI there; this puts a
 //! `POST` and an SSE body there. That is the whole point of M9's seam — `RISKS.md` §8 says
 //! the `tool_calls` path is what delegate-mode CLIs never exercise, and it is one loop with
 //! two consumers rather than two implementations.

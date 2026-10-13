@@ -294,6 +294,16 @@ Invoke-Gate -Label 'G4 acceptance (M9 tool loop)' -Argv @('test', '--test', 'too
 Invoke-Gate -Label 'G4 acceptance (M10 sse)' -Argv @('test', '--test', 'sse')
 Invoke-Gate -Label 'G4 acceptance (M10 http transport)' -Argv @('test', '--test', 'http_transport')
 
+# M11's stages, one gate binary each, named after the stage that owns it. Stage A's tier
+# is here now; stage B's `tools_bash` row lands with stage B, because a G4 row naming a
+# test binary that does not exist yet would make a verified tree red - which is the
+# opposite of what a gate is for.
+#
+# M11's G5 is `n/a`, stated rather than skipped, and for the same reason M9's and M10's
+# are: no backend that uses pie's loop has a working credential here. The tools need no
+# vendor at all, so the substance is offline; only the end-to-end turn is not.
+Invoke-Gate -Label 'G4 acceptance (M11 read-only tools)' -Argv @('test', '--test', 'tools')
+
 # --- G4 (M6 tui non-TTY) ----------------------------------------------------
 # ACCEPTANCE section 9: `pie tui` on a non-TTY stdin must fail with a clear message
 # rather than emitting escape codes into a pipe.
