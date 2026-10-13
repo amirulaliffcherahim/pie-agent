@@ -10,24 +10,30 @@
 |---|---|
 | Repo | `C:/Users/amiru/Local/Code/pie` |
 | Branch | `feat/m0-m2-subscription-backends` |
-| Last commit | M10 — pushed; `origin` in sync |
+| Last commit | M11 — pushed; `origin` in sync |
 | Tests | see the run log (§12) — do not trust a number here, run `scripts/qc.ps1` |
-| Gates | **all green with `-Live`** — 6 standing checks (G1, G2, G3, G3b, G3c, G3d) + 27 G4 + G6, then G5 |
-| Milestones | **M0–M10 done.** M9 is `offline-verified` (no Claude credential) and M10 is `offline-verified` (no API key); every other milestone is `done`. Each has a run-log row in `ACCEPTANCE.md` §12 |
-| Next | **M11** — the tool suite. Its contract is **frozen** in `DESIGN.md` §20, `ACCEPTANCE.md` §19 and `ROADMAP.md`; no code written. Then `ACCEPTANCE.md` §14's S1–S17, and the release (item 4 below) |
+| Gates | **38/39 offline green** — 6 standing checks (G1, G2, G3, G3b, G3c, G3d) + **31** G4 + G6. The 39th is G5, which spends real quota. M11's G5 is `n/a` and *stated*, which is why M11's verdict is `offline-verified` rather than `done` |
+| Milestones | **M0–M11 built.** M9, M10 and M11 are `offline-verified` (no Claude credential / no API key / no live turn that could call a tool); every other milestone is `done`. Each has a run-log row in `ACCEPTANCE.md` §12 |
+| Next | `ACCEPTANCE.md` §14's **S1–S22** — S2 is the cheapest remaining panic, S15 and S17 batch, and **S19 + S21 are one follow-up**. Then the release, which needs the user's version decision |
 
-**Note for whoever picks this up: subagent delegation was unavailable at the end of this session**
-(the account returned `402 Insufficient Balance`), so the last items were done by hand. The M11
-contract is written precisely so the stages can be dispatched one at a time without re-deriving
-anything — and its **first** decision (no user in the loop, so a tool is enabled in config or not
-offered) is recorded there rather than waiting to be rediscovered.
+**Delegation works again; `advisor` does not.** The `402 Insufficient Balance` reported at the end of
+the previous session has cleared — the `Agent` tool and the `agy-agent` skill both answer — but
+`advisor` is still quota-blocked (resets ~72 h), so M11 was dispatched **and verified** without it.
+Its three stages took two waves: **A and C in parallel** (disjoint files, so genuinely independent),
+then **B**, which needs C's `process::ChildSession` — built before C, its `bash` would have become the
+*third* copy of the spawn policy, which is the exact thing the milestone exists to delete.
 
-**Gate count changed three times across M6–M10, and every change was a defect being closed rather
+Dispatching it was worth it for one reason worth repeating: **half of M11's defects were found by
+breaking finished work, not by a stage's own gate passing.** A stage's report describes what it
+looked for.
+
+**Gate count changed four times across M6–M11, and every change was a defect being closed rather
 than a feature being added.** G6 was a required gate with *no runner at all* and a command that
 could not pass as written (B25); G3c (no `mod.rs`) and G3d (no test may depend on machine vendor
-state, B32) are new; and the milestone stages contributed 20 G4 rows of their own. If you remember
-"15/16 gates", that number is three rewrites stale — **run the runner rather than trusting any
-count in any document.**
+state, B32) are new; M11 added two more (its two stage binaries), and the milestone stages together
+contributed **31** G4 rows. The current census is **38 offline gates green + G5**, and the only thing
+that knows it is the runner. If you remember "15/16 gates", that number is four rewrites stale —
+**run the runner rather than trusting any count in any document.**
 
 Build the binary before manual checks: `cargo build --release` →
 `./target/release/pie.exe`.
@@ -91,6 +97,23 @@ the same build directory.
   and therefore every CI job — was red while the local run was green (B32). Gate G3d
   now runs the whole suite with `HOME` redirected to an empty directory. **If you add
   a test that touches vendor auth, give it a scratch home; do not inherit one.**
+- **An outer `#[cfg(windows)]` on a function that also has inner `#[cfg(not(windows))]` arms
+  deletes the function on unix while its callers still reference it.** M11's `kill_plan` did exactly
+  that: every Windows gate was green (G1–G3, clippy, 852 tests) and `cargo check --target
+  x86_64-unknown-linux-gnu` went **red on its first run**. The same shape recurs in every stand-in
+  with a `.bat` half and a `.sh` half. **Put G6 in every stage brief**, and read "the unix arm is not
+  compiled here" in a stage's report as a pointer to where to look rather than as a reassurance —
+  stage C flagged the risk and the bug was sitting in the same report.
+- **A claim this platform cannot observe needs a witness or a confession.** M11 needed both twice:
+  removing `process_group(0)`/`CREATE_NO_WINDOW` reddens **nothing** here, because a console window
+  is not observable from inside a console-attached test process; and "`bash` spawns no shell" is
+  behavioural only on unix, because a `.bat` stand-in *is* a cmd script and re-parses its own
+  command line. Both are now **source-text assertions with the gap stated** (S20, S22) rather than
+  behavioural tests that do not exist.
+- **A new test binary needs its own G4 row, added in the same commit as the binary.** `ACCEPTANCE`
+  §19 names `cargo test --test tools` as stage A's *gate*, and a named gate with no runner is B25
+  exactly. Adding the row before the binary exists makes a verified tree red; adding it later leaves
+  the criterion resting on a claim.
 - **`2>&1` on a native command's stderr aborts PowerShell** under
   `$ErrorActionPreference = 'Stop'`, via `NativeCommandError`. The M6 non-TTY gate
   failed *silently* because of it — no FAIL line, just exit 1 — which is the exact
@@ -159,18 +182,23 @@ the reason is a missing credential rather than unfinished work:
 
 ### The open work, in the order I would pick it up
 
-1. **M11 — the tool suite**, whose contract is frozen (`DESIGN.md` §20, `ACCEPTANCE.md` §19,
-   `ROADMAP.md`). Three stages, one test binary each. The decision that shapes all of it: M9's
-   loop has **no user in it**, so a tool is enabled in config with a declared scope or it is not
-   offered — no per-call approval. And `bash` must not become a *third* copy of the spawn policy;
-   M11 unifies `ChildTransport` into `process.rs` rather than adding one.
-2. **`ACCEPTANCE.md` §14's S1–S17.** S15 and S17 are the ones worth batching: S15 is three
-   signature widenings in one function (`render_report`), and S17 is the fused-flag-table
-   duplication the strings leg's two selection paths create.
-3. **A concrete tool suite's prerequisite is settled; the tools themselves are M11's work.**
-4. **The release** (§15 of this handoff): promote the changelog and tag. `Cargo.toml` is still
-   `0.1.0` after eleven milestones, so the bump is a deliberate decision, not an automatic one.
-5. **Nothing else.** `DEFERRED-BACKENDS.md`'s two halves were closed by the M10 follow-up.
+1. **`ACCEPTANCE.md` §14's S1–S22.** S2 is the cheapest remaining panic: `println!`/`print!` panic on
+   a write failure, so `pie -p … | head -1` exits 101. It is 78 sites across 15 files and the fix is
+   one `out::` helper plus a **process-level** test — spawn the real binary, close the read end of
+   its stdout *before* it writes, and assert exit 0 rather than 101. Closing early rather than
+   overfilling the pipe is what makes that test cheap and deterministic. S15 and S17 batch well.
+   **S19 and S21 are one follow-up**: both want the same change — `ToolSet` carrying resolved
+   context (the ceiling, the composed scrub list) — so do them together rather than as the two
+   separate patches each describes.
+2. **The release**: promote `[Unreleased]`, choose the version, and tag **in the same commit**
+   (`VERSIONING.md`). `Cargo.toml` is still `0.1.0` after eleven `feat:` milestones and `git tag` is
+   still empty, so the first tag is a deliberate choice rather than an arithmetic one: `0.1.0`
+   because nothing has ever been released is as defensible as a bump, and either way it is the
+   user's call.
+3. **Judge the TUI by hand** — `./target/release/pie.exe tui`. Still the user's, and still not
+   automatable.
+4. **Nothing else.** `DEFERRED-BACKENDS.md`'s two halves were closed by the M10 follow-up, and M11's
+   residues are recorded as S18–S22 rather than left inside a stage report.
 
 ### Testing it hands-on
 
@@ -180,8 +208,8 @@ reducer and rendering through the buffer, but "does this feel usable" is not aut
 
 ## 7. Remaining milestones
 
-None. `ROADMAP.md`'s M0–M10 are all implemented; the run log in `ACCEPTANCE.md` §12 records each
-one's verdict and the evidence behind it. New work belongs in `ROADMAP.md` as M11+, with its
+None. `ROADMAP.md`'s M0–M11 are all implemented; the run log in `ACCEPTANCE.md` §12 records each
+one's verdict and the evidence behind it. New work belongs in `ROADMAP.md` as M12+, with its
 acceptance criteria frozen in `ACCEPTANCE.md` **before** the code — the discipline that produced
 every result below.
 
@@ -189,6 +217,7 @@ every result below.
 |---|---|---|
 | M9 | claude adapter + `tool_use`→`tool_result` loop | **unverifiable live here** — no Claude credential. Verdict is `offline-verified`, never `done` |
 | M10 | OpenRouter/DeepSeek from `DEFERRED-BACKENDS.md` | only where `cost_usd_micros` is real. Verdict depends on whether the user supplies keys |
+| M11 | the tool suite: read-only tier, scoped `bash`, one spawn policy | **the tools are fully verified offline; the end-to-end turn is not**, because no backend with a working loop has a credential. Verdict is `offline-verified` |
 
 ## 8. Open items — decisions, not oversights
 
@@ -200,14 +229,20 @@ every result below.
   asks for it" is not a reason for the *default* to carry the account risk
   `knowledge/9router-findings.md` §0 describes. See DESIGN §9, ACCEPTANCE §5,
   TOKEN-ECONOMICS §10d.
-- **S1–S16** in `ACCEPTANCE.md` §14 — argv measured against the bin *name*; `println!`
+- **S1–S22** in `ACCEPTANCE.md` §14 — argv measured against the bin *name*; `println!`
   panics on broken pipe; `read_all` reads the whole log; version snapshot is a plain
   write; itsmini is env-only; `agent.compact_after_turns` named in the contract but
   not implemented; switch drops per-turn framing; `--switch`/`--model` use different
   error variants; `Done`'s vendor status string discarded on the TUI path; `scroll`
   has no ceiling in the reducer; three-stage checkout compile noise; the changelog
   and tagging rules are unenforced; the picker overlay has no scroll affordance;
-  `require_subscription` precedes pure argv validation.
+  `require_subscription` precedes pure argv validation; `render_report`'s signature has
+  no channel for failed news sources; `cargo fmt --all` rewrote an in-flight stage's
+  file; the fused flag table is kept twice. **S18–S22 are M11's five**, and they are the
+  ones to read before touching `src/tools/` or `src/process.rs`: the declared-but-unbuilt
+  `write`/`edit` tier; `bash` takes no `cwd`; I1's evidence is source text; the tool child
+  gets `BUILTIN_SCRUB` rather than the composed list; and "no shell" is behavioural only
+  on unix. S19 and S21 are one follow-up, not two.
 - **`crossterm` appears twice in `Cargo.lock`** — `ratatui 0.29` needs `0.28.1`, pie
   depends on `0.29`. Not a defect today (the two never share a type) and not changed,
   because the pair is what was verified. Deduplicating means pinning pie's direct dep

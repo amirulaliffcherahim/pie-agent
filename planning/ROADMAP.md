@@ -87,6 +87,15 @@ contract (`DESIGN.md` §20, `ACCEPTANCE.md` §19) **before** any code, like ever
 - **Done:** with an empty config, no tool runs at all; with a read-only tool enabled, a
   scripted turn reads a file and answers; with `bash` enabled and scoped, a scripted turn runs
   one command, and a command that outlives its deadline is killed rather than waited on.
+- **Done as built (M11, verdict `offline-verified`).** The read-only tier and a scoped `bash` are
+  implemented, and the spawn policy has **one** owner: `ChildTransport` is deleted and
+  `process::ChildSession` is the only way a child is created, asserted rather than assumed.
+  **`write` and `edit` are not built** — their keys exist and every call is refused with a sentence
+  saying so. `ACCEPTANCE.md` §19 freezes three stages and gives the mutating tier no criterion at
+  all, so building it would have produced a feature with nothing defining it; recorded as **S18**.
+  The scripted-turn half is satisfied at the tool boundary rather than through a model, because no
+  backend with a working loop has a credential here — which is why the verdict is
+  `offline-verified` and not `done`.
 
 ## Cross-cutting gates (green every milestone)
 - No console popups; latency logged; `pie doctor` health; bounded prompt argv;
