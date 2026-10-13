@@ -19,13 +19,35 @@
 
 use pie::watch::{self, Drift, DriftClass, NewsItem};
 
+/// A finding built by hand, with **no** pie file on it — the shape the classifier leaves on
+/// a finding that has nothing to follow (and the shape an unknown backend gets).
 fn drift(backend: &str, class: DriftClass, what: &str) -> Drift {
     Drift {
         backend: backend.to_string(),
         class,
         what: what.to_string(),
         detail: format!("before: {backend} --old-flag\n after: {backend} --new-flag"),
+        pie_file: None,
     }
+}
+
+/// The same finding, carrying the pie file a `pie-must-change` finding names.
+///
+/// `pie_file` is the finding's own field: the renderer prints it and never derives one, so
+/// a test that wants the line has to supply it.
+fn drift_following(backend: &str, class: DriftClass, what: &str, pie_file: &str) -> Drift {
+    Drift {
+        pie_file: Some(pie_file.to_string()),
+        ..drift(backend, class, what)
+    }
+}
+
+/// `render_report` in the shipped mode, with no failed sources.
+///
+/// The tests that are *about* the mode or about a lost source call `render_report`
+/// themselves; the rest stay readable.
+fn render(month: &str, drifts: &[Drift], news: &[NewsItem], first_run: bool) -> String {
+    watch::render_report(month, drifts, news, &[], watch::REA_MODE_LITE, first_run)
 }
 
 fn headline(title: &str, source: &str, impact: u32, matched: &[&str]) -> NewsItem {
@@ -54,8 +76,8 @@ const ALL_CLASSES: [DriftClass; 4] = [
 /// any date.
 #[test]
 fn two_months_render_two_different_file_names_from_one_call_site() {
-    let november = watch::render_report("2026-11", &[], &[], false);
-    let december = watch::render_report("2026-12", &[], &[], false);
+    let november = render("2026-11", &[], &[], false);
+    let december = render("2026-12", &[], &[], false);
 
     assert!(
         november.contains("watchtower-2026-11.md"),
@@ -70,8 +92,8 @@ fn two_months_render_two_different_file_names_from_one_call_site() {
         "two different months must not render byte-identical reports"
     );
 
-    let past = watch::render_report("1999-01", &[], &[], false);
-    let future = watch::render_report("2099-12", &[], &[], false);
+    let past = render("1999-01", &[], &[], false);
+    let future = render("2099-12", &[], &[], false);
     assert!(
         past.contains("watchtower-1999-01.md"),
         "a past month needs no current-date plausibility check:\n{past}"
@@ -90,7 +112,7 @@ fn two_months_render_two_different_file_names_from_one_call_site() {
 #[test]
 fn every_class_label_appears_when_a_finding_of_that_class_is_supplied() {
     for class in ALL_CLASSES {
-        let rendered = watch::render_report(
+        let rendered = render(
             "2026-11",
             &[drift("agy", class, "a flag moved")],
             &[],
@@ -103,7 +125,7 @@ fn every_class_label_appears_when_a_finding_of_that_class_is_supplied() {
         );
     }
 
-    let none = watch::render_report("2026-11", &[], &[], false);
+    let none = render("2026-11", &[], &[], false);
     for class in ALL_CLASSES {
         assert!(
             !none.contains(class.label()),
@@ -120,7 +142,7 @@ fn every_class_label_appears_when_a_finding_of_that_class_is_supplied() {
 /// negative assertion is not passing because the word never appears anywhere.
 #[test]
 fn an_unclassifiable_finding_is_never_reported_as_compatible() {
-    let unknown = watch::render_report(
+    let unknown = render(
         "2026-11",
         &[drift(
             "agy",
@@ -141,7 +163,7 @@ fn an_unclassifiable_finding_is_never_reported_as_compatible() {
 
     // Control: a genuinely compatible finding *does* print the word, so the assertion
     // above is about the class rather than about a string the renderer never emits.
-    let known = watch::render_report(
+    let known = render(
         "2026-11",
         &[drift("agy", DriftClass::Compatible, "a flag appeared")],
         &[],
@@ -166,8 +188,8 @@ fn a_first_run_is_not_the_same_string_as_no_drift() {
         "a first run and a clean comparison are different claims and need different words"
     );
 
-    let first = watch::render_report("2026-11", &[], &[], true);
-    let later = watch::render_report("2026-11", &[], &[], false);
+    let first = render("2026-11", &[], &[], true);
+    let later = render("2026-11", &[], &[], false);
 
     assert!(
         first.contains(watch::FIRST_RUN_NOTE),
@@ -195,7 +217,7 @@ fn a_first_run_is_not_the_same_string_as_no_drift() {
 /// pie never made.
 #[test]
 fn the_rea_mode_is_labelled_in_both_a_first_run_and_a_normal_report() {
-    let first = watch::render_report("2026-11", &[], &[], true);
+    let first = watch::render_report("2026-11", &[], &[], &[], watch::REA_MODE_LITE, true);
     let normal = watch::render_report(
         "2026-11",
         &[drift(
@@ -204,6 +226,8 @@ fn the_rea_mode_is_labelled_in_both_a_first_run_and_a_normal_report() {
             "a stream field changed shape",
         )],
         &[headline("a headline", "Hacker News", 3, &["codex"])],
+        &[],
+        watch::REA_MODE_LITE,
         false,
     );
 
@@ -232,10 +256,12 @@ fn an_incomplete_digest_says_so_and_a_complete_one_does_not() {
     let incomplete = watch::render_report(
         "2026-11",
         &[],
-        &[
-            headline("a headline", "Hacker News", 3, &["codex"]),
-            watch::failed_source("arXiv cs.SE", "connection reset by peer"),
-        ],
+        &[headline("a headline", "Hacker News", 3, &["codex"])],
+        &[watch::failed_source(
+            "arXiv cs.SE",
+            "connection reset by peer",
+        )],
+        watch::REA_MODE_LITE,
         false,
     );
 
@@ -257,11 +283,68 @@ fn an_incomplete_digest_says_so_and_a_complete_one_does_not() {
         "2026-11",
         &[],
         &[headline("a headline", "Hacker News", 3, &["codex"])],
+        &[],
+        watch::REA_MODE_LITE,
         false,
     );
     assert!(
         !complete.contains("INCOMPLETE"),
         "a complete digest must not claim to be incomplete:\n{complete}"
+    );
+}
+
+/// **A failure is reported as a failure, and never rendered as a headline.**
+///
+/// This is S15's core claim. While a failure travelled inside the headline list as a
+/// sentinel item, a caller that forgot to partition the list printed the fetch error in a
+/// headline's own shape — `- [impact 0] <reason> — <source>` — which is a failure being
+/// presented as something that arrived. A failure now has its own type, its own argument
+/// and its own rendering, so no partition can be forgotten: the headline list cannot
+/// contain one.
+///
+/// The second half is the control: the *same* render, with the failure supplied, prints the
+/// headline the run did receive. Without it, "the reason is not printed as a headline"
+/// would pass for a renderer that printed nothing at all.
+#[test]
+fn a_failed_source_is_reported_as_a_failure_and_never_as_a_headline() {
+    let news = [headline("a headline", "Hacker News", 3, &["codex"])];
+    let failed = [watch::failed_source(
+        "arXiv cs.SE",
+        "connection reset by peer",
+    )];
+
+    let rendered =
+        watch::render_report("2026-11", &[], &news, &failed, watch::REA_MODE_LITE, false);
+
+    assert!(
+        rendered.contains(watch::DIGEST_INCOMPLETE_NOTE),
+        "a lost source must be stated:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("  - arXiv cs.SE: connection reset by peer"),
+        "the failure line names the source and the reason:\n{rendered}"
+    );
+    // Control: the source that answered is still rendered — as a headline.
+    assert!(
+        rendered.contains("- [impact 3] a headline — Hacker News"),
+        "a failed source must not blank the digest:\n{rendered}"
+    );
+
+    // The sentinel's tell, asserted directly: a failure in the headline list carried
+    // impact 0 and a title, so it rendered wearing the headline line's own marker and
+    // joined its reason to its source with the headline separator.
+    assert!(
+        !rendered.contains("[impact 0]"),
+        "a failure must never be given a headline's shape:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("connection reset by peer — arXiv cs.SE"),
+        "the failure's reason must not be printed as a headline line:\n{rendered}"
+    );
+    assert_eq!(
+        rendered.matches("connection reset by peer").count(),
+        1,
+        "the reason belongs to the failure block and nowhere else:\n{rendered}"
     );
 }
 
@@ -282,18 +365,33 @@ fn the_same_inputs_render_byte_identical_output() {
         ),
         drift("newcli", DriftClass::Unclassified, "something moved"),
     ];
-    let news = vec![
-        headline(
-            "codex ships a new flag",
-            "Hacker News",
-            3,
-            &["codex", "cli"],
-        ),
-        watch::failed_source("arXiv cs.SE", "connection reset by peer"),
-    ];
+    let news = vec![headline(
+        "codex ships a new flag",
+        "Hacker News",
+        3,
+        &["codex", "cli"],
+    )];
+    let failed = vec![watch::failed_source(
+        "arXiv cs.SE",
+        "connection reset by peer",
+    )];
 
-    let once = watch::render_report("2026-11", &drifts, &news, false);
-    let twice = watch::render_report("2026-11", &drifts, &news, false);
+    let once = watch::render_report(
+        "2026-11",
+        &drifts,
+        &news,
+        &failed,
+        watch::REA_MODE_LITE,
+        false,
+    );
+    let twice = watch::render_report(
+        "2026-11",
+        &drifts,
+        &news,
+        &failed,
+        watch::REA_MODE_LITE,
+        false,
+    );
 
     assert_eq!(
         once, twice,
@@ -311,7 +409,7 @@ fn the_same_inputs_render_byte_identical_output() {
 /// what was checked (and in which mode) from the artefact alone.
 #[test]
 fn an_empty_report_is_still_intelligible() {
-    let empty = watch::render_report("2026-11", &[], &[], false);
+    let empty = render("2026-11", &[], &[], false);
 
     assert!(
         !empty.trim().is_empty(),
@@ -341,22 +439,27 @@ fn an_empty_report_is_still_intelligible() {
 
 /// A `pie-must-change` finding names the pie file that has to follow.
 ///
-/// The class is only useful if it says *where* to go. An unknown backend names no invented
-/// path: a confident wrong file is worse than an admitted gap.
+/// The class is only useful if it says *where* to go, and the file is now the finding's own
+/// field (`Drift::pie_file`), set where the finding was classified — so the renderer prints
+/// what the finding carries and derives nothing. `tests/drift.rs` asserts the mapping from
+/// a real backend id; this asserts that the report prints it.
 #[test]
 fn a_pie_must_change_finding_names_the_pie_file_that_must_follow() {
     let rendered = watch::render_report(
         "2026-11",
-        &[drift(
+        &[drift_following(
             "codex",
             DriftClass::PieMustChange,
             "--json gained a field",
+            "src/provider/codex.rs",
         )],
         &[],
+        &[],
+        watch::REA_MODE_LITE,
         false,
     );
     assert!(
-        rendered.contains("src/provider/codex.rs"),
+        rendered.contains("  pie file that must follow: src/provider/codex.rs"),
         "the adapter that must follow the change has to be named:\n{rendered}"
     );
     assert!(
@@ -364,7 +467,9 @@ fn a_pie_must_change_finding_names_the_pie_file_that_must_follow() {
         "a codex finding must not name another backend's adapter:\n{rendered}"
     );
 
-    let unknown = watch::render_report(
+    // A finding with no file on it — an unknown backend, or one nobody mapped — names no
+    // path at all: a confident wrong file is worse than an admitted gap.
+    let unknown = render(
         "2026-11",
         &[drift("brandnew", DriftClass::PieMustChange, "a flag moved")],
         &[],
@@ -376,6 +481,50 @@ fn a_pie_must_change_finding_names_the_pie_file_that_must_follow() {
     );
 }
 
+/// **The renderer does not invent a pie file.** With none on the finding, it prints no line.
+///
+/// This is the half of S15 that the old renderer could not have: it derived the path from
+/// `backend` through its own table, so a `Drift` carrying no file still rendered one. The
+/// control below proves the negative is not vacuous — the same class and the same backend
+/// *with* a file on the finding prints exactly that line.
+#[test]
+fn a_finding_with_no_pie_file_renders_no_pie_file_line() {
+    let none = render(
+        "2026-11",
+        &[drift(
+            "codex",
+            DriftClass::PieMustChange,
+            "--json gained a field",
+        )],
+        &[],
+        false,
+    );
+    assert!(
+        !none.contains("pie file"),
+        "a finding with no file must print no file line:\n{none}"
+    );
+    assert!(
+        !none.contains("src/provider/codex.rs"),
+        "the renderer must not derive the path from the backend:\n{none}"
+    );
+
+    let some = render(
+        "2026-11",
+        &[drift_following(
+            "codex",
+            DriftClass::PieMustChange,
+            "--json gained a field",
+            "src/provider/codex.rs",
+        )],
+        &[],
+        false,
+    );
+    assert!(
+        some.contains("pie file that must follow: src/provider/codex.rs"),
+        "the control: a finding that carries a file must print it:\n{some}"
+    );
+}
+
 /// A `pie-must-stop` finding says driving the CLI is no longer sanctioned, with no route.
 ///
 /// `PLAN.md` §11a: the watchtower flags when pie must change or stop, *never how to evade
@@ -383,7 +532,7 @@ fn a_pie_must_change_finding_names_the_pie_file_that_must_follow() {
 /// not "change a file and carry on".
 #[test]
 fn a_pie_must_stop_finding_names_no_route_around_the_policy() {
-    let rendered = watch::render_report(
+    let rendered = render(
         "2026-11",
         &[drift(
             "claude",
@@ -409,5 +558,66 @@ fn a_pie_must_stop_finding_names_no_route_around_the_policy() {
     assert!(
         !rendered.contains("pie file that must follow"),
         "a stop finding must not be framed as an adapter change to carry on with:\n{rendered}"
+    );
+
+    // A stop finding that *does* carry a file says which path is affected — and still
+    // offers no route around the measure. The two sentences are asserted together because
+    // the pair is the point: naming where pie was driving, while refusing to say how to
+    // keep driving.
+    let affected = render(
+        "2026-11",
+        &[drift_following(
+            "claude",
+            DriftClass::PieMustStop,
+            "an anti-automation gate was added",
+            "src/provider/claude.rs",
+        )],
+        &[],
+        false,
+    );
+    assert!(
+        affected.contains("affected pie path: src/provider/claude.rs"),
+        "a stop finding names the path it was driving through:\n{affected}"
+    );
+    assert!(
+        affected.contains(watch::PIE_MUST_STOP_NOTE),
+        "and it still refuses a workaround:\n{affected}"
+    );
+}
+
+/// **The mode label is the one the caller passed**, not one the renderer asserts.
+///
+/// `RISKS.md` §14: the shipped comparison is REA-lite because no disassembler is installed,
+/// and a run that *did* decompile the artefact must label itself otherwise. A renderer that
+/// read `watch::REA_MODE` itself could only ever print one mode, so a structural run would
+/// be mislabelled as the degraded one — the header claiming a comparison the body
+/// contradicts, which is the defect `REA_MODE_DETAIL` already records once.
+#[test]
+fn the_mode_label_is_the_one_the_caller_passed() {
+    let structural = watch::ReportMode {
+        label: "REA-structural",
+        detail: "the vendor's own artefact was decompiled by `rea setup`",
+    };
+    let rendered = watch::render_report("2026-11", &[], &[], &[], structural, false);
+
+    assert!(
+        rendered.contains("rea mode: REA-structural — the vendor's own artefact was decompiled"),
+        "the label and its detail must be the ones passed in:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains(watch::REA_MODE),
+        "the renderer must not fall back to `REA_MODE` when another mode is passed:\n{rendered}"
+    );
+
+    // Control: the shipped pair still renders the shipped label, so the assertion above is
+    // about the renderer reading its argument rather than about the word never appearing.
+    let shipped = render("2026-11", &[], &[], false);
+    assert!(
+        shipped.contains(watch::REA_MODE),
+        "the shipped mode is still what the default caller passes:\n{shipped}"
+    );
+    assert!(
+        shipped.contains(watch::REA_MODE_DETAIL),
+        "and its detail travels with it:\n{shipped}"
     );
 }

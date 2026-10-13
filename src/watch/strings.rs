@@ -414,12 +414,17 @@ impl StringScanner {
     ///
     /// The whole sentence around the word is the evidence a human judges, so the run is kept
     /// — trimmed, and truncated by [`StringScanner::keep_truncated`] like anything else.
+    ///
+    /// **Except when the run is a flag table** ([`is_flag_table`]): a concatenated table is
+    /// not prose, the flag path above already kept every flag in it as its own entry, and
+    /// keeping the table as well would hold the same information twice (`ACCEPTANCE.md` §14
+    /// S17) — the second copy through a per-string cap that can hide a change late in it.
     fn keep_run_sentence(&mut self) {
         if !self.run_started || !self.run_has_policy {
             return;
         }
         let text = String::from_utf8_lossy(&self.run_head).into_owned();
-        if !text.is_empty() {
+        if !text.is_empty() && !is_flag_table(&text) {
             self.keep_policy(&text);
         }
     }
@@ -464,6 +469,51 @@ impl StringScanner {
     /// How many strings the result holds so far, across both kinds.
     fn total(&self) -> usize {
         self.flags.len() + self.policy.len()
+    }
+}
+
+/// Whether a run is a **flag table** — a concatenation of `--<segment>` pieces and nothing
+/// else — rather than prose a human should read.
+///
+/// The vendored tables this exists for are stored concatenated and carry no separators at
+/// all, so a single run reads
+/// `--sandbox-policy-cwd--permission-profile--use-legacy-landlock--managed-networkcommand`.
+/// Such a run matches a [`POLICY_WORDS`] term (`policy`, `permission`) and so reaches the
+/// sentence path, but it is not a sentence: the flags inside it are already kept, split, by
+/// [`flags_in`], and keeping the table too holds the same information twice while the copy
+/// is still cut at [`MAX_STRING_CHARS`], where a change late in the table is invisible.
+///
+/// The **space test is the discriminator**, not the `--` prefix: a flag *name* cannot contain
+/// a space, so `--effort high` is a flag with an argument rather than a table, and its
+/// sentence path still runs. A run that is a table and nothing else loses nothing to the
+/// early return, because the flag path has already kept every piece of it.
+///
+/// [`StringScanner::run_head`] is bounded by [`RETENTION`], so a long table arrives here
+/// truncated — and that needs no special case. A truncated table is still a table by this
+/// test, while any truncation that mixed in prose would contain a space and fail it; a "was
+/// it truncated" branch would only add a way to be wrong.
+fn is_flag_table(text: &str) -> bool {
+    let mut rest = text;
+    loop {
+        // Each piece begins with the separator, and nothing is consumed unless it does: the
+        // text must end where the last piece does, which is what makes this a claim about the
+        // whole run rather than about a prefix of it.
+        let Some(after) = rest.strip_prefix("--") else {
+            return false;
+        };
+        // A name ends at the next separator — a real long flag never contains one — or at the
+        // end of the text.
+        let (segment, tail) = match after.find("--") {
+            Some(index) => (&after[..index], &after[index..]),
+            None => (after, ""),
+        };
+        if segment.is_empty() || segment.contains(' ') {
+            return false;
+        }
+        if tail.is_empty() {
+            return true;
+        }
+        rest = tail;
     }
 }
 

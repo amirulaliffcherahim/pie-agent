@@ -44,6 +44,25 @@ use crate::paths;
 pub use drift::{classify, diff};
 pub use news::{rank, NewsItem, NewsSource};
 
+/// A configured source that could **not** be fetched, and the reason it was not.
+///
+/// `ACCEPTANCE.md` §14's S15 row suggests this channel be typed `&[NewsSource]`. That is
+/// the wrong shape: [`NewsSource`] is the *feed configuration* — a name and a URL — and
+/// carries no reason, so a signature built on it could say which source failed and never
+/// what went wrong. This pair carries both, which is what the report prints and what the
+/// failing run's error names.
+///
+/// It exists so a failure never has to reach the report through the *headline* list. A
+/// failure smuggled in as a [`NewsItem`] is a sentinel a caller can forget to strip, and
+/// the failure it forgot would render as a headline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailedSource {
+    /// The source's configured name (`NewsSource::name`), as the report spells it.
+    pub source: String,
+    /// Why the fetch failed, verbatim from the fetch error.
+    pub reason: String,
+}
+
 /// What a change means for pie. `PLAN.md` §11a's sentence, as a type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DriftClass {
@@ -119,6 +138,19 @@ pub struct Drift {
     /// The evidence — the before and after, so a reader can judge the classification
     /// rather than trust it.
     pub detail: String,
+    /// The pie file that must follow, when a file follows at all.
+    ///
+    /// Set where the finding is **classified** (the only caller of `drift::classify`,
+    /// `drift::finding`), because that is the one moment the backend and the class are
+    /// both known. The renderer used to derive it from `backend` through a table of its
+    /// own, which put a second copy of the mapping in the layer that draws the report; a
+    /// finding rendered from a `Drift` this field says nothing about prints no file line
+    /// rather than inventing one.
+    ///
+    /// `Some` for a `pie-must-change`/`pie-must-stop` finding, `None` for `Compatible`
+    /// and `Unclassified`. `drift::pie_file`/`drift::follow` remain the one place the
+    /// path is computed.
+    pub pie_file: Option<String>,
 }
 
 /// Where snapshots are kept: `$PIE_HOME/watch`.
@@ -135,7 +167,8 @@ pub fn reports_dir() -> PathBuf {
     paths::pie_home().join("reports")
 }
 
-/// The mode word this report prints, because a finding line looks the same either way.
+/// The mode word the shipped report prints, because a finding line looks the same either
+/// way.
 ///
 /// `RISKS.md` §14: no disassembler is installed on this machine, so `drift` compares
 /// version, `--help` and selected binary strings and **no structure at all**. Without the
@@ -171,13 +204,26 @@ pub const FIRST_RUN_NOTE: &str =
 /// The snapshot line for a run that **did** compare, and found nothing.
 pub const NO_DRIFT_NOTE: &str = "no drift found — every probe matched the previous snapshot";
 
-/// Marker prefix on a [`NewsItem`] that records a **failed source**, not a headline.
+/// How a report's comparison was made: the label it prints, and what it did not check.
 ///
-/// [`render_report`]'s signature is frozen and carries no error list, so the item list is
-/// the only channel a fetch failure has. This mark is what stops a short digest from being
-/// presented as a whole one (`DESIGN.md` §17 rule 2 — the same rule M5's `ocr` shipped: a
-/// source that failed must read as "something is missing", never as "nothing happened").
-pub const FAILED_SOURCE_MARK: &str = "[source-failed] ";
+/// A parameter of [`render_report`] rather than a constant read inside it, so a run in
+/// another mode (the structural half `rea setup` enables, `RISKS.md` §14) can label itself
+/// honestly instead of a renderer asserting one mode for every run. The label and its
+/// detail travel together because a bare label is a word the reader has to look up, and
+/// kept as one value because two adjacent `&str`s are a swap waiting to happen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReportMode<'a> {
+    /// The mode word, printed first.
+    pub label: &'a str,
+    /// What that mode did and did not check, printed beside the label.
+    pub detail: &'a str,
+}
+
+/// The mode the shipped `pie watch` runs in — the pair above, as the caller passes it.
+pub const REA_MODE_LITE: ReportMode<'static> = ReportMode {
+    label: REA_MODE,
+    detail: REA_MODE_DETAIL,
+};
 
 /// The digest line that names the failure, rather than letting silence imply a full scan.
 pub const DIGEST_INCOMPLETE_NOTE: &str =
@@ -202,37 +248,16 @@ fn file_name(month: &str) -> String {
     format!("watchtower-{month}.md")
 }
 
-/// Build the stand-in item that records a **failed source**.
+/// Record a **failed source**, as its own value rather than as a headline.
 ///
-/// The `watch` command turns each `fetch` error into one of these and passes it along with
-/// the headlines, since [`render_report`] takes a single list. The failure text goes in
-/// `title` so it survives wherever the item is rendered.
-pub fn failed_source(source: &str, error: &str) -> NewsItem {
-    NewsItem {
-        title: format!("{FAILED_SOURCE_MARK}{error}"),
-        url: String::new(),
+/// The `watch` command turns each `fetch` error into one of these and passes the list to
+/// [`render_report`] beside the headlines. Two types hold one concept each, so a caller
+/// that forgets about the failure list loses a stated failure — it does not render a
+/// failure as a headline, which is what the old sentinel made possible.
+pub fn failed_source(source: &str, error: &str) -> FailedSource {
+    FailedSource {
         source: source.to_string(),
-        impact: 0,
-        matched: Vec::new(),
-    }
-}
-
-/// Whether `item` is a failure record rather than a headline.
-fn is_failed_source(item: &NewsItem) -> bool {
-    item.title.starts_with(FAILED_SOURCE_MARK)
-}
-
-/// The pie file that has to follow when `backend`'s contract moves.
-///
-/// Derived from the backend id because [`Drift`] carries no file field. A table rather than
-/// a guess: an unknown backend names no path at all, because a confident wrong path sends
-/// the reader to the wrong file and hides that the mapping is missing.
-fn pie_file_for(backend: &str) -> &'static str {
-    match backend.trim().to_ascii_lowercase().as_str() {
-        "agy" => "src/provider/agy.rs",
-        "codex" => "src/provider/codex.rs",
-        "claude" => "src/provider/claude.rs",
-        _ => "src/provider/ (the finding does not name a known backend)",
+        reason: error.to_string(),
     }
 }
 
@@ -257,10 +282,25 @@ fn push_labelled(out: &mut String, label: &str, body: &str) {
 /// `month` is a **parameter**, never read from the clock: a file name that depends on the
 /// system date can only be tested in the current month, which is where a date bug lives.
 ///
+/// `failed` is the fetch failures, as their own list: a source that failed is not a
+/// headline, and giving it a channel of its own is what makes that structural rather than
+/// a convention the renderer has to remember to apply.
+///
+/// `mode` is the comparison the run actually made, passed rather than read from
+/// [`REA_MODE`]/[`REA_MODE_DETAIL`] here — the report does not get to decide what produced
+/// it.
+///
 /// `first_run` exists because a drift check with no previous snapshot must report "first
 /// snapshot taken, nothing to diff" and **never** "no drift found". Those two are
 /// indistinguishable in a report that only prints findings, and only one of them is true.
-pub fn render_report(month: &str, drifts: &[Drift], news: &[NewsItem], first_run: bool) -> String {
+pub fn render_report(
+    month: &str,
+    drifts: &[Drift],
+    news: &[NewsItem],
+    failed: &[FailedSource],
+    mode: ReportMode<'_>,
+    first_run: bool,
+) -> String {
     let mut out = String::new();
 
     out.push_str(&format!("# pie watchtower — {month}\n"));
@@ -270,7 +310,7 @@ pub fn render_report(month: &str, drifts: &[Drift], news: &[NewsItem], first_run
     ));
     // The mode sits above the findings, not in a footnote: a reader must know what the
     // comparison covered before trusting a line that says "no drift found".
-    out.push_str(&format!("rea mode: {REA_MODE} — {REA_MODE_DETAIL}\n"));
+    out.push_str(&format!("rea mode: {} — {}\n", mode.label, mode.detail));
 
     if first_run {
         out.push_str(&format!("snapshot: {FIRST_RUN_NOTE}\n"));
@@ -310,17 +350,18 @@ pub fn render_report(month: &str, drifts: &[Drift], news: &[NewsItem], first_run
         match d.class {
             DriftClass::Compatible => {}
             DriftClass::PieMustChange => {
-                out.push_str(&format!(
-                    "  pie file that must follow: {}\n",
-                    pie_file_for(&d.backend)
-                ));
+                // The file comes from the finding and nowhere else. Deriving it here from
+                // `backend` is what let the renderer name a path for a `Drift` that never
+                // carried one; a finding with `pie_file: None` prints no line at all.
+                if let Some(file) = &d.pie_file {
+                    out.push_str(&format!("  pie file that must follow: {file}\n"));
+                }
             }
             DriftClass::PieMustStop => {
                 out.push_str(&format!("  {PIE_MUST_STOP_NOTE}\n"));
-                out.push_str(&format!(
-                    "  affected pie path: {}\n",
-                    pie_file_for(&d.backend)
-                ));
+                if let Some(file) = &d.pie_file {
+                    out.push_str(&format!("  affected pie path: {file}\n"));
+                }
             }
             // Never silently "fine": the only honest thing to say about a finding nobody
             // has judged is that nobody has judged it.
@@ -334,22 +375,16 @@ pub fn render_report(month: &str, drifts: &[Drift], news: &[NewsItem], first_run
     }
 
     out.push_str("\n## news\n");
-    let (failed, headlines): (Vec<&NewsItem>, Vec<&NewsItem>) =
-        news.iter().partition(|i| is_failed_source(i));
     if !failed.is_empty() {
         out.push_str(&format!("{DIGEST_INCOMPLETE_NOTE}\n"));
-        for item in &failed {
-            let why = item
-                .title
-                .strip_prefix(FAILED_SOURCE_MARK)
-                .unwrap_or(&item.title);
-            out.push_str(&format!("  - {}: {why}\n", item.source));
+        for entry in failed {
+            out.push_str(&format!("  - {}: {}\n", entry.source, entry.reason));
         }
     }
-    if headlines.is_empty() {
+    if news.is_empty() {
         out.push_str("  no headlines this month\n");
     } else {
-        for item in &headlines {
+        for item in news {
             out.push_str(&format!(
                 "- [impact {}] {} — {}\n",
                 item.impact, item.title, item.source

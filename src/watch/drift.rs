@@ -448,15 +448,25 @@ fn collect_help_line_changes(
 ///
 /// The class comes from [`classify`] rather than from the site that detected the change,
 /// so there is exactly one place where a class is decided (see the module docs).
+///
+/// The `pie_file` field is filled here, in the same breath as the class, because this is
+/// the only place where a finding has both a backend and a class. Both come from the
+/// verdict: a finding that has to be acted on names the file to act on, and one that is
+/// compatible or unjudged names nothing rather than a path it has no reason to expect.
 fn finding(backend: &str, what: String, detail: String) -> Drift {
     let mut entry = Drift {
         backend: backend.to_string(),
         class: DriftClass::Unclassified,
         what,
         detail,
+        pie_file: None,
     };
     let class = classify(&entry);
     entry.class = class;
+    entry.pie_file = match class {
+        DriftClass::PieMustChange | DriftClass::PieMustStop => Some(pie_file(backend)),
+        DriftClass::Compatible | DriftClass::Unclassified => None,
+    };
     entry
 }
 

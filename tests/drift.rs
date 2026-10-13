@@ -259,12 +259,16 @@ fn none(drifts: &[Drift], needle: &str) {
 }
 
 /// A finding built by hand, as `classify` may be handed one no snapshot produced.
+///
+/// `pie_file` is `None` and stays that way: `classify` reads `what`, and the file a finding
+/// carries is filled in by the differ's own constructor (`drift::finding`), not here.
 fn drift(what: &str, detail: &str) -> Drift {
     Drift {
         backend: BACKEND.to_string(),
         class: DriftClass::Unclassified,
         what: what.to_string(),
         detail: detail.to_string(),
+        pie_file: None,
     }
 }
 
@@ -320,7 +324,8 @@ fn a_changed_version_is_pie_must_change_and_names_the_backend_module() {
 #[test]
 fn the_pie_file_a_change_names_follows_the_backend_it_came_from() {
     // A hardcoded `src/provider/agy.rs` would satisfy the agy case and be wrong for every
-    // other backend, so the mapping is asserted on two.
+    // other backend, so the mapping is asserted on two. Both forms are asserted: the field
+    // the report renders from, and the detail line that carries the same path.
     for (backend, file) in [
         ("agy", "src/provider/agy.rs"),
         ("codex", "src/provider/codex.rs"),
@@ -334,6 +339,11 @@ fn the_pie_file_a_change_names_follows_the_backend_it_came_from() {
             entry.detail.contains(file),
             "{backend}: {:#?}",
             entry.detail
+        );
+        assert_eq!(
+            entry.pie_file.as_deref(),
+            Some(file),
+            "{backend}: the finding must carry the file the report renders from: {entry:#?}"
         );
     }
 }
@@ -742,7 +752,55 @@ fn every_pie_must_change_finding_names_a_pie_file_to_follow() {
             entry.detail.contains("src/provider/") && entry.detail.contains(".rs"),
             "{case}: a `pie-must-change` finding must name the file that follows — {entry:#?}"
         );
+        // The same claim on the field the renderer prints, so "the report names the file"
+        // rests on the finding rather than on a path derived where the report is drawn.
+        let file = entry
+            .pie_file
+            .as_deref()
+            .unwrap_or_else(|| panic!("{case}: a `pie-must-change` finding carries no file"));
+        assert!(
+            file.contains("src/provider/") && file.contains(".rs"),
+            "{case}: `pie_file` must be a path, not {file:?}"
+        );
     }
+}
+
+/// A finding carries a pie file **exactly** when its class needs one.
+///
+/// The field is filled where the class is decided, so the two can never disagree: a
+/// `compatible` finding that carried a file would have the report name a path for a change
+/// that needs no follow-up, and an `unclassified` one would name a path for a verdict
+/// nobody has reached.
+#[test]
+fn a_finding_carries_a_pie_file_exactly_when_its_class_needs_one() {
+    let mut with_file = 0usize;
+    let mut without_file = 0usize;
+
+    for (case, entry) in all_findings() {
+        match entry.class {
+            DriftClass::PieMustChange | DriftClass::PieMustStop => {
+                with_file += 1;
+                assert!(
+                    entry.pie_file.is_some(),
+                    "{case}: a `{}` finding must carry the file that follows — {entry:#?}",
+                    entry.class.label()
+                );
+            }
+            DriftClass::Compatible | DriftClass::Unclassified => {
+                without_file += 1;
+                assert!(
+                    entry.pie_file.is_none(),
+                    "{case}: a `{}` finding must carry no file — {entry:#?}",
+                    entry.class.label()
+                );
+            }
+        }
+    }
+
+    assert!(
+        with_file > 0 && without_file > 0,
+        "the fixtures must exercise both arms, or this scan proves nothing"
+    );
 }
 
 #[test]

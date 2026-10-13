@@ -145,7 +145,7 @@ fn execute(cfg: &Tools, call: &ToolCall) -> Result<Outcome, String> {
         return Err(EMPTY_ALLOW.to_string());
     }
 
-    let (program, args) = arguments(call)?;
+    let (program, args, cwd) = arguments(call)?;
 
     if !cfg
         .bash_allow
@@ -171,7 +171,23 @@ fn execute(cfg: &Tools, call: &ToolCall) -> Result<Outcome, String> {
         ));
     };
 
-    run_command(cfg, &root, binary, args)
+    // Resolved **after** the program is known to be allowed and to exist, so a refused command
+    // touches no filesystem at all. The check itself is the shared ceiling, not a copy of it.
+    let cwd = match cwd {
+        Some(requested) => {
+            let resolved = crate::tools::guard::resolve_within(&root, &requested)?;
+            if !resolved.is_dir() {
+                return Err(format!(
+                    "`cwd` is `{requested}`, which is inside the workspace root but is not a \
+                     directory. Give a directory, or omit `cwd` to run in the workspace root."
+                ));
+            }
+            resolved
+        }
+        None => root.clone(),
+    };
+
+    run_command(cfg, &cwd, binary, args)
 }
 
 /// The workspace root as the child's `cwd`: resolved once, so the child starts in the
@@ -191,14 +207,15 @@ fn canonical_root(configured: &Path) -> Result<PathBuf, String> {
 // Arguments.
 // ---------------------------------------------------------------------------------------
 
-/// The program and its arguments, from either accepted shape.
+/// The program, its arguments, and an optional working directory, from either accepted shape.
 ///
-/// `cwd` is **refused rather than ignored**: it would need the same resolved-path ceiling
-/// the read-only tier has, and a second copy of that check is precisely what M11 exists to
-/// eliminate. A call that supplies one is told it is not supported in this build, which is
-/// a sentence a model can act on; quietly running it in the workspace root instead would
-/// answer a question that was not asked.
-fn arguments(call: &ToolCall) -> Result<(String, Vec<String>), String> {
+/// **`cwd` is accepted and resolved through the shared ceiling** (`crate::tools::guard`), which
+/// is the same check the read-only tier uses. M11 refused the argument outright, and the reason
+/// was sound while it held: a second copy of the path check would be free to drift from the
+/// first, and each copy would be tested only by its own tier's tests. Now that there is one
+/// implementation (S19), accepting the argument costs nothing and the boundary is unchanged. A
+/// `cwd` outside the root is refused exactly as a path outside the root is refused.
+fn arguments(call: &ToolCall) -> Result<(String, Vec<String>, Option<String>), String> {
     let Value::Object(fields) = &call.input else {
         return Err(format!(
             "the `bash` tool takes an object with `command` or `argv`. {}",
@@ -206,32 +223,40 @@ fn arguments(call: &ToolCall) -> Result<(String, Vec<String>), String> {
         ));
     };
 
-    if fields.contains_key("cwd") {
-        return Err(
-            "the `bash` tool does not support a `cwd` argument in this build. The working \
-             directory is always the configured `tools.workspace` root, and a `cwd` would need \
-             the same resolved-path ceiling the read-only tier has. Send the call without \
-             `cwd` — the command runs in the workspace root."
-                .to_string(),
-        );
-    }
+    let cwd = match fields.get("cwd") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(text)) => Some(text.clone()),
+        Some(_) => {
+            return Err(format!(
+                "`cwd` must be a string naming a directory inside the workspace root. Omit it to \
+                 run in the workspace root. {}",
+                shape_help()
+            ));
+        }
+    };
 
-    match (fields.get("argv"), fields.get("command")) {
+    let (program, args) = match (fields.get("argv"), fields.get("command")) {
         // Refused rather than resolved by precedence: a call that sends both is a call whose
         // author was unsure, and silently picking one hides that.
-        (Some(_), Some(_)) => Err(format!(
-            "the `bash` tool takes `argv` or `command`, not both, and which one was meant is \
-             not something to guess. {}",
-            shape_help()
-        )),
-        (Some(value), None) => parse_argv(value),
-        (None, Some(value)) => parse_command(value),
-        (None, None) => Err(format!(
-            "the `bash` tool needs `command` or `argv`, and neither was present, so nothing ran. \
-             {}",
-            shape_help()
-        )),
-    }
+        (Some(_), Some(_)) => {
+            return Err(format!(
+                "the `bash` tool takes `argv` or `command`, not both, and which one was meant is \
+                 not something to guess. {}",
+                shape_help()
+            ))
+        }
+        (Some(value), None) => parse_argv(value)?,
+        (None, Some(value)) => parse_command(value)?,
+        (None, None) => {
+            return Err(format!(
+                "the `bash` tool needs `command` or `argv`, and neither was present, so nothing \
+                 ran. {}",
+                shape_help()
+            ))
+        }
+    };
+
+    Ok((program, args, cwd))
 }
 
 /// The sentence every argument-shaped refusal ends with, so a model gets the shape it needs
@@ -454,7 +479,7 @@ enum Stop {
 /// Spawn the command, read it bounded, and settle its exit status.
 fn run_command(
     cfg: &Tools,
-    root: &Path,
+    cwd: &Path,
     program: PathBuf,
     args: Vec<String>,
 ) -> Result<Outcome, String> {
@@ -477,7 +502,7 @@ fn run_command(
         backend: BACKEND.to_string(),
         program,
         args: args.into_iter().map(OsString::from).collect(),
-        cwd: root.to_path_buf(),
+        cwd: cwd.to_path_buf(),
         scrub: scrub(cfg),
         timeout,
     };

@@ -44,6 +44,7 @@ use serde_json::Value;
 
 use crate::config::Tools;
 use crate::tool_loop::{ToolCall, ToolResult};
+use crate::tools::guard::{relative, resolve_within, within};
 
 /// Run one call from the read-only tier.
 ///
@@ -324,93 +325,8 @@ fn find(cfg: &Tools, root: &Path, call: &ToolCall) -> Result<String, String> {
     Ok(out)
 }
 
-// ---------------------------------------------------------------------------------------
-// Path resolution: the ceiling, checked on the resolved path.
-// ---------------------------------------------------------------------------------------
-
-/// Resolve `requested` against the ceiling and refuse anything that lands outside it.
-///
-/// The check is on `std::fs::canonicalize`'s output, never on the text: a textual prefix
-/// check passes `../secret` and passes a symlink pointing out of the tree, which are
-/// exactly the two cases `ACCEPTANCE.md` §19 names.
-fn resolve_within(root: &Path, requested: &str) -> Result<PathBuf, String> {
-    if requested.trim().is_empty() {
-        return Err(
-            "the path argument was empty. Give a path inside the workspace root; an empty string \
-             resolves to no file, so retrying it reaches the same refusal."
-                .to_string(),
-        );
-    }
-
-    let as_path = Path::new(requested);
-    // An absolute request is not joined — `Path::join` would silently discard the root for
-    // one — it is resolved and then checked against the ceiling like any other.
-    let candidate = if as_path.is_absolute() {
-        as_path.to_path_buf()
-    } else {
-        root.join(as_path)
-    };
-
-    let resolved = fs::canonicalize(&candidate).map_err(|e| {
-        format!(
-            "`{requested}` does not resolve to an existing path under the workspace root `{}` ({e}). \
-             Check the path, or use the `ls` tool to see what is there.",
-            root.display()
-        )
-    })?;
-
-    if !within(root, &resolved) {
-        return Err(format!(
-            "`{requested}` resolves to `{}`, which is outside the workspace root `{}`. The \
-             `tools.workspace` root is a ceiling for every tool, not a default, so this call was not \
-             run. Ask for a path inside the root instead; do not retry this one.",
-            resolved.display(),
-            root.display()
-        ));
-    }
-
-    Ok(resolved)
-}
-
-/// Whether `path` is `root` or underneath it, compared by **components**.
-///
-/// String-prefix comparison is the bug this avoids: `C:\ws2` starts with `C:\ws`, and so
-/// does a verbatim-prefixed spelling of the same path. Components are what the filesystem
-/// means. Case-insensitive on Windows because the filesystem is, and because
-/// `canonicalize` may return either case for the same directory.
-fn within(root: &Path, path: &Path) -> bool {
-    let mut ceiling = root.components();
-    let mut candidate = path.components();
-    loop {
-        match (ceiling.next(), candidate.next()) {
-            (None, _) => return true,
-            (Some(a), Some(b)) if same_component(a.as_os_str(), b.as_os_str()) => {}
-            _ => return false,
-        }
-    }
-}
-
-#[cfg(windows)]
-fn same_component(a: &std::ffi::OsStr, b: &std::ffi::OsStr) -> bool {
-    a.to_string_lossy()
-        .eq_ignore_ascii_case(&b.to_string_lossy())
-}
-
-#[cfg(not(windows))]
-fn same_component(a: &std::ffi::OsStr, b: &std::ffi::OsStr) -> bool {
-    a == b
-}
-
-/// The path as the model should see it: relative to the ceiling, `/`-separated.
-fn relative(root: &Path, path: &Path) -> String {
-    let rel = path.strip_prefix(root).unwrap_or(path);
-    let text = rel.to_string_lossy().replace('\\', "/");
-    if text.is_empty() {
-        ".".to_string()
-    } else {
-        text
-    }
-}
+// The ceiling these tools resolve against now lives in `crate::tools::guard`, so `bash`
+// resolves its working directory through the *same* check rather than a second copy of it.
 
 // ---------------------------------------------------------------------------------------
 // Walking, reading, and the output budget.

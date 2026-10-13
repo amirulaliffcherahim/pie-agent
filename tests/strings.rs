@@ -401,32 +401,69 @@ fn a_fused_flag_table_yields_every_flag_in_it() {
             "`{expected}` must be found as its own entry, not fused into a blob: {found:?}"
         );
     }
-    assert!(
-        found.iter().any(|s| s == "--use-legacy-landlock"),
-        "{found:?}"
-    );
     // The material claim is that **every flag is its own entry**, because that is what removes
     // the truncation blind spot: a 200-character cap over the whole blob would hide a change
-    // late in it. A fused blob may *also* appear, and that is a second, deliberate path rather
-    // than a failure of this one — see `a_policy_word_keeps_its_sentence_whole` for that rule,
-    // and `ACCEPTANCE.md` §14's S17 for the duplication it creates.
+    // late in it. The blob does **not** also appear — a concatenated table is not prose, so the
+    // sentence path stands down; `a_fused_flag_table_is_kept_once_not_twice` is that assertion,
+    // and `ACCEPTANCE.md` §14's S17 is what it closes. The whole result is named here rather
+    // than only the three flags, so an extra entry cannot slip in unnoticed.
+    assert_eq!(
+        found,
+        vec![
+            "--permission-profile".to_string(),
+            "--sandbox-policy-cwd".to_string(),
+            "--use-legacy-landlock".to_string(),
+        ],
+        "{found:?}"
+    );
+}
+
+/// **The fused table is kept once, not twice** (`ACCEPTANCE.md` §14 S17).
+///
+/// The B38 blob matches *both* selection paths: the flag path splits it, and the sentence path
+/// would keep it whole because `policy` and `permission` are policy words. So the snapshot held
+/// the four split flags **and** the concatenated blob — the same evidence twice, the second
+/// copy still subject to the per-string cap, where a change late in it is invisible. Recognising
+/// a flag table as not-prose removes the copy, and the assertion that fails if it comes back is
+/// the *absence* of the blob.
+#[test]
+fn a_fused_flag_table_is_kept_once_not_twice() {
+    let fused: &[u8] = b"\x00--sandbox-policy-cwd--permission-profile--use-legacy-landlock--managed-networkcommand\x00";
+    let found = interesting_strings(fused, 64);
+
+    // The half that must survive: every flag as its own entry, including the one at the far
+    // end of the table, which is the flag a 200-character blob would have hidden.
     for expected in [
         "--sandbox-policy-cwd",
         "--permission-profile",
         "--use-legacy-landlock",
+        "--managed-networkcommand",
     ] {
         assert!(
             found.iter().any(|s| s == expected),
-            "`{expected}` must survive the split as its own entry: {found:?}"
+            "`{expected}` must be its own entry: {found:?}"
         );
     }
+
+    // The half that must not: the blob. `found.len()` is the harder form of the same claim —
+    // it fails on any extra entry, not only on this one — and it is exactly 4 only if the
+    // sentence path contributed nothing.
+    assert!(
+        !found
+            .iter()
+            .any(|s| s.contains("--sandbox-policy-cwd--permission-profile")),
+        "the concatenated blob must not survive as a sentence: the flag path already kept it \
+         split, and the copy is still cut at the per-string cap: {found:?}"
+    );
+    assert_eq!(found.len(), 4, "{found:?}");
 }
 
-/// A run carrying a policy word is kept **whole**, by design.
+/// A run carrying a policy word is kept **whole**, by design — unless it is a flag table.
 ///
-/// That is the other path, and it is why a fused flag table can appear twice: once split into
-/// flags, and once as the sentence around `permission`. The sentence is the evidence a human
-/// judges, so keeping it is deliberate — the duplication is recorded rather than papered over.
+/// That is the other path, and the sentence is the evidence a human judges, so keeping it is
+/// deliberate. It is the path `a_fused_flag_table_is_kept_once_not_twice` must *not* remove: a
+/// fix that deleted the sentence path outright would pass that test and lose the policy
+/// evidence, which is a worse bug than the duplication it closed.
 #[test]
 fn a_policy_word_keeps_its_sentence_whole() {
     let found = interesting_strings(b"ask for permission before writing files\x00", 64);
@@ -435,6 +472,64 @@ fn a_policy_word_keeps_its_sentence_whole() {
             .iter()
             .any(|s| s == "ask for permission before writing files"),
         "the sentence around the policy word is the evidence: {found:?}"
+    );
+}
+
+/// The sentence path still runs on **prose**, with a flag table in the same buffer.
+///
+/// The pair in one test on purpose: the rule being asserted is a *discrimination*, not a
+/// suppression, and a predicate that returned true for everything would flatten both halves to
+/// the same answer. The prose here carries no `--` at all, so it can only arrive through the
+/// sentence path.
+#[test]
+fn a_prose_sentence_around_a_policy_word_is_still_kept() {
+    let input: &[u8] =
+        b"\x00we ask for permission before writing files\x00--sandbox-policy-cwd--permission-profile\x00";
+
+    let found = interesting_strings(input, 64);
+
+    assert!(
+        found
+            .iter()
+            .any(|s| s == "we ask for permission before writing files"),
+        "prose is not a flag table and its sentence is the evidence: {found:?}"
+    );
+    assert!(
+        found.iter().any(|s| s == "--sandbox-policy-cwd"),
+        "and the table beside it is still split into flags: {found:?}"
+    );
+    assert!(
+        !found
+            .iter()
+            .any(|s| s.contains("--sandbox-policy-cwd--permission-profile")),
+        "while the table itself is not kept as prose: {found:?}"
+    );
+}
+
+/// A flag **with an argument** is not a flag table, and its sentence path still runs.
+///
+/// The space is the discriminator, and this is why it is the space rather than the `--`
+/// prefix: a flag name cannot contain one, so `--effort high` is a flag plus its argument. The
+/// assertion has to be an entry the *sentence* path produces — `--effort` alone carries no
+/// policy word, so it reaches the result through the flag path either way — hence a run with
+/// both a space and a word.
+#[test]
+fn a_flag_with_an_argument_is_not_a_flag_table() {
+    let input: &[u8] = b"\x00--effort high\x00--policy strict\x00";
+
+    let found = interesting_strings(input, 16);
+
+    assert!(
+        found.iter().any(|s| s == "--policy strict"),
+        "a flag with an argument must keep its sentence as well as its flag: {found:?}"
+    );
+    assert!(
+        found.iter().any(|s| s == "--policy"),
+        "and the flag inside it is still its own entry: {found:?}"
+    );
+    assert!(
+        found.iter().any(|s| s == "--effort"),
+        "and a flag with an argument and no policy word is unaffected: {found:?}"
     );
 }
 

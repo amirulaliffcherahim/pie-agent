@@ -25,9 +25,10 @@
 //!   backend (`DESIGN.md` §17, "The `--help` producer"), and no snapshot is written for
 //!   it.
 //! * **A lost source is stated, and the run is not a success.** `Http` is a trait so no
-//!   test reaches the network; a fetch failure becomes a [`crate::watch::failed_source`]
-//!   entry, which `render_report` turns into the digest-incomplete note, and
-//!   [`incomplete_digest`] turns into a non-zero exit.
+//!   test reaches the network; a fetch failure becomes a [`crate::watch::FailedSource`],
+//!   which `render_report` renders as the digest-incomplete note and
+//!   [`incomplete_digest`] turns into a non-zero exit. A failure is its own type and its
+//!   own list, so it cannot reach the headline list at all.
 //!
 //! # Two entry points, because "the user asked" and "the schedule ticked" are different
 //!
@@ -80,7 +81,7 @@ use crate::provider;
 use crate::schedule::{self, Job, Ledger, RunReport, Spend, Trigger};
 use crate::session_log::now_millis;
 use crate::watch::news::{self, Http, NewsItem, NewsSource};
-use crate::watch::{self, CliSnapshot, Drift};
+use crate::watch::{self, CliSnapshot, Drift, FailedSource};
 
 /// How long one `--version`/`--help` probe may take.
 ///
@@ -269,7 +270,9 @@ pub struct Outcome {
     pub snapshots: Vec<(String, String)>,
     /// The backends that could not be probed, and why.
     pub skipped: Vec<(String, String)>,
-    /// The ranked digest, failure records included.
+    /// The ranked digest — headlines only. A fetch failure is not a headline and lives in
+    /// [`Outcome::failed_sources`], so nothing here can be mistaken for an item that
+    /// arrived.
     pub digest: Vec<NewsItem>,
     /// How many sources were configured.
     pub sources: usize,
@@ -277,8 +280,8 @@ pub struct Outcome {
     pub sources_ok: usize,
     /// How many headlines arrived.
     pub headlines: usize,
-    /// The sources that failed, by name.
-    pub failed_sources: Vec<String>,
+    /// The sources that failed, by name and reason.
+    pub failed_sources: Vec<FailedSource>,
     /// Things the run did not do, or did only in part, stated rather than implied — an
     /// artefact read that stopped at the cap, a dry run, a scope that fetched nothing.
     /// A note is never decoration: each one exists because the omission it describes would
@@ -369,7 +372,11 @@ impl Outcome {
                 out.push_str(&format!(
                     "digest: {} — {}\n",
                     watch::DIGEST_INCOMPLETE_NOTE,
-                    self.failed_sources.join(", ")
+                    self.failed_sources
+                        .iter()
+                        .map(|failed| failed.source.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 ));
             }
         }
@@ -399,7 +406,12 @@ pub fn incomplete_digest(outcome: &Outcome) -> Result<()> {
 
     Err(PieError::NotReachable(format!(
         "the digest is incomplete: {} could not be fetched.{report}",
-        outcome.failed_sources.join(", ")
+        outcome
+            .failed_sources
+            .iter()
+            .map(|failed| failed.source.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
     )))
 }
 
@@ -578,7 +590,14 @@ fn finish(
     }
 
     if options.scope.writes_report() {
-        let body = watch::render_report(month, &outcome.drifts, &outcome.digest, outcome.first_run);
+        let body = watch::render_report(
+            month,
+            &outcome.drifts,
+            &outcome.digest,
+            &outcome.failed_sources,
+            watch::REA_MODE_LITE,
+            outcome.first_run,
+        );
         outcome.written = Some(write_report(home, month, &body)?);
     }
 
@@ -911,21 +930,22 @@ fn read_artefact(path: &Path) -> std::io::Result<(Vec<String>, Option<String>)> 
 /// What one digest pass produced.
 #[derive(Debug, Default)]
 struct NewsHalf {
-    /// The ranked items, failure records included.
+    /// The ranked headlines. **A failed source is not one of these** — see `failed`.
     items: Vec<NewsItem>,
     /// How many headlines arrived.
     headlines: usize,
     /// How many sources answered.
     sources_ok: usize,
-    /// The sources that failed, by name.
-    failed: Vec<String>,
+    /// The sources that failed, with the reason each failed.
+    failed: Vec<FailedSource>,
 }
 
 /// Fetch, and rank what arrived by rule.
 ///
-/// A failure becomes a [`watch::failed_source`] entry rather than an empty list: the
-/// digest's incompleteness has to survive into the report, because a digest that is
-/// silently one source short reads as "nothing happened" (`DESIGN.md` §17 rule 2).
+/// A failure becomes a [`watch::failed_source`] in its own list rather than an entry in the
+/// item list: the digest's incompleteness has to survive into the report (`DESIGN.md` §17
+/// rule 2 — a digest silently one source short reads as "nothing happened"), and a failure
+/// is not a headline, so it never enters the list the report renders as headlines.
 fn news_half(sources: &[NewsSource], stack: &[String], http: &dyn Http) -> NewsHalf {
     let mut half = NewsHalf::default();
     let mut items: Vec<NewsItem> = Vec::new();
@@ -938,8 +958,8 @@ fn news_half(sources: &[NewsSource], stack: &[String], http: &dyn Http) -> NewsH
                 items.extend(found);
             }
             Err(error) => {
-                half.failed.push(source.name.clone());
-                items.push(watch::failed_source(&source.name, &error.to_string()));
+                half.failed
+                    .push(watch::failed_source(&source.name, &error.to_string()));
             }
         }
     }

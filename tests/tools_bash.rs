@@ -215,24 +215,35 @@ fn counting(base: &Base, name: &str) -> PathBuf {
 /// A stand-in that records that it started, sleeps, and records that it finished — so the
 /// deadline has two things to prove: the call returned at the deadline, **and** the child it
 /// killed never reached its final line.
+///
+/// The sleep is [`SLEEP`] because the deadline test's wall-clock assertion is written against
+/// it. See that constant for why the margin is the stand-in's working time rather than a fixed
+/// slack added to the deadline.
+const SLEEP: Duration = Duration::from_secs(4);
 fn sleeper(base: &Base, name: &str) -> PathBuf {
     let started = base.mark(&format!("{name}-started.txt"));
     let finished = base.mark(&format!("{name}-finished.txt"));
+
+    // Both bodies have to last as long as [`SLEEP`], and each is written from it rather than
+    // spelled out, because the deadline test's assertion and the script below are two things
+    // that must agree and neither can see the other. `ping -n N` is about N-1 seconds.
+    let seconds = SLEEP.as_secs();
 
     script(
         base,
         name,
         &format!(
             "echo started>\"{started}\"\r\n\
-             ping -n 4 127.0.0.1 >nul\r\n\
+             ping -n {pings} 127.0.0.1 >nul\r\n\
              echo finished>\"{finished}\"\r\n\
              echo the-child-outlived-its-deadline\r\n",
             started = started.display(),
-            finished = finished.display()
+            finished = finished.display(),
+            pings = seconds + 1
         ),
         &format!(
             "echo started > \"{started}\"\n\
-             sleep 3\n\
+             sleep {seconds}\n\
              echo finished > \"{finished}\"\n\
              echo the-child-outlived-its-deadline\n",
             started = started.display(),
@@ -636,27 +647,124 @@ fn both_argument_shapes_at_once_are_refused_rather_than_guessed() {
     assert!(!base.mark("counter-calls.txt").exists());
 }
 
+/// **S19**, and the reason it is a *promotion* rather than a second implementation.
+///
+/// `cwd` is now accepted, because the ceiling it needs is a shared function rather than a copy.
+/// The test proves the command really runs *there*: the stand-in reads `hello.txt` relative to
+/// its working directory, and the two files have different contents, so "which directory" is
+/// answered by which text came back rather than by inspecting `RunSpec`.
 #[test]
-fn a_cwd_argument_is_refused_as_unsupported_in_this_build() {
+fn a_cwd_inside_the_root_is_the_directory_the_command_runs_in() {
+    let base = Base::new();
+    let stand_in = reader(&base, "reader");
+    let sub = base.ws().join("sub");
+    fs::create_dir_all(&sub).unwrap();
+    fs::write(sub.join("hello.txt"), "subdirectory-file\n").unwrap();
+
+    let result = bash(
+        &base.tools(&["reader"]),
+        json!({"argv": [stand_in.display().to_string()], "cwd": "sub"}),
+    );
+    assert!(!result.is_error, "{}", result.output);
+    assert!(
+        result.output.contains("subdirectory-file"),
+        "the command did not run in `ws/sub`: {}",
+        result.output
+    );
+    assert!(
+        !result.output.contains("workspace-file"),
+        "the command ran in the workspace root instead of the requested `cwd`: {}",
+        result.output
+    );
+}
+
+#[test]
+fn a_cwd_that_escapes_the_root_by_dotdot_is_refused_before_the_spawn() {
     let base = Base::new();
     let stand_in = counting(&base, "counter");
 
     let result = bash(
         &base.tools(&["counter"]),
-        json!({"argv": [stand_in.display().to_string()], "cwd": base.ws().display().to_string()}),
+        json!({"argv": [stand_in.display().to_string()], "cwd": ".."}),
     );
 
-    assert!(
-        !base.mark("counter-calls.txt").exists(),
-        "a `cwd` must be refused, not quietly ignored while the command runs"
-    );
     assert!(result.is_error, "{}", result.output);
-    assert!(result.output.contains("cwd"), "{}", result.output);
     assert!(
-        result.output.contains("not support"),
-        "the refusal says it is unsupported in this build: {}",
+        result.output.contains("outside the workspace root"),
+        "the one ceiling must say what it refused and why: {}",
         result.output
     );
+    assert!(
+        !base.mark("counter-calls.txt").exists(),
+        "an escaping `cwd` must not spawn anything"
+    );
+}
+
+/// The discriminator, not the obvious case.
+///
+/// A sibling whose *name* merely starts with the root's - `ws-extra` beside `ws` - is admitted
+/// by a textual prefix check and refused by a component comparison. This is the test that fails
+/// if `bash` ever grows its own copy of the ceiling instead of calling the shared one, which is
+/// precisely what S19 was about. (The symlink half of the same rule belongs to the guard and is
+/// witnessed in `tests/tools.rs`, since there is now one implementation to witness.)
+#[test]
+fn a_cwd_that_merely_starts_with_the_root_path_is_refused() {
+    let base = Base::new();
+    let stand_in = counting(&base, "counter");
+    let twin = base.path().join("ws-extra");
+    fs::create_dir_all(&twin).unwrap();
+    assert!(
+        twin.to_string_lossy()
+            .starts_with(base.ws().to_string_lossy().as_ref()),
+        "the fixture must be the trap it claims: a string prefix check has to admit it"
+    );
+
+    let result = bash(
+        &base.tools(&["counter"]),
+        json!({"argv": [stand_in.display().to_string()], "cwd": twin.display().to_string()}),
+    );
+
+    assert!(result.is_error, "{}", result.output);
+    assert!(
+        result.output.contains("outside the workspace root"),
+        "{}",
+        result.output
+    );
+    assert!(!base.mark("counter-calls.txt").exists());
+}
+
+#[test]
+fn a_cwd_inside_the_root_that_is_not_a_directory_is_refused() {
+    let base = Base::new();
+    let stand_in = counting(&base, "counter");
+
+    let result = bash(
+        &base.tools(&["counter"]),
+        json!({"argv": [stand_in.display().to_string()], "cwd": "hello.txt"}),
+    );
+
+    assert!(result.is_error, "{}", result.output);
+    assert!(
+        result.output.contains("not a") && result.output.contains("directory"),
+        "a file is not a working directory, and the refusal should say so: {}",
+        result.output
+    );
+    assert!(!base.mark("counter-calls.txt").exists());
+}
+
+#[test]
+fn a_cwd_that_is_not_a_string_is_refused_by_name() {
+    let base = Base::new();
+    let stand_in = counting(&base, "counter");
+
+    let result = bash(
+        &base.tools(&["counter"]),
+        json!({"argv": [stand_in.display().to_string()], "cwd": 5}),
+    );
+
+    assert!(result.is_error, "{}", result.output);
+    assert!(result.output.contains("cwd"), "{}", result.output);
+    assert!(!base.mark("counter-calls.txt").exists());
 }
 
 #[test]
@@ -767,8 +875,19 @@ fn a_command_outliving_its_deadline_is_killed_not_waited_on() {
         result.output
     );
     assert!(
-        elapsed < Duration::from_secs(2),
-        "a 1s deadline returned after {elapsed:?} — the child was waited on, not killed"
+        elapsed >= Duration::from_secs(1),
+        "the call returned after {elapsed:?}, before its 1s deadline could have fired, so this \
+         test is not measuring what happens at a deadline"
+    );
+    assert!(
+        elapsed < SLEEP,
+        "a 1s deadline returned after {elapsed:?}, and the stand-in works for {SLEEP:?}: the \
+         child was waited on rather than killed. **The ceiling is the stand-in's own working \
+         time, deliberately, not the deadline plus a fixed slack** — a deadline kill costs a \
+         `taskkill` spawn and a process-tree walk, measured at ~1.2 s on a machine under load, \
+         so `deadline + 1s` measured the machine instead of the behaviour. This failed 2 runs in \
+         6 under 6x CPU load with a ceiling of 2s (see ACCEPTANCE 13, B41); the two mark-based \
+         assertions below are the independent witnesses and never moved"
     );
     assert!(
         base.mark("sleeper-started.txt").exists(),
@@ -784,7 +903,7 @@ fn a_command_outliving_its_deadline_is_killed_not_waited_on() {
     // left running": a killed child never reaches its third line, and this is where that is
     // checked. The child sleeps three seconds and the call returned after about one, so the
     // mark has to appear inside the poll window if the child is still alive.
-    let give_up = Instant::now() + Duration::from_secs(4);
+    let give_up = Instant::now() + SLEEP + Duration::from_secs(1);
     while Instant::now() < give_up {
         assert!(
             !base.mark("sleeper-finished.txt").exists(),

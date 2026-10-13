@@ -645,7 +645,8 @@ fn the_report_path_is_the_one_the_frozen_module_names() {
         );
     }
 
-    let body = pie::watch::render_report("2026-11", &[], &[], false);
+    let body =
+        pie::watch::render_report("2026-11", &[], &[], &[], pie::watch::REA_MODE_LITE, false);
     let name = watch::report_path(home.path(), "2026-11")
         .file_name()
         .unwrap()
@@ -955,7 +956,22 @@ async fn a_lost_source_is_stated_in_the_report_and_is_not_a_successful_run() {
 
     assert_eq!(http.calls().len(), 2, "both sources were attempted");
     assert_eq!(outcome.sources_ok, 1);
-    assert_eq!(outcome.failed_sources, vec!["arXiv cs.SE".to_string()]);
+    // The failure is its own value: the name it was configured under, and the reason —
+    // which the old sentinel reached the report with only by re-parsing a headline title.
+    assert_eq!(
+        outcome.failed_sources.len(),
+        1,
+        "{:?}",
+        outcome.failed_sources
+    );
+    assert_eq!(outcome.failed_sources[0].source, "arXiv cs.SE");
+    assert!(
+        outcome.failed_sources[0]
+            .reason
+            .contains("refused by the test transport"),
+        "the failure carries the reason it failed: {:?}",
+        outcome.failed_sources[0]
+    );
     assert_eq!(outcome.headlines, 1);
 
     let body = read_report(&outcome);
@@ -964,6 +980,20 @@ async fn a_lost_source_is_stated_in_the_report_and_is_not_a_successful_run() {
         "the digest must say it is incomplete:\n{body}"
     );
     assert!(body.contains("arXiv cs.SE"), "{body}");
+    assert!(
+        body.contains("connection") || body.contains("refused by the test transport"),
+        "the report states why the source failed:\n{body}"
+    );
+    // The end-to-end form of S15's core assertion: nothing that failed reached the
+    // headline list, so no line carries a headline's `[impact 0]` marker.
+    assert!(
+        !body.contains("[impact 0]"),
+        "a failed source must never be rendered as a headline:\n{body}"
+    );
+    assert!(
+        body.contains("  - arXiv cs.SE: "),
+        "the failure is rendered as a failure, naming the source:\n{body}"
+    );
     assert!(
         body.contains("Async closures land in Rust 1.87"),
         "a failed source must not blank the source that answered:\n{body}"

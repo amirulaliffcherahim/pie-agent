@@ -30,6 +30,7 @@
 //! has rather than retry the same call.
 
 pub mod bash;
+pub(crate) mod guard;
 pub mod read_only;
 
 use crate::config::Tools;
