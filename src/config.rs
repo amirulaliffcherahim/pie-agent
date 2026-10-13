@@ -343,6 +343,25 @@ pub struct Tools {
     /// A command that prints forever must not fill memory — the reason `read_body` is
     /// capped, and `B22`'s lesson applied to a new input.
     pub max_output_bytes: usize,
+    /// Environment variables this tier's children must not see.
+    ///
+    /// **Not a config key** (`#[serde(skip)]`), because there is exactly one place the list may
+    /// come from: `Config::scrub_keys`, which composes [`BUILTIN_SCRUB`] with the user's
+    /// `general.extra_scrub_env`. A `tools.scrub` key would be a second list, free to disagree
+    /// with the one every vendor child gets.
+    ///
+    /// The default carries [`BUILTIN_SCRUB`] rather than being empty, so a `Tools` built by hand
+    /// is scrubbed by construction. An empty default would make "forgot to compose the scrub"
+    /// indistinguishable from "nothing to scrub", which is the failure this field exists to
+    /// correct.
+    ///
+    /// **This tier scrubs unconditionally, and the asymmetry is deliberate.** `PIE_STRIP_ENV=0`
+    /// is a debugging escape hatch for a *vendor* CLI, where the risk is a subscription quietly
+    /// switching to pay-as-you-go billing. Here the risk is different in kind: the command is
+    /// chosen by a model, and an unscrubbed child can simply be asked to print its environment.
+    /// So the tool path composes with `scrub_keys(true)` and never consults `scrub_enabled()`.
+    #[serde(skip)]
+    pub scrub: Vec<String>,
 }
 
 impl Default for Tools {
@@ -356,6 +375,9 @@ impl Default for Tools {
             bash_allow: Vec::new(),
             timeout_secs: 30,
             max_output_bytes: 1 << 20,
+            // The builtin deny-list, so a hand-built `Tools` is safe by construction; the
+            // user's extras are added by `Config::resolve`.
+            scrub: BUILTIN_SCRUB.iter().map(|key| (*key).to_string()).collect(),
         }
     }
 }
@@ -394,6 +416,15 @@ impl Config {
         let mut cfg = Self::load_from(&crate::paths::config_file())?;
         cfg.apply_env()?;
         cfg.apply(overrides);
+        // Composed last, and with `true`, so the tool tier gets the **whole** list:
+        // `BUILTIN_SCRUB` plus whatever `general.extra_scrub_env` contributes. `scrub_enabled()`
+        // is deliberately not consulted - see `Tools::scrub`.
+        //
+        // Sound rather than merely convenient: `extra_scrub_env` has no environment override and
+        // is written only by `toml::from_str`, so a config carrying extras necessarily came
+        // through here. A `Tools` built by hand has no extras to lose.
+        let scrub = cfg.scrub_keys(true);
+        cfg.tools.scrub = scrub;
         Ok(cfg)
     }
 
@@ -800,6 +831,78 @@ mod tests {
         assert_eq!(cfg.agy.bin, "/opt/agy");
         assert_eq!(cfg.codex.bin, "/opt/codex");
         assert_eq!(cfg.claude.bin, "/opt/claude");
+    }
+
+    #[test]
+    fn a_hand_built_tools_carries_the_builtin_scrub_list() {
+        // `Tools::default()` is what tests and any non-`resolve` path get. If `scrub` defaulted
+        // to empty, "forgot to compose the scrub" would be indistinguishable from "nothing to
+        // scrub" - which is the failure S21 was.
+        let tools = Tools::default();
+        for key in BUILTIN_SCRUB {
+            assert!(
+                tools.scrub.iter().any(|candidate| candidate == key),
+                "`{key}` is missing from Tools::default().scrub: {:?}",
+                tools.scrub
+            );
+        }
+    }
+
+    #[test]
+    fn the_scrub_list_is_not_settable_from_a_tools_table() {
+        // One place composes the list (`Config::scrub_keys`). A `tools.scrub` key would be a
+        // second list, free to disagree with the one every vendor child gets.
+        let cfg: Config = toml::from_str("[tools]\nworkspace = \"/tmp\"\nscrub = [\"MY_TOKEN\"]\n")
+            .expect("the tools table parses");
+        assert_eq!(cfg.tools.workspace.as_deref(), Some(Path::new("/tmp")));
+        assert!(
+            !cfg.tools.scrub.iter().any(|key| key == "MY_TOKEN"),
+            "`tools.scrub` must not be deserializable; got {:?}",
+            cfg.tools.scrub
+        );
+    }
+
+    #[test]
+    fn resolve_gives_the_tool_tier_the_users_extra_keys_and_ignores_the_escape_hatch() {
+        // The real wiring, not the rule applied by hand: `Config::resolve` is the only production
+        // path to a config carrying `extra_scrub_env`, so this is where the composition has to
+        // hold. A scratch `PIE_HOME` keeps the developer's own config out of it.
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join("config.toml"),
+            "[general]\nextra_scrub_env = [\"MY_CORP_TOKEN\"]\n",
+        )
+        .unwrap();
+        let home_text = home.path().to_string_lossy().into_owned();
+        let _env = EnvGuard::set(&[
+            ("PIE_HOME", Some(home_text.as_str())),
+            // The debugging escape hatch for vendor children, which the tool tier must ignore.
+            ("PIE_STRIP_ENV", Some("0")),
+        ]);
+
+        let cfg = Config::resolve(&Overrides::default()).unwrap();
+        for key in BUILTIN_SCRUB {
+            assert!(
+                cfg.tools.scrub.iter().any(|candidate| candidate == key),
+                "`{key}` is missing from the tool tier's scrub list: {:?}",
+                cfg.tools.scrub
+            );
+        }
+        assert!(
+            cfg.tools.scrub.iter().any(|key| key == "MY_CORP_TOKEN"),
+            "the user's own deny-list key did not reach the tool tier (S21): {:?}",
+            cfg.tools.scrub
+        );
+        // And the escape hatch still works where it is meant to: for a *vendor* child, whose
+        // risk is a billing switch rather than a model asking a command to print the environment.
+        assert!(
+            !cfg.scrub_enabled(),
+            "this test is only meaningful with PIE_STRIP_ENV=0 honoured"
+        );
+        assert!(
+            cfg.scrub_keys(cfg.scrub_enabled()).is_empty(),
+            "PIE_STRIP_ENV=0 must still disable scrubbing for vendor children"
+        );
     }
 
     #[test]

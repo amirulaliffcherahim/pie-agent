@@ -478,7 +478,7 @@ fn run_command(
         program,
         args: args.into_iter().map(OsString::from).collect(),
         cwd: root.to_path_buf(),
-        scrub: scrub(),
+        scrub: scrub(cfg),
         timeout,
     };
 
@@ -599,22 +599,19 @@ fn run_command(
 
 /// The environment a `bash` child does not see (invariant I2).
 ///
-/// `I2` is about *every* child, so this child gets the same deny-list a vendor CLI gets.
+/// I2 is about *every* child, so this child gets the same deny-list a vendor CLI gets - and
+/// since **S21** it gets the **whole** list, not just [`BUILTIN_SCRUB`]. `Tools::scrub` is
+/// composed by `Config::resolve` from `BUILTIN_SCRUB` plus the user's `general.extra_scrub_env`,
+/// so a key someone added to their own deny-list now reaches this child too.
 ///
-/// **What it cannot reach, and why.** `Tools` carries no scrub list — the list is composed
-/// by `Config::scrub_keys`, which lives on `Config`, while this module's signature is frozen
-/// as `&Tools`. So the `extra_scrub_env` keys and `PIE_STRIP_ENV=0` are unreachable from
-/// here, and the constant is passed instead: one list, no second copy of it. The
-/// alternatives were both worse — re-reading `config.toml` inside a tool call would make
-/// this child's environment depend on a *second* parse of the configuration (and on `HOME`,
-/// so a test could pass here and fail in CI), and a hand-copied list would be the drift
-/// `DESIGN.md` §20 exists to prevent. A user's extra keys are therefore a stated residual
-/// rather than a guarantee.
-fn scrub() -> Vec<String> {
-    crate::config::BUILTIN_SCRUB
-        .iter()
-        .map(|key| (*key).to_string())
-        .collect()
+/// The earlier version passed the constant and documented the shortfall, on the grounds that
+/// re-parsing `config.toml` inside a tool call would make a child's environment depend on a
+/// second read of the configuration (and on `HOME`, so a test could pass here and fail in CI).
+/// That reasoning was right about the *mechanism* and wrong about the *conclusion*: the fix was
+/// never to re-read anything, it was to carry the already-resolved list, which is why
+/// `Tools::scrub` exists instead of a second parse or a hand-copied list.
+fn scrub(cfg: &Tools) -> Vec<String> {
+    cfg.scrub.clone()
 }
 
 /// The sentence that stops a runaway output.

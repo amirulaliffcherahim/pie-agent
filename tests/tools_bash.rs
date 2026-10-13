@@ -955,9 +955,9 @@ fn the_child_runs_in_the_workspace_root() {
 
 #[test]
 fn the_child_does_not_see_a_scrubbed_api_key() {
-    // I2 is about *every* child, and the key this removes is `BUILTIN_SCRUB`'s, which is the
-    // list `bash` passes (see the note in `src/tools/bash.rs`: `Tools` cannot reach
-    // `Config::scrub_keys`, so the constant itself is passed).
+    // I2 is about *every* child, and the key this removes is `BUILTIN_SCRUB`'s, which is what
+    // `Tools::default()` carries. The test below covers the *other* half of the list - the keys
+    // `Config::resolve` adds from `general.extra_scrub_env` (S21).
     const KEY: &str = "OPENAI_API_KEY";
     const VALUE: &str = "sk-must-not-reach-a-bash-child";
 
@@ -983,6 +983,45 @@ fn the_child_does_not_see_a_scrubbed_api_key() {
     assert!(
         !dumped.contains(KEY),
         "`{KEY}`'s name reached the child (I2)"
+    );
+}
+
+/// The other half of the scrub list, and the half **S21** added.
+///
+/// The test above covers `BUILTIN_SCRUB`, which `Tools::default()` carries; this covers the keys a
+/// user adds in `general.extra_scrub_env`, which `Config::resolve` composes on top. Both are worth
+/// asserting separately because the first version of this tier passed the constant and nothing
+/// else - so a key someone had deliberately added to their own deny-list reached a *model-invoked*
+/// command while every vendor child was correctly scrubbed. The gap was never that the scrub list
+/// was wrong; it was that this child saw a different list from every other child.
+#[test]
+fn the_child_does_not_see_a_key_the_user_added_to_the_scrub_list() {
+    const KEY: &str = "PIE_TEST_CORP_TOKEN";
+    const VALUE: &str = "corp-token-must-not-reach-a-bash-child";
+
+    let base = Base::new();
+    let stand_in = dumper(&base, "dumper");
+    let _restore = EnvVar::set(KEY, VALUE);
+
+    let tools = Tools {
+        scrub: vec![KEY.to_string()],
+        ..base.tools(&["dumper"])
+    };
+    let result = bash(&tools, json!({"argv": [stand_in.display().to_string()]}));
+    assert!(!result.is_error, "{}", result.output);
+
+    let dumped = content(&base.mark("dumper-env.txt"));
+    assert!(
+        dumped.contains("PATH") || dumped.contains("Path"),
+        "the dump is empty or incomplete, so the assertions below would be vacuous"
+    );
+    assert!(
+        !dumped.contains(VALUE),
+        "`{KEY}`'s value reached the child (I2, S21)"
+    );
+    assert!(
+        !dumped.contains(KEY),
+        "`{KEY}`'s name reached the child (I2, S21)"
     );
 }
 
